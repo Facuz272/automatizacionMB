@@ -1,0 +1,6 @@
+anthropic
+beautifulsoup4
+googlemaps
+loguru
+python-dotenv
+requests
