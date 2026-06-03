@@ -30,8 +30,10 @@ def get_initial_candidates():
 
 def get_followup_candidates():
     """
-    Leads whose step-1 email was sent 4+ days ago
+    Leads whose step-1 email was sent 4+ days ago, haven't replied,
     and don't have a step-2 draft yet.
+    The replied = 0 guard is the critical block: if they replied to step-1,
+    we never generate (or send) a follow-up.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -40,6 +42,7 @@ def get_followup_candidates():
         FROM generated_emails ge
         WHERE ge.sequence_step = 1
           AND ge.send_status   = 'sent'
+          AND ge.replied       = 0
           AND ge.sent_at      <= datetime('now', '-4 days')
           AND NOT EXISTS (
               SELECT 1 FROM generated_emails ge2
@@ -52,6 +55,11 @@ def get_followup_candidates():
 
 
 def save_generated_email(domain, email, subject, body, sequence_step=1):
+    """
+    Insert draft into generated_emails.
+    Uses INSERT OR IGNORE — checks cursor.rowcount to distinguish
+    a real save from a silently ignored duplicate.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -62,8 +70,17 @@ def save_generated_email(domain, email, subject, body, sequence_step=1):
             (domain, email, subject, body, sequence_step),
         )
         conn.commit()
+
+        if cursor.rowcount == 0:
+            logger.warning(
+                "Duplicate silently ignored — {} already has a step-{} draft (shared inbox?). No data was written.",
+                email, sequence_step,
+            )
+        else:
+            logger.success("Step-{} draft saved for {}", sequence_step, domain)
+
     except Exception as e:
-        logger.error("Error saving email for {} (step {}): {}", domain, sequence_step, e)
+        logger.error("Error saving draft for {} step {}: {}", domain, sequence_step, e)
     finally:
         conn.close()
 
@@ -129,7 +146,6 @@ def run_writer():
         logger.error("Missing ANTHROPIC_API_KEY in .env")
         return
 
-    init_db()
     client = Anthropic(api_key=api_key)
     leads = get_initial_candidates()
 
@@ -155,23 +171,24 @@ def run_writer():
         result = _draft_email(client, prompt, domain, step=1)
         if result:
             save_generated_email(domain, email, result["subject"], result["body"], sequence_step=1)
-            logger.success("Step-1 draft saved for {}", domain)
         time.sleep(1)
 
 
 def run_followup_writer():
-    """Generate step-2 follow-up emails for leads sent step-1 >= 4 days ago."""
+    """
+    Generate step-2 follow-up emails for leads sent step-1 >= 4 days ago
+    that have NOT replied (replied = 0).
+    """
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         logger.error("Missing ANTHROPIC_API_KEY in .env")
         return
 
-    init_db()
     client = Anthropic(api_key=api_key)
     candidates = get_followup_candidates()
 
     if not candidates:
-        logger.info("No leads eligible for a follow-up yet.")
+        logger.info("No leads eligible for a follow-up (none, or all have replied).")
         return
 
     logger.info("Module 3 — drafting {} follow-up emails", len(candidates))
@@ -192,10 +209,10 @@ def run_followup_writer():
         result = _draft_email(client, prompt, domain, step=2)
         if result:
             save_generated_email(domain, email, result["subject"], result["body"], sequence_step=2)
-            logger.success("Step-2 follow-up draft saved for {}", domain)
         time.sleep(1)
 
 
 if __name__ == "__main__":
+    init_db()
     run_writer()
     run_followup_writer()

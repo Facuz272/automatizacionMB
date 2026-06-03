@@ -8,15 +8,21 @@ from loguru import logger
 from utils.db import get_connection, init_db
 
 
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
 def get_pending_domains():
-    """Return domains that have not been enriched yet."""
+    """
+    Return domains where scraped_at IS NULL — meaning we've never attempted
+    to find emails there, regardless of whether we found any.
+    This prevents infinite re-scraping of domains with no public email.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT DISTINCT l.domain, l.website
-        FROM leads l
-        LEFT JOIN enriched_leads el ON l.domain = el.domain
-        WHERE l.website IS NOT NULL AND el.domain IS NULL
+        SELECT DISTINCT domain, website
+        FROM leads
+        WHERE website IS NOT NULL
+          AND scraped_at IS NULL
     """)
     domains = cursor.fetchall()
     conn.close()
@@ -27,13 +33,33 @@ def save_email(domain, email):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT OR IGNORE INTO enriched_leads (domain, email) VALUES (?, ?)", (domain, email))
+        cursor.execute(
+            "INSERT OR IGNORE INTO enriched_leads (domain, email) VALUES (?, ?)",
+            (domain, email),
+        )
         conn.commit()
     except Exception as e:
         logger.error("Error saving email {}: {}", email, e)
     finally:
         conn.close()
 
+
+def mark_domain_scraped(domain):
+    """
+    Stamp scraped_at on the lead row whether or not an email was found.
+    This is what prevents the infinite-retry loop.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE leads SET scraped_at = CURRENT_TIMESTAMP WHERE domain = ?",
+        (domain,),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ── Scraping ──────────────────────────────────────────────────────────────────
 
 EMAIL_RE = re.compile(
     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.(?!png|jpg|jpeg|gif|webp)[a-zA-Z]{2,}"
@@ -45,7 +71,6 @@ def find_emails_on_page(url):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        # Parse visible text only — avoids false positives from JS/CSS/comments
         soup = BeautifulSoup(response.text, "html.parser")
         text = soup.get_text(separator=" ")
         return set(EMAIL_RE.findall(text))
@@ -54,19 +79,20 @@ def find_emails_on_page(url):
         return set()
 
 
+# ── Public runner ─────────────────────────────────────────────────────────────
+
 def run_enricher():
-    logger.info("Starting Module 2: Email Finder")
-    init_db()
+    logger.info("Module 2: Email Finder starting")
     targets = get_pending_domains()
 
     if not targets:
-        logger.warning("No pending domains to enrich. Run the scraper first, or all domains are already enriched.")
+        logger.info("No unscraped domains — enricher has nothing to do.")
         return
 
     logger.info("Enriching {} domains", len(targets))
 
     for domain, website in targets:
-        logger.info("Scanning domain: {}", domain)
+        logger.info("Scanning: {}", domain)
 
         if not website.startswith("http"):
             website = "https://" + website
@@ -79,12 +105,18 @@ def run_enricher():
             time.sleep(1)
 
         if found_emails:
-            for email in found_emails:
-                logger.success("Email found for {}: {}", domain, email)
-                save_email(domain, email.lower())
+            for em in found_emails:
+                logger.success("Email found for {}: {}", domain, em)
+                save_email(domain, em.lower())
         else:
-            logger.info("No emails found for {}", domain)
+            logger.info("No emails found for {} — marking as scraped to skip next time", domain)
+
+        # Always stamp scraped_at, even on zero-result domains
+        mark_domain_scraped(domain)
+
+    logger.info("Enricher complete")
 
 
 if __name__ == "__main__":
+    init_db()
     run_enricher()
