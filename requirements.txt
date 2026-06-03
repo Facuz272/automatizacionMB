@@ -2,5 +2,7 @@ anthropic
 beautifulsoup4
 googlemaps
 loguru
+pytz
 python-dotenv
 requests
+schedule

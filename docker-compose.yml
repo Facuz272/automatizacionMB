@@ -1,0 +1,9 @@
+services:
+  pipeline:
+    build: .
+    env_file: .env
+    environment:
+      TZ: America/New_York   # all schedule times interpreted in ET
+    volumes:
+      - ./data:/app/data     # SQLite DB persists outside the container
+    restart: unless-stopped  # auto-restarts after VPS reboots or crashes

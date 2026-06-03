@@ -17,12 +17,14 @@ DAILY_LIMIT = 40  # conservative limit for Gmail SMTP (~100/day max)
 
 
 def get_pending_emails(limit: int = DAILY_LIMIT):
+    """Return pending emails ordered so step-1 always goes before step-2."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT domain, email, subject, body
+        SELECT domain, email, subject, body, sequence_step
         FROM generated_emails
         WHERE send_status = 'pending' OR send_status IS NULL
+        ORDER BY sequence_step ASC
         LIMIT ?
     """, (limit,))
     rows = cursor.fetchall()
@@ -30,14 +32,14 @@ def get_pending_emails(limit: int = DAILY_LIMIT):
     return rows
 
 
-def mark_send_status(email_addr: str, status: str):
+def mark_send_status(email_addr: str, sequence_step: int, status: str):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE generated_emails
         SET send_status = ?, sent_at = CURRENT_TIMESTAMP
-        WHERE email = ?
-    """, (status, email_addr))
+        WHERE email = ? AND sequence_step = ?
+    """, (status, email_addr, sequence_step))
     conn.commit()
     conn.close()
 
@@ -66,26 +68,33 @@ def run_sender():
     pending = get_pending_emails()
 
     if not pending:
-        logger.warning("No pending emails to send. Run writer.py first.")
+        logger.info("No pending emails to send.")
         return
 
-    logger.info("Starting Module 4: sending {} emails (daily limit: {})", len(pending), DAILY_LIMIT)
+    step_counts = {1: 0, 2: 0}
+    logger.info("Module 4 — sending {} emails (daily limit: {})", len(pending), DAILY_LIMIT)
 
     sent_count = 0
-    for domain, email, subject, body in pending:
+    for domain, email, subject, body, sequence_step in pending:
+        label = "initial" if sequence_step == 1 else f"follow-up #{sequence_step - 1}"
         try:
             send_email(email, subject, body)
-            mark_send_status(email, "sent")
+            mark_send_status(email, sequence_step, "sent")
             sent_count += 1
-            logger.success("[{}/{}] Sent to {} ({})", sent_count, len(pending), email, domain)
+            step_counts[sequence_step] = step_counts.get(sequence_step, 0) + 1
+            logger.success("[{}/{}] {} sent to {} ({})", sent_count, len(pending), label, email, domain)
         except Exception as e:
-            mark_send_status(email, "failed")
-            logger.error("Failed to send to {}: {}", email, e)
+            mark_send_status(email, sequence_step, "failed")
+            logger.error("Failed to send {} to {}: {}", label, email, e)
 
-        # Randomized delay to avoid spam filters and stay well under rate limits
         time.sleep(random.uniform(25, 45))
 
-    logger.info("Sender run completed: {} sent, {} failed", sent_count, len(pending) - sent_count)
+    logger.info(
+        "Sender done — {} initial, {} follow-ups, {} failed",
+        step_counts.get(1, 0),
+        step_counts.get(2, 0),
+        len(pending) - sent_count,
+    )
 
 
 if __name__ == "__main__":
