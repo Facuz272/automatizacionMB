@@ -1,11 +1,10 @@
-import sqlite3
 import time
 from urllib.parse import urlparse
 
 import googlemaps
 from loguru import logger
 
-from config import GOOGLE_PLACES_API_KEY, TARGET_CITIES, TARGET_VERTICALS, DB_PATH
+from config import GOOGLE_PLACES_API_KEY, TARGET_CITIES, TARGET_VERTICALS
 from utils.db import get_connection, init_db
 
 
@@ -39,47 +38,100 @@ def get_existing_place_ids():
     return ids
 
 
+def _fetch_page(client, search_args: dict, has_page_token: bool) -> dict | None:
+    """
+    Fetch one page from the Places Text Search API.
+
+    When a next_page_token is present Google can take up to ~5 seconds to
+    activate it after issuing it.  Sending a request too early returns
+    INVALID_REQUEST — this is documented behaviour, not an error on our end.
+
+    Strategy:
+      - page_token requests: retry INVALID_REQUEST up to 3 times with
+        increasing delays (3 s → 5 s → 10 s).
+      - All other errors: single attempt, return None on failure so the
+        caller can break pagination gracefully instead of crashing.
+    """
+    delays = [3, 5, 10]
+    max_attempts = len(delays) if has_page_token else 1
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.places(**search_args)
+        except Exception as exc:
+            is_token_activation = has_page_token and "INVALID_REQUEST" in str(exc)
+
+            if is_token_activation and attempt < max_attempts:
+                wait = delays[attempt - 1]
+                logger.warning(
+                    "next_page_token not ready yet (attempt {}/{}) — retrying in {}s",
+                    attempt, max_attempts, wait,
+                )
+                time.sleep(wait)
+            else:
+                logger.warning(
+                    "Places API request failed after {} attempt(s): {}", attempt, exc
+                )
+                return None
+
+    return None  # all retries exhausted
+
+
 def search_place_ids(client):
-    place_id_map = {}
-    total_found = 0
+    """
+    Collect place_ids across all configured cities and verticals.
+    Pagination failures on page 2+ do NOT discard page 1 results —
+    the function breaks the pagination loop and returns what it has.
+    """
+    place_id_map: dict[str, str] = {}
 
     for city in TARGET_CITIES:
         for vertical in TARGET_VERTICALS:
             query = f"{vertical} {city}"
-            logger.info("Searching for {}", query)
+            logger.info("Searching for '{}'", query)
 
-            page_token = None
+            page_token: str | None = None
             page_index = 0
 
             while True:
                 page_index += 1
-                search_args = {"query": query}
+                search_args: dict = {"query": query}
                 if page_token:
                     search_args["page_token"] = page_token
 
-                response = client.places(**search_args)
+                response = _fetch_page(client, search_args, has_page_token=bool(page_token))
+
+                if response is None:
+                    # Page fetch failed after retries.
+                    # Break pagination loop — results from previous pages are safe.
+                    logger.warning(
+                        "Stopping pagination for '{}' at page {} — "
+                        "{} place(s) collected so far will be saved.",
+                        query, page_index, len(place_id_map),
+                    )
+                    break
+
                 results = response.get("results", [])
-                logger.info("Found {} results on page {} for query {}", len(results), page_index, query)
+                logger.info("Page {}: {} results for '{}'", page_index, len(results), query)
 
                 for place in results:
                     place_id = place.get("place_id")
                     if place_id and place_id not in place_id_map:
                         place_id_map[place_id] = city
-                        total_found += 1
 
                 page_token = response.get("next_page_token")
                 if not page_token:
-                    break
+                    break  # no more pages for this query
 
-                logger.info("Waiting 2.5 seconds before fetching next page token")
-                time.sleep(2.5)
+                logger.info("Waiting 3s for next_page_token to activate...")
+                time.sleep(3)
 
-    logger.info("Found {} unique raw places", total_found)
+    logger.info("Collected {} unique place(s) across all queries", len(place_id_map))
     return place_id_map
 
 
-def fetch_place_details(client, place_id, max_retries=3):
-    logger.debug("Extracting details for place {}", place_id)
+def fetch_place_details(client, place_id: str, max_retries: int = 3) -> dict:
+    logger.debug("Fetching details for place {}", place_id)
     for attempt in range(1, max_retries + 1):
         try:
             response = client.place(
@@ -89,79 +141,88 @@ def fetch_place_details(client, place_id, max_retries=3):
             return response.get("result", {})
         except Exception as exc:
             wait = 2 ** attempt
-            logger.warning("Attempt {}/{} failed for {}: {} — retrying in {}s", attempt, max_retries, place_id, exc, wait)
+            logger.warning(
+                "Attempt {}/{} failed for {}: {} — retrying in {}s",
+                attempt, max_retries, place_id, exc, wait,
+            )
             if attempt == max_retries:
                 raise
             time.sleep(wait)
 
 
-def build_lead_record(place_id, details, city):
+def build_lead_record(place_id: str, details: dict, city: str) -> dict | None:
     if details.get("permanently_closed"):
         logger.debug("Skipping permanently closed business {}", place_id)
         return None
 
     website = details.get("website")
     if not website:
-        logger.debug("Skipping place {} because no website is available", place_id)
+        logger.debug("Skipping {} — no website", place_id)
         return None
 
     domain = extract_domain(website)
     if not domain:
-        logger.debug("Skipping place {} because domain extraction failed", place_id)
+        logger.debug("Skipping {} — domain extraction failed", place_id)
         return None
 
     return {
         "place_id": place_id,
-        "name": details.get("name", "")[:255],
-        "address": details.get("formatted_address", "")[:512],
-        "city": city,
-        "website": website,
-        "domain": domain,
+        "name":     details.get("name", "")[:255],
+        "address":  details.get("formatted_address", "")[:512],
+        "city":     city,
+        "website":  website,
+        "domain":   domain,
     }
 
 
-def save_leads(leads):
+def save_leads(leads: list[dict]) -> int:
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        before_changes = conn.total_changes
+        before = conn.total_changes
         for lead in leads:
             cursor.execute(
-                "INSERT OR IGNORE INTO leads (place_id, name, address, city, website, domain) VALUES (?, ?, ?, ?, ?, ?)",
-                (lead["place_id"], lead["name"], lead["address"], lead["city"], lead["website"], lead["domain"]),
+                """INSERT OR IGNORE INTO leads
+                   (place_id, name, address, city, website, domain)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (lead["place_id"], lead["name"], lead["address"],
+                 lead["city"],    lead["website"], lead["domain"]),
             )
         conn.commit()
-        inserted = conn.total_changes - before_changes
-        logger.info("Saved {} new leads", inserted)
+        inserted = conn.total_changes - before
+        logger.info("Saved {} new lead(s) to DB", inserted)
         return inserted
     finally:
         conn.close()
 
 
 def run_scraper():
-    logger.info("Starting scraper module")
+    logger.info("Scraper starting")
     init_db()
-    client = build_client()
-    existing_ids = get_existing_place_ids()
-    place_id_map = search_place_ids(client)
+    client        = build_client()
+    existing_ids  = get_existing_place_ids()
+    place_id_map  = search_place_ids(client)
 
-    new_place_ids = {pid: city for pid, city in place_id_map.items() if pid not in existing_ids}
-    logger.info("Skipping {} already-saved places, fetching details for {} new ones", len(place_id_map) - len(new_place_ids), len(new_place_ids))
+    new_ids = {pid: city for pid, city in place_id_map.items() if pid not in existing_ids}
+    logger.info(
+        "{} already in DB, {} new to fetch details for",
+        len(place_id_map) - len(new_ids), len(new_ids),
+    )
 
     leads = []
-    for place_id, city in new_place_ids.items():
+    for place_id, city in new_ids.items():
         try:
             details = fetch_place_details(client, place_id)
-            lead = build_lead_record(place_id, details, city)
+            lead    = build_lead_record(place_id, details, city)
             if lead:
                 leads.append(lead)
         except Exception as exc:
-            logger.warning("Failed to fetch details for {}: {}", place_id, exc)
-        time.sleep(0.05)  # stay under Google's QPS limit
+            logger.warning("Could not fetch details for {}: {}", place_id, exc)
+        time.sleep(0.05)  # stay under Google QPS limit
 
-    logger.info("Processed {} detail records, saving valid leads", len(leads))
+    logger.info("Processed {} detail records", len(leads))
     save_leads(leads)
-    logger.info("Scraper run completed")
+    logger.info("Scraper complete")
 
 
 if __name__ == "__main__":
