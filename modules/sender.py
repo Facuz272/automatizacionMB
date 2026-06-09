@@ -26,9 +26,15 @@ def get_pending_emails(limit: int = DAILY_LIMIT):
     Return emails that are actionable today:
       - 'pending'  → never attempted
       - 'failed'   with failure_count < MAX_RETRIES → transient failure, retry
-      - Always excludes replied leads (replied = 0 guard)
+
+    Hard exclusions (AND guards):
+      - replied = 0      — lead replied or unsubscribed; tracker set this flag
+      - suppression_list — permanent opt-out or confirmed bounce; belt-and-
+                           suspenders guard in case tracker ran before the row
+                           was suppressed (e.g. manual suppression).
+
     Ordered: step-1 before step-2; fewer failures first within each step
-    (so fresh emails go out before retries).
+    (fresh emails go out before retries).
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -40,6 +46,10 @@ def get_pending_emails(limit: int = DAILY_LIMIT):
                 OR (send_status = 'failed' AND COALESCE(failure_count, 0) < ?)
               )
           AND replied = 0
+          AND NOT EXISTS (
+              SELECT 1 FROM suppression_list sl
+              WHERE sl.email = generated_emails.email
+          )
         ORDER BY sequence_step ASC, COALESCE(failure_count, 0) ASC
         LIMIT ?
     """, (MAX_RETRIES, limit))

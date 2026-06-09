@@ -136,7 +136,12 @@ def fetch_place_details(client, place_id: str, max_retries: int = 3) -> dict:
         try:
             response = client.place(
                 place_id=place_id,
-                fields=["name", "formatted_address", "website", "permanently_closed"],
+                fields=[
+                    "name", "formatted_address", "website",
+                    "permanently_closed",
+                    "rating",             # Google review score (0.0–5.0)
+                    "user_ratings_total", # number of reviews
+                ],
             )
             return response.get("result", {})
         except Exception as exc:
@@ -166,27 +171,48 @@ def build_lead_record(place_id: str, details: dict, city: str) -> dict | None:
         return None
 
     return {
-        "place_id": place_id,
-        "name":     details.get("name", "")[:255],
-        "address":  details.get("formatted_address", "")[:512],
-        "city":     city,
-        "website":  website,
-        "domain":   domain,
+        "place_id":           place_id,
+        "name":               details.get("name", "")[:255],
+        "address":            details.get("formatted_address", "")[:512],
+        "city":               city,
+        "website":            website,
+        "domain":             domain,
+        "rating":             details.get("rating"),            # float or None
+        "user_ratings_total": details.get("user_ratings_total"),# int  or None
     }
 
 
 def save_leads(leads: list[dict]) -> int:
+    """
+    Persist new leads.
+
+    Two-layer deduplication:
+      1. place_id PRIMARY KEY  — same API result arriving twice (idempotent re-runs).
+      2. WHERE NOT EXISTS domain — same company discovered via a different city query
+         or vertical search.  We keep the first record encountered and silently drop
+         the duplicate, avoiding phantom duplicates in the enricher / writer queue.
+    """
     conn = get_connection()
     try:
         cursor = conn.cursor()
         before = conn.total_changes
         for lead in leads:
             cursor.execute(
-                """INSERT OR IGNORE INTO leads
-                   (place_id, name, address, city, website, domain)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (lead["place_id"], lead["name"], lead["address"],
-                 lead["city"],    lead["website"], lead["domain"]),
+                """INSERT INTO leads
+                       (place_id, name, address, city, website, domain,
+                        rating, user_ratings_total)
+                   SELECT ?, ?, ?, ?, ?, ?, ?, ?
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM leads
+                       WHERE place_id = ? OR domain = ?
+                   )""",
+                (
+                    lead["place_id"], lead["name"],    lead["address"],
+                    lead["city"],     lead["website"], lead["domain"],
+                    lead.get("rating"), lead.get("user_ratings_total"),
+                    # WHERE NOT EXISTS params
+                    lead["place_id"], lead["domain"],
+                ),
             )
         conn.commit()
         inserted = conn.total_changes - before

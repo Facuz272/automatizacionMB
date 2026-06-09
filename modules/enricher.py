@@ -69,6 +69,38 @@ EMAIL_RE = re.compile(
     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.(?!png|jpg|jpeg|gif|webp)[a-zA-Z]{2,}"
 )
 
+# Local-parts that indicate a role/generic inbox or spam-trap address.
+# Sending to these tanks deliverability and never reaches a decision-maker.
+_GENERIC_LOCAL_PARTS = frozenset({
+    "info", "contact", "hello", "hola", "hi",
+    "admin", "administrator", "webmaster", "hostmaster", "abuse",
+    "postmaster", "mailer-daemon", "noreply", "no-reply", "donotreply",
+    "support", "help", "helpdesk", "service", "customerservice",
+    "sales", "marketing", "billing", "invoices", "accounts",
+    "team", "office", "general", "reception", "enquiries", "enquiry",
+    "mail", "email", "privacy", "legal", "compliance",
+    "news", "newsletter", "updates", "notifications",
+    "careers", "jobs", "hr", "hiring",
+    "media", "press", "pr", "partners",
+})
+
+
+def is_valid_outreach_email(email: str) -> bool:
+    """
+    Return True only if the email address looks like a real person's inbox.
+
+    Rejects:
+      - Role / generic local-parts  (info@, admin@, noreply@, …)
+      - Addresses longer than 254 chars (RFC 5321 hard limit)
+      - Addresses with no '@'
+
+    Does NOT validate domain MX records — that's a pre-send step (ZeroBounce).
+    """
+    if "@" not in email or len(email) > 254:
+        return False
+    local = email.split("@")[0].lower()
+    return local not in _GENERIC_LOCAL_PARTS
+
 
 def scrape_page(url: str) -> tuple[set[str], str]:
     """
@@ -119,8 +151,18 @@ def run_enricher():
                 homepage_text = page_text
             time.sleep(1)
 
-        if found_emails:
-            for em in found_emails:
+        # Filter before saving: drop generic/trap addresses
+        personal_emails = {em for em in found_emails if is_valid_outreach_email(em)}
+        filtered_out    = len(found_emails) - len(personal_emails)
+
+        if filtered_out:
+            logger.debug(
+                "{} generic/trap address(es) discarded for {}",
+                filtered_out, domain,
+            )
+
+        if personal_emails:
+            for em in personal_emails:
                 logger.success("Email found for {}: {}", domain, em)
                 save_email(domain, em.lower())
         else:
