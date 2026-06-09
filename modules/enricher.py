@@ -44,16 +44,20 @@ def save_email(domain, email):
         conn.close()
 
 
-def mark_domain_scraped(domain):
+def mark_domain_scraped(domain: str, website_text: str = ""):
     """
-    Stamp scraped_at on the lead row whether or not an email was found.
-    This is what prevents the infinite-retry loop.
+    Stamp scraped_at and persist homepage text on the lead row.
+    Called whether or not an email was found — prevents infinite-retry loop.
+    website_text is capped at 1 500 chars so the DB column stays lean.
     """
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE leads SET scraped_at = CURRENT_TIMESTAMP WHERE domain = ?",
-        (domain,),
+        """UPDATE leads
+           SET scraped_at   = CURRENT_TIMESTAMP,
+               website_text = ?
+           WHERE domain = ?""",
+        (website_text[:1500] if website_text else None, domain),
     )
     conn.commit()
     conn.close()
@@ -66,17 +70,23 @@ EMAIL_RE = re.compile(
 )
 
 
-def find_emails_on_page(url):
+def scrape_page(url: str) -> tuple[set[str], str]:
+    """
+    Fetch a page and return (emails_found, clean_page_text).
+    clean_page_text has whitespace collapsed — ready for DB storage.
+    Returns (set(), "") on any fetch / parse error.
+    """
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         text = soup.get_text(separator=" ")
-        return set(EMAIL_RE.findall(text))
+        clean_text = " ".join(text.split())          # collapse all whitespace
+        return set(EMAIL_RE.findall(text)), clean_text
     except Exception as e:
         logger.debug("Could not access {}: {}", url, e)
-        return set()
+        return set(), ""
 
 
 # ── Public runner ─────────────────────────────────────────────────────────────
@@ -98,10 +108,15 @@ def run_enricher():
             website = "https://" + website
 
         urls_to_check = [website, f"{website}/contact", f"{website}/about"]
-        found_emails = set()
+        found_emails: set[str] = set()
+        homepage_text = ""
 
-        for url in urls_to_check:
-            found_emails.update(find_emails_on_page(url))
+        for i, url in enumerate(urls_to_check):
+            emails, page_text = scrape_page(url)
+            found_emails.update(emails)
+            # Capture homepage text from the first URL only (the root domain)
+            if i == 0 and page_text:
+                homepage_text = page_text
             time.sleep(1)
 
         if found_emails:
@@ -111,8 +126,8 @@ def run_enricher():
         else:
             logger.info("No emails found for {} — marking as scraped to skip next time", domain)
 
-        # Always stamp scraped_at, even on zero-result domains
-        mark_domain_scraped(domain)
+        # Always stamp scraped_at + save homepage text, even on zero-result domains
+        mark_domain_scraped(domain, homepage_text)
 
     logger.info("Enricher complete")
 

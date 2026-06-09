@@ -76,6 +76,7 @@ def _add_column_if_missing(conn, table: str, column: str, definition: str):
 def _run_all_migrations(conn):
     _migrate_generated_emails_sequence_step(conn)
     _add_column_if_missing(conn, "leads",            "scraped_at",    "TIMESTAMP DEFAULT NULL")
+    _add_column_if_missing(conn, "leads",            "website_text",  "TEXT DEFAULT NULL")
     _add_column_if_missing(conn, "generated_emails", "replied",       "INTEGER NOT NULL DEFAULT 0")
     _add_column_if_missing(conn, "generated_emails", "failure_count", "INTEGER NOT NULL DEFAULT 0")
 
@@ -88,13 +89,14 @@ def init_db():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS leads (
-            place_id   TEXT PRIMARY KEY,
-            name       TEXT,
-            address    TEXT,
-            city       TEXT,
-            website    TEXT,
-            domain     TEXT,
-            scraped_at TIMESTAMP DEFAULT NULL
+            place_id     TEXT PRIMARY KEY,
+            name         TEXT,
+            address      TEXT,
+            city         TEXT,
+            website      TEXT,
+            domain       TEXT,
+            scraped_at   TIMESTAMP DEFAULT NULL,
+            website_text TEXT DEFAULT NULL
         )
     """)
 
