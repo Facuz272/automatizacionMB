@@ -15,8 +15,13 @@ load_dotenv()
 
 SMTP_HOST   = "smtp.gmail.com"
 SMTP_PORT   = 587
-DAILY_LIMIT = 40   # conservative ceiling for Gmail SMTP (~100/day actual max)
+DAILY_LIMIT = 5    # warm-up phase: strict ceiling while building domain reputation
 MAX_RETRIES = 3    # a 'failed' email is retried up to this many times total
+
+# Pause between sends — simulates human behaviour, protects domain reputation.
+# Range: 2–5 minutes (120–300 s).  Raise both bounds gradually as warm-up progresses.
+STAGGER_MIN_S = 120   # 2 minutes
+STAGGER_MAX_S = 300   # 5 minutes
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -136,7 +141,11 @@ def run_sender():
             mark_send_status(email_addr, sequence_step, "failed")
             logger.error("Failed to send {} → {}: {}", label, email_addr, e)
 
-        time.sleep(random.uniform(25, 45))
+        # Human staggering — skip the final sleep (nothing left to space out)
+        if sent_count < len(pending):
+            wait = random.uniform(STAGGER_MIN_S, STAGGER_MAX_S)
+            logger.info("Waiting {:.0f}s before next send…", wait)
+            time.sleep(wait)
 
     logger.info("Sender done — {} initial, {} follow-ups, {} failed",
                 step_counts.get(1, 0),
