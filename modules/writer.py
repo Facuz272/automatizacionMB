@@ -45,7 +45,11 @@ Google Reviews Signal: {rating_signal}
 5. THE CTA: End with a single, low-friction question.
 6. TONE & LENGTH: Maximum 100-120 words. Confident, conversational, direct, strictly professional.
 7. FORBIDDEN PHRASES: Never use "I hope this email finds you well", "We are a leading company", or corporate buzzwords.
-8. SIGNATURE: Sign exactly as: Best, / Tomas / MB Softwash Miami
+8. SIGNATURE: The email MUST end with this exact signature block — no variations, no omissions:
+   Best,
+   Mateo Morantes
+   MB Softwash Miami
+   +1 (305) 834-2218
 """
 
 FOLLOWUP_SYSTEM_PROMPT = """\
@@ -58,7 +62,11 @@ Company being contacted: {company_name}
 Write an ultra-short follow-up (2-3 sentences MAX). Be polite, not pushy — a single gentle nudge to check if they saw the previous message.
 - Do not re-pitch the full offer.
 - End with a simple, low-friction question (e.g., "Would this week work for a quick chat?").
-- Sign exactly as: Best, / Tomas / MB Softwash Miami
+- The email MUST end with this exact signature block — no variations, no omissions:
+  Best,
+  Mateo Morantes
+  MB Softwash Miami
+  +1 (305) 834-2218
 """
 
 _JSON_INSTRUCTION = (
