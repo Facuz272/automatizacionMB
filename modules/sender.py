@@ -34,6 +34,9 @@ def get_pending_emails(limit: int = DAILY_LIMIT):
 
     Hard exclusions (AND guards):
       - replied = 0      — lead replied or unsubscribed; tracker set this flag
+      - snooze_until     — lead returned an OOO / auto-responder; tracker paused
+                           the sequence for 7 days. Once the timestamp passes the
+                           row becomes sendable again automatically.
       - suppression_list — permanent opt-out or confirmed bounce; belt-and-
                            suspenders guard in case tracker ran before the row
                            was suppressed (e.g. manual suppression).
@@ -51,6 +54,7 @@ def get_pending_emails(limit: int = DAILY_LIMIT):
                 OR (send_status = 'failed' AND COALESCE(failure_count, 0) < ?)
               )
           AND replied = 0
+          AND (snooze_until IS NULL OR snooze_until <= CURRENT_TIMESTAMP)
           AND NOT EXISTS (
               SELECT 1 FROM suppression_list sl
               WHERE sl.email = generated_emails.email

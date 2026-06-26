@@ -81,6 +81,18 @@ def _run_all_migrations(conn):
     _add_column_if_missing(conn, "leads",            "user_ratings_total",   "INTEGER DEFAULT NULL")
     _add_column_if_missing(conn, "generated_emails", "replied",              "INTEGER NOT NULL DEFAULT 0")
     _add_column_if_missing(conn, "generated_emails", "failure_count",        "INTEGER NOT NULL DEFAULT 0")
+    # auto_replied: informational flag — tracker sets it when a lead returns an
+    # OOO / auto-responder. Kept separate from `replied` so reply analytics stay
+    # honest. Send gating is driven by snooze_until, not this flag.
+    _add_column_if_missing(conn, "generated_emails", "auto_replied",         "INTEGER NOT NULL DEFAULT 0")
+    # snooze_until: when set, the sender skips the row until this timestamp
+    # passes, then resumes automatically. Tracker sets it +7 days on an OOO so a
+    # lead on vacation isn't lost — just paused.
+    _add_column_if_missing(conn, "generated_emails", "snooze_until",         "TIMESTAMP DEFAULT NULL")
+    # Decision-maker identity captured at enrichment time (Apollo or scrape).
+    _add_column_if_missing(conn, "enriched_leads",   "full_name",            "TEXT DEFAULT NULL")
+    _add_column_if_missing(conn, "enriched_leads",   "title",                "TEXT DEFAULT NULL")
+    _add_column_if_missing(conn, "enriched_leads",   "source",               "TEXT DEFAULT 'scrape'")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -106,8 +118,11 @@ def init_db():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS enriched_leads (
-            domain TEXT,
-            email  TEXT,
+            domain    TEXT,
+            email     TEXT,
+            full_name TEXT DEFAULT NULL,
+            title     TEXT DEFAULT NULL,
+            source    TEXT DEFAULT 'scrape',
             UNIQUE(domain, email)
         )
     """)
@@ -135,6 +150,8 @@ def init_db():
             send_status    TEXT    DEFAULT 'pending',
             sent_at        TIMESTAMP DEFAULT NULL,
             replied        INTEGER NOT NULL DEFAULT 0,
+            auto_replied   INTEGER NOT NULL DEFAULT 0,
+            snooze_until   TIMESTAMP DEFAULT NULL,
             failure_count  INTEGER NOT NULL DEFAULT 0,
             UNIQUE(email, sequence_step)
         )

@@ -5,6 +5,7 @@ import requests
 from bs4 import BeautifulSoup
 from loguru import logger
 
+from modules.apollo import find_decision_maker
 from utils.db import get_connection, init_db
 
 
@@ -29,13 +30,15 @@ def get_pending_domains():
     return domains
 
 
-def save_email(domain, email):
+def save_email(domain, email, full_name=None, title=None, source="scrape"):
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
-            "INSERT OR IGNORE INTO enriched_leads (domain, email) VALUES (?, ?)",
-            (domain, email),
+            """INSERT OR IGNORE INTO enriched_leads
+                   (domain, email, full_name, title, source)
+               VALUES (?, ?, ?, ?, ?)""",
+            (domain, email, full_name, title, source),
         )
         conn.commit()
     except Exception as e:
@@ -90,16 +93,28 @@ def is_valid_outreach_email(email: str) -> bool:
     Return True only if the email address looks like a real person's inbox.
 
     Rejects:
-      - Role / generic local-parts  (info@, admin@, noreply@, …)
+      - Role / generic local-parts          (info@, admin@, noreply@, …)
+      - Plus-addressed role inboxes          (info+canned.response@, sales+x@)
+      - Compound role local-parts            (info.miami@, sales.team@, support-us@)
       - Addresses longer than 254 chars (RFC 5321 hard limit)
       - Addresses with no '@'
+
+    The exact-match check this replaced let plus-addressing and dotted role
+    inboxes through — that is exactly how `info+canned.response@…` slipped past
+    the filter and received a follow-up. We now normalise the local-part
+    (drop the +tag) and inspect every token split on '.', '_' and '-'.
 
     Does NOT validate domain MX records — that's a pre-send step (ZeroBounce).
     """
     if "@" not in email or len(email) > 254:
         return False
     local = email.split("@")[0].lower()
-    return local not in _GENERIC_LOCAL_PARTS
+    base = local.split("+", 1)[0]              # strip plus-tag: info+x → info
+    if base in _GENERIC_LOCAL_PARTS:
+        return False
+    # Token check catches compound role inboxes (info.miami, sales-team).
+    tokens = re.split(r"[._-]", base)
+    return not any(tok in _GENERIC_LOCAL_PARTS for tok in tokens)
 
 
 def scrape_page(url: str) -> tuple[set[str], str]:
@@ -139,6 +154,8 @@ def run_enricher():
         if not website.startswith("http"):
             website = "https://" + website
 
+        # Always scrape the homepage — even when Apollo supplies the email, the
+        # writer needs website_text for personalization.
         urls_to_check = [website, f"{website}/contact", f"{website}/about"]
         found_emails: set[str] = set()
         homepage_text = ""
@@ -146,12 +163,29 @@ def run_enricher():
         for i, url in enumerate(urls_to_check):
             emails, page_text = scrape_page(url)
             found_emails.update(emails)
-            # Capture homepage text from the first URL only (the root domain)
             if i == 0 and page_text:
                 homepage_text = page_text
             time.sleep(1)
 
-        # Filter before saving: drop generic/trap addresses
+        # ── Priority 1: Apollo decision-maker ─────────────────────────────────
+        # Go straight to the owner/director instead of a footer's info@.
+        decision_maker = find_decision_maker(domain)
+        if decision_maker and is_valid_outreach_email(decision_maker[0]):
+            dm_email, dm_name, dm_title = decision_maker
+            save_email(
+                domain, dm_email.lower(),
+                full_name=dm_name or None,
+                title=dm_title or None,
+                source="apollo",
+            )
+            logger.success(
+                "Decision-maker for {}: {} <{}> ({})",
+                domain, dm_name or "?", dm_email, dm_title or "no title",
+            )
+            mark_domain_scraped(domain, homepage_text)
+            continue
+
+        # ── Priority 2: scraped personal emails (fallback) ────────────────────
         personal_emails = {em for em in found_emails if is_valid_outreach_email(em)}
         filtered_out    = len(found_emails) - len(personal_emails)
 
@@ -164,9 +198,9 @@ def run_enricher():
         if personal_emails:
             for em in personal_emails:
                 logger.success("Email found for {}: {}", domain, em)
-                save_email(domain, em.lower())
+                save_email(domain, em.lower(), source="scrape")
         else:
-            logger.info("No emails found for {} — marking as scraped to skip next time", domain)
+            logger.info("No usable email for {} — marking as scraped to skip next time", domain)
 
         # Always stamp scraped_at + save homepage text, even on zero-result domains
         mark_domain_scraped(domain, homepage_text)

@@ -36,6 +36,7 @@ load_dotenv()
 IMAP_HOST    = "imap.gmail.com"
 IMAP_PORT    = 993
 LOOKBACK_DAYS = 2   # see original comment about UTC/ET boundary
+SNOOZE_DAYS  = 7    # how long to pause a sequence after an OOO / auto-reply
 
 
 # ── Detection vocabularies ────────────────────────────────────────────────────
@@ -63,6 +64,30 @@ BOUNCE_SUBJECT_KEYWORDS: frozenset[str] = frozenset({
     "mail delivery failure", "non-delivery report",
     "message delivery failed",
 })
+
+# Subject keywords that flag an out-of-office / auto-responder message.
+# These are NOT genuine replies — following up on them spams a robot and
+# signals to the recipient's mail system that we are a bot.
+AUTO_REPLY_SUBJECT_KEYWORDS: frozenset[str] = frozenset({
+    "out of office", "out-of-office", "ooo",
+    "auto-reply", "auto reply", "autoreply",
+    "automatic reply", "auto response", "auto-response", "autoresponse",
+    "away from", "on vacation", "on holiday", "on annual leave", "on leave",
+    "thank you for contacting", "thank you for your email",
+    "thanks for contacting", "thanks for your email",
+    "we have received your", "we received your", "we've received your",
+    "message received", "your email has been received",
+})
+
+# Header fields (lowercased) that, when present/non-trivial, mark an auto-reply.
+# Auto-Submitted is RFC 3834; the X-* headers are the de-facto conventions used
+# by Gmail, Outlook, and most autoresponders.
+AUTO_REPLY_HEADER_FIELDS: tuple[str, ...] = (
+    "auto-submitted",          # RFC 3834: any value other than "no"
+    "x-autoreply",
+    "x-autorespond",
+    "x-auto-response-suppress",
+)
 
 # Ordered longest-first so the most specific prefix is stripped preferentially
 _BOUNCE_PREFIXES: tuple[str, ...] = (
@@ -94,6 +119,26 @@ def _is_bounce_notification(from_addr: str, subject: str) -> bool:
         any(p in from_lower    for p in BOUNCE_FROM_PATTERNS)
         or any(kw in subject_lower for kw in BOUNCE_SUBJECT_KEYWORDS)
     )
+
+
+def _is_auto_reply(headers: dict[str, str], subject: str) -> bool:
+    """
+    True if the message is an out-of-office / auto-responder reply.
+
+    Checks the standard auto-reply headers first (most reliable), then falls
+    back to subject keywords for autoresponders that omit the headers.
+    """
+    for field in AUTO_REPLY_HEADER_FIELDS:
+        value = headers.get(field, "").strip().lower()
+        if not value:
+            continue
+        # Auto-Submitted: "no" means a real human message; anything else is auto.
+        if field == "auto-submitted" and value == "no":
+            continue
+        return True
+
+    subject_lower = subject.lower()
+    return any(kw in subject_lower for kw in AUTO_REPLY_SUBJECT_KEYWORDS)
 
 
 def _extract_original_subject(bounce_subject: str) -> str | None:
@@ -144,6 +189,47 @@ def mark_as_replied(email_addr: str) -> int:
     conn.commit()
     conn.close()
     return affected
+
+
+def snooze_lead(email_addr: str, days: int = SNOOZE_DAYS) -> int:
+    """
+    Pause a sequence for `days` after an OOO / auto-reply, instead of killing it.
+
+    Sets snooze_until = now + days for every step of this address; the sender
+    skips the rows until the timestamp passes, then resumes automatically — so a
+    lead on vacation is paused, not lost. Also stamps auto_replied=1 for
+    analytics. The WHERE guard skips rows already inside an active snooze window,
+    so re-reading the same OOO message on the next run doesn't keep extending it.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE generated_emails
+        SET auto_replied = 1,
+            snooze_until = datetime('now', ?)
+        WHERE email = ?
+          AND (snooze_until IS NULL OR snooze_until <= CURRENT_TIMESTAMP)
+    """, (f"+{days} days", email_addr))
+    affected = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return affected
+
+
+def get_tracked_addresses_by_domain() -> dict[str, set[str]]:
+    """
+    Map domain → set of tracked addresses at that domain.
+
+    Auto-responders frequently reply from a different address than the one we
+    targeted (e.g. info+canned.response@ or noreply@), so an exact From match
+    misses them. Matching on the domain lets us halt the right sequence anyway.
+    """
+    mapping: dict[str, set[str]] = {}
+    for addr in get_tracked_addresses():
+        domain = addr.split("@")[-1] if "@" in addr else ""
+        if domain:
+            mapping.setdefault(domain, set()).add(addr)
+    return mapping
 
 
 def add_to_suppression_list(email_addr: str, domain: str, reason: str) -> int:
@@ -222,13 +308,14 @@ def _parse_from_address(raw_from: str) -> str:
 def _fetch_recent_senders(
     mail: imaplib.IMAP4_SSL,
     lookback_days: int,
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, dict[str, str]]]:
     """
-    Return (from_address, subject) pairs for inbox messages received in
-    the last `lookback_days` days.
+    Return (from_address, subject, auto_reply_headers) tuples for inbox
+    messages received in the last `lookback_days` days.
 
-    Fetches ONLY From + Subject headers (~200 bytes/message).
-    RAM usage stays flat regardless of inbox size.
+    Fetches only the From/Subject headers plus the small set of auto-reply
+    marker headers (~300 bytes/message). RAM stays flat regardless of inbox
+    size. `auto_reply_headers` keys are lowercased field names.
     """
     since_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%d-%b-%Y")
     _, message_ids = mail.search(None, f"SINCE {since_date}")
@@ -239,15 +326,21 @@ def _fetch_recent_senders(
     ids = message_ids[0].split()
     logger.info("Scanning {} inbox messages since {} (headers only)", len(ids), since_date)
 
+    header_fields = "FROM SUBJECT AUTO-SUBMITTED X-AUTOREPLY X-AUTORESPOND X-AUTO-RESPONSE-SUPPRESS"
+
     senders = []
     for msg_id in ids:
         try:
-            _, msg_data = mail.fetch(msg_id, "(BODY[HEADER.FIELDS (FROM SUBJECT)])")
+            _, msg_data = mail.fetch(msg_id, f"(BODY[HEADER.FIELDS ({header_fields})])")
             msg       = email.message_from_bytes(msg_data[0][1])
             from_addr = _parse_from_address(msg.get("From", ""))
             subject   = msg.get("Subject", "(no subject)")
+            auto_headers = {
+                field: msg.get(field, "")
+                for field in AUTO_REPLY_HEADER_FIELDS
+            }
             if from_addr:
-                senders.append((from_addr, subject))
+                senders.append((from_addr, subject, auto_headers))
         except Exception as exc:
             logger.debug("Could not parse message {}: {}", msg_id, exc)
 
@@ -268,6 +361,8 @@ def run_tracker():
     if not tracked:
         logger.info("Tracker: no active outbound leads to watch for replies.")
         return
+
+    tracked_by_domain = get_tracked_addresses_by_domain()
 
     logger.info("Tracker: checking inbox for replies from {} active leads...", len(tracked))
 
@@ -291,8 +386,9 @@ def run_tracker():
     new_replies      = 0
     new_unsubscribes = 0
     new_bounces      = 0
+    new_auto_replies = 0
 
-    for from_addr, subject in recent_senders:
+    for from_addr, subject, auto_headers in recent_senders:
 
         # ── 1. Bounce detection — must check BEFORE reply / unsubscribe ─────────
         # Bounces originate from mailer-daemon, never from a real lead address,
@@ -338,7 +434,26 @@ def run_tracker():
                 )
             continue
 
-        # ── 3. Hot reply from a tracked lead ────────────────────────────────────
+        # ── 3. Auto-reply / out-of-office — pause, do NOT count as a reply ──────
+        # Must run BEFORE the hot-reply branch: an OOO message can carry the
+        # lead's real From address, and we don't want to mark a robot as hot.
+        # Match on domain because autoresponders often reply from a different
+        # address (info+canned.response@, noreply@) than the one we targeted.
+        if _is_auto_reply(auto_headers, subject):
+            reply_domain = from_addr.split("@")[-1] if "@" in from_addr else ""
+            snoozed_any = False
+            for tracked_addr in tracked_by_domain.get(reply_domain, set()):
+                if snooze_lead(tracked_addr) > 0:
+                    snoozed_any = True
+                    logger.warning(
+                        "Auto-reply from {} — {} snoozed {} days (will resume, not a real reply)",
+                        from_addr, tracked_addr, SNOOZE_DAYS,
+                    )
+            if snoozed_any:
+                new_auto_replies += 1
+            continue
+
+        # ── 4. Hot reply from a tracked lead ────────────────────────────────────
         if from_addr not in tracked:
             continue
 
@@ -355,7 +470,7 @@ def run_tracker():
             logger.info("")
 
     # ── Summary ──────────────────────────────────────────────────────────────
-    if new_replies == 0 and new_unsubscribes == 0 and new_bounces == 0:
+    if not (new_replies or new_unsubscribes or new_bounces or new_auto_replies):
         logger.info("Tracker: nothing actionable in the last {} day(s).", LOOKBACK_DAYS)
     else:
         if new_replies:
@@ -364,6 +479,11 @@ def run_tracker():
             logger.warning("Tracker: {} unsubscribe(s) honoured and suppressed.", new_unsubscribes)
         if new_bounces:
             logger.warning("Tracker: {} bounce(s) detected and suppressed.", new_bounces)
+        if new_auto_replies:
+            logger.warning(
+                "Tracker: {} auto-reply(ies) detected — sequences snoozed {} days.",
+                new_auto_replies, SNOOZE_DAYS,
+            )
 
 
 if __name__ == "__main__":

@@ -32,8 +32,19 @@ full photo report, zero-obligation estimate, 100% satisfaction guarantee.
 
 === PROSPECT DATA ===
 Company Name: {company_name}
+Decision-maker: {recipient_name}
 Website Information: {website_text}
 Google Reviews Signal: {rating_signal}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 0 — GREETING (first line of the body, mandatory)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The body MUST begin with exactly this line, on its own, followed by a blank line:
+
+  {recipient_greeting}
+
+Do not invent or guess a name, do not add a surname or title, do not write
+"Dear". Use the greeting above verbatim, then start your opening line.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 1 — BANNED PHRASES (any of these = rejected output)
@@ -140,8 +151,11 @@ You are an expert B2B sales copywriter for 'MB Softwash Miami', an exterior main
 You are writing a brief follow-up to a cold email sent 4 days ago. The original email offered a FREE Property Exterior Inspection & Maintenance Assessment.
 
 Company being contacted: {company_name}
+Decision-maker: {recipient_name}
 
 Write an ultra-short follow-up (2-3 sentences MAX). Be polite, not pushy — a single gentle nudge to check if they saw the previous message.
+- The body MUST begin with exactly this greeting line, on its own, then a blank line: {recipient_greeting}
+  Do not invent a name or add a title — use it verbatim.
 - Do not re-pitch the full offer.
 - End with a simple, low-friction question (e.g., "Would this week work for a quick chat?").
 - The email MUST end with this exact signature block — no variations, no omissions:
@@ -155,6 +169,27 @@ _JSON_INSTRUCTION = (
     'Return ONLY a valid JSON object with exactly two keys: "subject" and "body". '
     "No markdown, no extra text, no explanation."
 )
+
+
+# ── Recipient greeting ────────────────────────────────────────────────────────
+
+def _greeting(full_name: str | None) -> tuple[str, str]:
+    """
+    Build the salutation from the Apollo decision-maker name.
+
+    Returns (greeting_line, recipient_label):
+      - With a name : ("Hi John,", "John")          — first name only, sane casing
+      - Without     : ("Hi there,", "the property manager (name unknown)")
+
+    The fallback is deliberately warm and human — "Hi there," reads like a real
+    person, never like a broken mail-merge ("Hi ,").
+    """
+    if full_name and full_name.strip():
+        first = full_name.strip().split()[0]
+        if first.isupper() or first.islower():   # JOHN / john → John, leave McKay alone
+            first = first.capitalize()
+        return f"Hi {first},", first
+    return "Hi there,", "the property manager (name unknown)"
 
 
 # ── Rating signal ─────────────────────────────────────────────────────────────
@@ -199,7 +234,7 @@ def _build_rating_signal(rating: float | None, review_count: int | None) -> str:
 def get_initial_candidates(limit: int = WRITER_DAILY_LIMIT):
     """
     Enriched leads that don't have a step-1 draft yet.
-    Returns (domain, email, company_name, website_text, rating, review_count).
+    Returns (domain, email, company_name, website_text, rating, review_count, full_name).
 
     Excludes:
       - Addresses already in suppression_list (unsubscribed / bounced)
@@ -213,7 +248,8 @@ def get_initial_candidates(limit: int = WRITER_DAILY_LIMIT):
                COALESCE(l.name, el.domain)        AS company_name,
                COALESCE(l.website_text, '')        AS website_text,
                l.rating                            AS rating,
-               l.user_ratings_total                AS review_count
+               l.user_ratings_total                AS review_count,
+               el.full_name                        AS full_name
         FROM enriched_leads el
         LEFT JOIN leads l ON l.domain = el.domain
         WHERE NOT EXISTS (
@@ -237,23 +273,28 @@ def get_followup_candidates():
     and don't have a step-2 draft yet.
     The replied = 0 guard is the critical block: if they replied to step-1,
     we never generate (or send) a follow-up.
-    Returns (domain, email, company_name).
+    Returns (domain, email, company_name, full_name).
 
-    Also excludes suppressed addresses — catch-all for late unsubscribes
-    that arrived after step-1 was drafted.
+    Also excludes:
+      - Suppressed addresses — catch-all for late unsubscribes after step-1.
+      - Snoozed leads (OOO / auto-reply) — don't draft a follow-up while the
+        sequence is paused; it would just sit until the snooze expires.
     """
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT ge.domain,
                ge.email,
-               COALESCE(l.name, ge.domain) AS company_name
+               COALESCE(l.name, ge.domain) AS company_name,
+               el.full_name                AS full_name
         FROM generated_emails ge
         LEFT JOIN leads l ON l.domain = ge.domain
+        LEFT JOIN enriched_leads el ON el.email = ge.email
         WHERE ge.sequence_step = 1
           AND ge.send_status   = 'sent'
           AND ge.replied       = 0
           AND ge.sent_at      <= datetime('now', '-4 days')
+          AND (ge.snooze_until IS NULL OR ge.snooze_until <= CURRENT_TIMESTAMP)
           AND NOT EXISTS (
               SELECT 1 FROM generated_emails ge2
               WHERE ge2.email = ge.email AND ge2.sequence_step = 2
@@ -379,9 +420,12 @@ def run_writer():
         len(leads), WRITER_DAILY_LIMIT,
     )
 
-    for domain, email, company_name, website_text, rating, review_count in leads:
+    for domain, email, company_name, website_text, rating, review_count, full_name in leads:
+        greeting_line, recipient_label = _greeting(full_name)
         system = SYSTEM_PROMPT.format(
             company_name=company_name,
+            recipient_name=recipient_label,
+            recipient_greeting=greeting_line,
             website_text=website_text or f"(no website text captured — domain: {domain})",
             rating_signal=_build_rating_signal(rating, review_count),
         )
@@ -411,8 +455,13 @@ def run_followup_writer():
 
     logger.info("Module 3 — drafting {} follow-up emails", len(candidates))
 
-    for domain, email, company_name in candidates:
-        system = FOLLOWUP_SYSTEM_PROMPT.format(company_name=company_name)
+    for domain, email, company_name, full_name in candidates:
+        greeting_line, recipient_label = _greeting(full_name)
+        system = FOLLOWUP_SYSTEM_PROMPT.format(
+            company_name=company_name,
+            recipient_name=recipient_label,
+            recipient_greeting=greeting_line,
+        )
 
         result = _draft_email(client, system, _JSON_INSTRUCTION, domain, step=2)
         if result:
