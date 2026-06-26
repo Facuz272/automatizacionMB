@@ -5,7 +5,7 @@ import requests
 from bs4 import BeautifulSoup
 from loguru import logger
 
-from modules.apollo import find_decision_maker
+from modules.apollo import ApolloTransientError, find_decision_maker
 from utils.db import get_connection, init_db
 
 
@@ -169,7 +169,17 @@ def run_enricher():
 
         # ── Priority 1: Apollo decision-maker ─────────────────────────────────
         # Go straight to the owner/director instead of a footer's info@.
-        decision_maker = find_decision_maker(domain)
+        # A transient Apollo failure must NOT burn the domain: skip it WITHOUT
+        # stamping scraped_at so the next cycle retries it cleanly.
+        try:
+            decision_maker = find_decision_maker(domain)
+        except ApolloTransientError as exc:
+            logger.warning(
+                "Apollo transient failure for {} — skipping, will retry next cycle: {}",
+                domain, exc,
+            )
+            continue  # do NOT mark_domain_scraped — domain stays pending
+
         if decision_maker and is_valid_outreach_email(decision_maker[0]):
             dm_email, dm_name, dm_title = decision_maker
             save_email(
