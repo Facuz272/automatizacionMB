@@ -1,0 +1,29 @@
+# Litestream replication service.
+# Install location: /etc/systemd/system/litestream.service
+#
+# NOTE: the Litestream .deb already ships its own litestream.service. Use this
+# file only if you want an explicit, version-controlled unit. If you use the
+# packaged one, just drop deploy/litestream.yml at /etc/litestream.yml and run
+# `systemctl enable --now litestream`.
+
+[Unit]
+Description=Litestream continuous replication of leads.db to S3
+# Replicate only while the DB is being written; start alongside the pipeline.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Restart=always
+RestartSec=5
+
+# Static S3 credentials live in a root-owned 0600 file, NOT in this unit.
+# Skip this line entirely if the EC2 instance has an IAM role attached.
+EnvironmentFile=-/etc/litestream.env
+
+ExecStart=/usr/bin/litestream replicate -config /etc/litestream.yml
+
+[Install]
+WantedBy=multi-user.target

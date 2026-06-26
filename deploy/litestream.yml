@@ -1,0 +1,26 @@
+# Litestream continuous-replication config for the prospecting DB.
+# Install location on the server: /etc/litestream.yml
+#
+# Requirements (already satisfied by this project):
+#   - leads.db runs in WAL mode (utils/db.py sets PRAGMA journal_mode=WAL).
+#     Litestream replicates the WAL; without it, replication does not work.
+#   - The app never truncates the WAL (no `wal_checkpoint(TRUNCATE)`), so
+#     Litestream never misses frames.
+#
+# Credentials: do NOT hard-code keys here. They come from the environment
+# (LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY) via the systemd
+# EnvironmentFile, or — better — from an EC2 instance role (no static keys).
+
+dbs:
+  - path: /home/ubuntu/automatizacionMB/data/leads.db
+    replicas:
+      - type: s3
+        bucket: mb-prospeccion-backups
+        path: leads.db                 # key prefix inside the bucket
+        region: us-east-1              # MUST match the bucket's region
+        # How often to push new WAL frames to S3 (default 1s).
+        sync-interval: 10s
+        # Take a full snapshot daily and keep 30 days of history so you can
+        # restore to any point within the retention window.
+        snapshot-interval: 24h
+        retention: 720h                # 30 days
