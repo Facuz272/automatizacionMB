@@ -8,8 +8,19 @@ BASE_DIR = Path(__file__).parent
 DB_PATH = str(BASE_DIR / "data" / "leads.db")
 
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
-TARGET_CITIES = ["Doral"]
-TARGET_VERTICALS = ["property management"]
+# Scraper search space: every (vertical × city) pair becomes one Google Places
+# text query. Kept deliberately moderate — each query is billable and the
+# scraper runs Mon–Fri, so 5×3 = 15 queries/run balances a full lead queue
+# against Places API cost. Widen further only if the queue starts running dry.
+# Cities: Doral + nearby Miami-Dade municipalities with dense managed property.
+TARGET_CITIES = ["Doral", "Miami", "Coral Gables", "Hialeah", "Aventura"]
+# Verticals: the softwash/exterior-cleaning ICP — firms that pay to clean
+# building facades and common areas (property mgrs, HOA & condo associations).
+TARGET_VERTICALS = [
+    "property management",
+    "HOA management",
+    "condominium association management",
+]
 
 # When True, and a domain yields neither a decision-maker (Apollo) nor a
 # personal email, the enricher falls back to a SINGLE human-read generic inbox
