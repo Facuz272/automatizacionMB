@@ -5,6 +5,7 @@ import requests
 from bs4 import BeautifulSoup
 from loguru import logger
 
+from config import ALLOW_GENERIC_FALLBACK
 from modules.apollo import ApolloTransientError, find_decision_maker
 from utils.db import get_connection, init_db
 
@@ -117,6 +118,58 @@ def is_valid_outreach_email(email: str) -> bool:
     return not any(tok in _GENERIC_LOCAL_PARTS for tok in tokens)
 
 
+# ── Generic fallback (micro-business last resort) ─────────────────────────────
+# Bounce / spam-trap / technical inboxes. NEVER send here — doing so tanks
+# deliverability and can land the whole domain on a blocklist. These stay
+# rejected even when ALLOW_GENERIC_FALLBACK is on.
+_NEVER_SEND_LOCAL_PARTS = frozenset({
+    "noreply", "no-reply", "donotreply", "postmaster",
+    "mailer-daemon", "abuse", "hostmaster", "webmaster",
+})
+
+# Human-read role inboxes, ordered best → worst. At a 5-15 person property
+# manager, info@/office@ is very often the owner's real inbox, so we allow ONE
+# of these as a last resort when no decision-maker or personal email exists.
+_GENERIC_FALLBACK_PRIORITY = (
+    "info", "contact", "contacto", "hello", "hola",
+    "office", "admin", "general", "reception",
+    "enquiries", "enquiry", "hi", "team", "mail", "email",
+)
+_FALLBACK_RANK = {name: i for i, name in enumerate(_GENERIC_FALLBACK_PRIORITY)}
+
+
+def pick_generic_fallback(emails: set[str]) -> str | None:
+    """
+    Last-resort inbox selector for micro-businesses.
+
+    From the addresses scraped off a site, return the single best *human-read*
+    generic inbox (info@, contact@, office@…) — or None if none qualify.
+
+    Selection is a strict whitelist (_FALLBACK_RANK): anything not on it is
+    ignored, which by construction excludes every bounce/trap/technical inbox.
+    _NEVER_SEND_LOCAL_PARTS is an explicit second guard for intent + safety.
+    Only ever returns ONE address, so we never blast several role inboxes at the
+    same company.
+    """
+    best: tuple[int, str] | None = None
+    for em in emails:
+        if "@" not in em or len(em) > 254:
+            continue
+        base = em.split("@")[0].lower().split("+", 1)[0]   # strip +tag
+        if base in _NEVER_SEND_LOCAL_PARTS:
+            continue
+        # Match the whole local-part, then fall back to its first token so
+        # compound inboxes like info.miami@ still resolve to "info".
+        rank = _FALLBACK_RANK.get(base)
+        if rank is None:
+            rank = _FALLBACK_RANK.get(re.split(r"[._-]", base)[0])
+        if rank is None:
+            continue
+        if best is None or rank < best[0]:
+            best = (rank, em)
+    return best[1] if best else None
+
+
 def scrape_page(url: str) -> tuple[set[str], str]:
     """
     Fetch a page and return (emails_found, clean_page_text).
@@ -209,6 +262,18 @@ def run_enricher():
             for em in personal_emails:
                 logger.success("Email found for {}: {}", domain, em)
                 save_email(domain, em.lower(), source="scrape")
+
+        # ── Priority 3: single human-read generic inbox (micro-biz fallback) ──
+        # Only when the domain gave no decision-maker AND no personal email.
+        # Tagged source='generic_fallback' so its reply rate can be measured
+        # separately and the whole tier switched off if it underperforms.
+        elif ALLOW_GENERIC_FALLBACK and (fallback := pick_generic_fallback(found_emails)):
+            logger.success(
+                "Generic fallback for {}: {} (no decision-maker/personal email available)",
+                domain, fallback,
+            )
+            save_email(domain, fallback.lower(), source="generic_fallback")
+
         else:
             logger.info("No usable email for {} — marking as scraped to skip next time", domain)
 

@@ -11,9 +11,9 @@ from utils.db import get_connection, init_db
 # ── Limits ────────────────────────────────────────────────────────────────────
 
 # Draft at most this many step-1 emails per pipeline run.
-# Keeps the pending queue in sync with DAILY_LIMIT in sender.py (40) while
-# leaving headroom for follow-up steps.  Raise once sending infrastructure
-# (domain warm-up, multiple accounts) supports higher volume.
+# Intentionally well above the sender's DAILY_LIMIT (5, warm-up mode): the writer
+# builds a backlog of drafts that the sender drains a few per day. Raise the
+# sender limit — not necessarily this — once warm-up graduates to full volume.
 WRITER_DAILY_LIMIT = 80
 
 
