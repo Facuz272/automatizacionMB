@@ -141,6 +141,8 @@ def fetch_place_details(client, place_id: str, max_retries: int = 3) -> dict:
                     "permanently_closed",
                     "rating",             # Google review score (0.0–5.0)
                     "user_ratings_total", # number of reviews
+                    "formatted_phone_number",     # local dialing format, e.g. (305) 834-2218
+                    "international_phone_number",  # +country fallback if local missing
                 ],
             )
             return response.get("result", {})
@@ -179,6 +181,8 @@ def build_lead_record(place_id: str, details: dict, city: str) -> dict | None:
         "domain":             domain,
         "rating":             details.get("rating"),            # float or None
         "user_ratings_total": details.get("user_ratings_total"),# int  or None
+        "phone":              details.get("formatted_phone_number")
+                              or details.get("international_phone_number"),  # str or None
     }
 
 
@@ -200,8 +204,8 @@ def save_leads(leads: list[dict]) -> int:
             cursor.execute(
                 """INSERT INTO leads
                        (place_id, name, address, city, website, domain,
-                        rating, user_ratings_total)
-                   SELECT ?, ?, ?, ?, ?, ?, ?, ?
+                        rating, user_ratings_total, phone)
+                   SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
                    WHERE NOT EXISTS (
                        SELECT 1 FROM leads
                        WHERE place_id = ? OR domain = ?
@@ -210,6 +214,7 @@ def save_leads(leads: list[dict]) -> int:
                     lead["place_id"], lead["name"],    lead["address"],
                     lead["city"],     lead["website"], lead["domain"],
                     lead.get("rating"), lead.get("user_ratings_total"),
+                    lead.get("phone"),
                     # WHERE NOT EXISTS params
                     lead["place_id"], lead["domain"],
                 ),

@@ -79,6 +79,9 @@ def _run_all_migrations(conn):
     _add_column_if_missing(conn, "leads",            "website_text",         "TEXT DEFAULT NULL")
     _add_column_if_missing(conn, "leads",            "rating",               "REAL DEFAULT NULL")
     _add_column_if_missing(conn, "leads",            "user_ratings_total",   "INTEGER DEFAULT NULL")
+    # Business phone (Google Places formatted_phone_number) — used for manual
+    # phone outreach. Backfilled for pre-existing rows via backfill_phones.py.
+    _add_column_if_missing(conn, "leads",            "phone",                "TEXT DEFAULT NULL")
     _add_column_if_missing(conn, "generated_emails", "replied",              "INTEGER NOT NULL DEFAULT 0")
     _add_column_if_missing(conn, "generated_emails", "failure_count",        "INTEGER NOT NULL DEFAULT 0")
     # auto_replied: informational flag — tracker sets it when a lead returns an
@@ -112,7 +115,8 @@ def init_db():
             scraped_at          TIMESTAMP DEFAULT NULL,
             website_text        TEXT      DEFAULT NULL,
             rating              REAL      DEFAULT NULL,
-            user_ratings_total  INTEGER   DEFAULT NULL
+            user_ratings_total  INTEGER   DEFAULT NULL,
+            phone               TEXT      DEFAULT NULL
         )
     """)
 
