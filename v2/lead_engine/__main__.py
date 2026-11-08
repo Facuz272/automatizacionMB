@@ -44,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--dry-run", action="store_true",
                       help="envía al CRM con dry_run=true (no escribe) y guarda la respuesta")
     mode.add_argument("--commit", action="store_true", help="inserta de verdad en el CRM")
+    r.add_argument("--pdf", action="store_true", help="generar el informe PDF de preventa por lead en out/<lote>/pdf/")
     r.add_argument("-v", "--verbose", action="store_true")
 
     i = sub.add_parser("import", help="enviar un crm_payload.json ya generado")
@@ -52,6 +53,17 @@ def main(argv: list[str] | None = None) -> int:
     ds = sub.add_parser("dbpr-sync", help="descargar padrón de condominios + licencias CAM del DBPR")
     ds.add_argument("--groups", help="MD,PB,NF,CE,CW (default DBPR_GROUPS o MD,PB)")
     ds.add_argument("--no-cam", action="store_true", help="no descargar el padrón de licencias CAM")
+    pp = sub.add_parser("pdf", help="informes PDF de preventa desde out/<lote>/leads.jsonl")
+    pp.add_argument("leads", help="out/<lote>/leads.jsonl")
+    pp.add_argument("--out", help="carpeta destino (default: <lote>/pdf)")
+    pp.add_argument("--top", type=int, help="solo los N de mayor lead_score")
+    pp.add_argument("--min-score", type=int, default=0)
+    rt = sub.add_parser("route", help="ruta de inspecciones optimizada por zonas")
+    rt.add_argument("input", help="leads.jsonl del lote o export del CRM (.csv/.json) con address e inspection_at")
+    rt.add_argument("--date", help="día (YYYY-MM-DD, default hoy en Miami)")
+    rt.add_argument("--inspectors", default=None, help="nombres separados por coma (default INSPECTORS)")
+    rt.add_argument("--start", default=None, help="'lat,lng' de salida (default ROUTE_START o centro de las visitas)")
+    rt.add_argument("--out", help="carpeta destino (default: junto al input)")
     cl = sub.add_parser("cam-load", help="cargar lic38cam.csv ya descargado")
     cl.add_argument("file")
     dl = sub.add_parser("dbpr-load", help="cargar CSVs del DBPR ya descargados")
@@ -67,6 +79,17 @@ def main(argv: list[str] | None = None) -> int:
         if not args.no_cam:
             print({"cam_licenses": cam.load_and_reindex(cam.sync)})
         return 0
+    if args.cmd == "pdf":
+        from pathlib import Path
+
+        from . import pdf_generator
+        src = Path(args.leads)
+        out = Path(args.out) if args.out else src.parent / "pdf"
+        files = pdf_generator.generate_batch(pdf_generator.load_jsonl(src), out, top=args.top, min_score=args.min_score)
+        print(f"{len(files)} PDF en {out}/")
+        return 0
+    if args.cmd == "route":
+        return _route(args)
     if args.cmd == "cam-load":
         print({"cam_licenses": cam.load_and_reindex(lambda c: cam.load_csv(args.file, c))})
         return 0
@@ -101,8 +124,43 @@ def main(argv: list[str] | None = None) -> int:
         use_ai=not args.no_ai, use_apollo=not args.no_apollo, precheck=not args.no_precheck,
         send=args.dry_run or args.commit, commit=args.commit, max_candidates=args.max_candidates,
         use_search=not args.no_search, use_geo=not args.no_geo, use_dbpr=not args.no_dbpr,
-        check_mx=False if args.no_mx else None,
+        check_mx=False if args.no_mx else None, make_pdfs=args.pdf,
     )
+    return 0
+
+
+def _route(args) -> int:
+    import json
+    import os
+    from datetime import date
+    from pathlib import Path
+
+    from . import geocode, route_optimizer as ro
+
+    stops = ro.load(args.input)
+    names = [x.strip() for x in (args.inspectors or os.getenv("INSPECTORS", "Inspector 1")).split(",") if x.strip()]
+    day = date.fromisoformat(args.date) if args.date else None
+    raw_start = args.start or os.getenv("ROUTE_START")
+    if raw_start:
+        lat, lng = (float(x) for x in raw_start.split(","))
+        start = (lat, lng)
+    else:
+        for s in stops:
+            if s.lat is None:
+                hit = geocode.geocode(s.address)
+                if hit:
+                    s.lat, s.lng = hit
+        pts = [(s.lat, s.lng) for s in stops if s.lat is not None]
+        start = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)) if pts else (25.7617, -80.1918)
+    plan = ro.optimize(stops, inspectors=names, start=start, day=day, geocoder=geocode.geocode)
+    out = Path(args.out) if args.out else Path(args.input).parent
+    out.mkdir(parents=True, exist_ok=True)
+    stem = f"ruta_{plan.day.isoformat()}"
+    (out / f"{stem}.md").write_text(ro.to_markdown(plan), encoding="utf-8")
+    ro.to_csv(plan, out / f"{stem}.csv")
+    (out / f"{stem}.json").write_text(json.dumps(ro.to_json(plan), ensure_ascii=False, indent=2), encoding="utf-8")
+    print(ro.to_markdown(plan))
+    print(f"Archivos: {out}/{stem}.md · .csv · .json")
     return 0
 
 

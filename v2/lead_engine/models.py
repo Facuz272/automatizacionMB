@@ -123,6 +123,8 @@ class Lead:
     lodging: dict[str, Any] = field(default_factory=dict)
     # management firm's corporate domain (mgmt_domains.resolve): {"domain","status","source","email"?}
     management_domain: dict[str, Any] = field(default_factory=dict)
+    # competitor_intel.analyze: zone weaknesses of cleaning vendors from neighbours' reviews
+    competitor_intel: dict[str, Any] = field(default_factory=dict)
     search_hits: list[dict[str, Any]] = field(default_factory=list)
     lead_score: int = 0
     score_breakdown: dict[str, int] = field(default_factory=dict)

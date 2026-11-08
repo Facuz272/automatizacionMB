@@ -66,6 +66,7 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline.appraiser, "lookup", lambda address: dict(CADASTRE_5555)
                         if address and address.startswith("5555 Collins") else None)
     monkeypatch.setattr(pipeline.lodging, "match", lambda address, conn=None: None)
+    monkeypatch.setattr(pipeline.geocode, "geocode", lambda address: None)
     monkeypatch.setattr(pipeline.npi, "enrich", lambda lead: None)
     monkeypatch.setattr(pipeline.mgmt_domains, "resolve", lambda firm, **kw: {
         "domain": "castlegroup.com", "status": "mx", "source": "catalog", "firm": "Castle Group"}
@@ -92,7 +93,7 @@ def test_full_run(wired, monkeypatch):
     monkeypatch.setattr(google_places, "settings", s)
     costs.tracker.reset()
     out = pipeline.run(strategy="onsite", limit=5, use_ai=False, use_apollo=False, precheck=False,
-                       out_dir=wired / "out", max_candidates=4)
+                       out_dir=wired / "out", max_candidates=4, make_pdfs=True)
 
     leads = [json.loads(l) for l in (out / "leads.jsonl").read_text().splitlines()]
     payload = json.loads((out / "crm_payload.json").read_text())["leads"]
@@ -135,6 +136,7 @@ def test_full_run(wired, monkeypatch):
     assert oceania["public_records"]["dbpr"]["units"] == 330
 
     assert report["accepted"] == 3 and report["pct"]["dbpr_match"] == 100.0
+    assert report["pdfs"] == 3 and (out / "pdf" / "Oceanside_Plaza_Condo.pdf").exists()
     assert report["pct"]["municipal_signal"] == round(100 / 3, 1) and report["pct"]["deal_estimated"] == 100.0
     assert report["estimated_deal_usd"]["sum_high"] >= top["estimated_deal"]["high"]
     assert report["lead_score"]["max"] == 100

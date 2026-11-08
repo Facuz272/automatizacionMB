@@ -24,7 +24,7 @@ CSV                ya están         OSM (pisos/m²/amenities/costa) → dolor �
 v2/
 ├── pyproject.toml / requirements.txt / .env.example
 ├── lead_engine/
-│   ├── __main__.py        CLI: run | import | dbpr-sync | dbpr-load | cam-load
+│   ├── __main__.py        CLI: run | import | pdf | route | dbpr-sync | dbpr-load | cam-load
 │   ├── config.py          env + ciudades y consultas por estrategia (onsite/pain/portfolio)
 │   ├── normalize.py       extract_domain, to_e164, phone_key, address_problem, emails (puro)
 │   ├── models.py          Lead + brief() «Ficha» + crm_payload() (contrato exacto del endpoint)
@@ -48,6 +48,10 @@ v2/
 │   ├── verticals.py       segmentos de negocio y vocabulario comercial por segmento
 │   ├── roles.py           roles de decisión (PM, facilities, asistente, junta) y horario de oficina
 │   ├── mgmt_domains.py    dominios corporativos verificados de administradoras
+│   ├── pdf_generator.py   informe técnico preliminar de preventa (PDF de 2 páginas) por lead
+│   ├── competitor_intel.py  debilidades de la competencia en reseñas de edificios vecinos
+│   ├── route_optimizer.py rutas de inspección por zonas e inspector
+│   ├── geocode.py         geocodificación gratuita (US Census) para leads sin coordenadas
 │   ├── geo.py             perfil físico OSM: pisos, huella m², techo, amenities lavables, distancia a la costa
 │   ├── pain.py            detector de dolor ponderado EN/ES con cita y fecha
 │   ├── email_verify.py    DNS MX/A con caché y sonda de resolvedor
@@ -112,6 +116,57 @@ Cruza cada lead por número + calle normalizada + ZIP (o por nombre dentro del Z
 línea «C/O» del registro: administradora («C/O CASTLE MANAGEMENT LLC»), oficina en el edificio
 («C/O MANAGEMENT OFFICE»), directivo de la junta («C/O PETER BATTY, PRESIDENT») o agente
 registrado (no se usa como contacto). Con los datos de nov-2026 interpreta el 99 % de esas líneas.
+
+### PDF de preventa
+
+```bash
+python -m lead_engine run --seed dbpr --strategy onsite --limit 20 --dry-run --pdf   # PDFs del lote
+python -m lead_engine pdf out/<lote>/leads.jsonl --top 10                          # o después, de un lote ya generado
+```
+
+Un PDF de 2 páginas por lead en `out/<lote>/pdf/<edificio>.pdf`, listo para mandar por mail o
+WhatsApp. Página 1: portada con los datos oficiales (catastro de Miami-Dade y DBPR: año y antigüedad,
+pisos, unidades, ft², lote, uso de suelo, valor tasado, asociación, administración, folio). Página
+2: diagnóstico técnico (Milestone/recertificación, permisos y casos municipales, reseñas con
+evidencia, salitre, antecedentes de la zona, superficies), alcance del servicio softwash según el
+segmento, cuadro con el rango del contrato anual por componente y próximo paso. El contenido de cada
+página se ajusta para que el informe sea siempre de 2 páginas. Lleva la marca de `COMPANY_*` (solo
+lo que esté definido) y la aclaración de que es una estimación preliminar, no una inspección
+estructural ni una cotización vinculante.
+
+### Inteligencia competitiva de la zona
+
+Con las reseñas de todos los edificios vistos en la corrida (gratis) y, si `COMPETITOR_NEARBY=true`,
+una búsqueda Places Nearby por lead, `competitor_intel.py` busca frases sobre empresas de limpieza
+exterior con una debilidad: el moho vuelve a las semanas, la alta presión dañó pintura o selladores,
+rayas, incumplimientos, daños a plantas o filtraciones, sobreprecios (inglés y español). El gancho
+suma una línea de cierre sin nombrar a ningún competidor (los nombres quedan en la evidencia):
+
+```
+Zona: reseñas de 2 edificio(s) vecino(s) dicen que el moho y las manchas vuelven a las pocas semanas
+después del lavado a presión → argumento: el softwash trata el moho con producto a baja presión en vez
+de solo arrastrarlo, por eso dura más.
+```
+
+### Rutas de inspección
+
+```bash
+python -m lead_engine route export_crm.csv --date 2026-11-10 --inspectors "Tomás,Mateo" --start "25.7617,-80.1918"
+python -m lead_engine route out/<lote>/leads.jsonl --inspectors "Tomás,Mateo"
+```
+
+Entrada: `leads.jsonl` de un lote o un export del CRM (CSV/JSON con `company_name`, `address` y,
+opcionales, `inspection_at`, `inspector`, `phone`, `lat`/`lng`; las direcciones sin coordenadas se
+geocodifican gratis con el Census). Cada visita recibe su zona (Brickell/Downtown, Miami Beach,
+Sunny Isles/Aventura, Coral Gables/Grove, Doral, Fort Lauderdale…). Las visitas sin inspector se
+reparten por zonas enteras al inspector con citas más cercanas ese día. Las citas agendadas mantienen
+su hora (y se avisa si el traslado no llega); las visitas libres se insertan donde menos kilómetros
+suman sin atrasar ninguna cita, prefiriendo terminar antes el día (los huecos de la mañana se
+llenan). Salida: `ruta_<día>.md` (para WhatsApp, con links de Google Maps), `.csv` y `.json`.
+
+Prueba real con 8 edificios (2 citas): 81 km en total, cada inspector en su zona y la mañana de Mateo
+ocupada antes de su cita de las 14:00; antes del ajuste
+de reparto por citas eran 132 km cruzando Miami.
 
 ### Segmentos de negocio
 

@@ -73,6 +73,15 @@ class Settings:
     # (Gran Comunidad / Shopping/Plaza Comercial / Edificio Comercial / Clínica/Hospital) once the CRM enum has them.
     # --seed pa: which vertical to pull from the cadastre (plaza | commercial | clinic)
     seed_vertical: str = field(default_factory=lambda: os.getenv("SEED_VERTICAL", "plaza").strip().lower())
+    geocode_enabled: bool = field(default_factory=lambda: _bool("GEOCODE_ENABLED", True))
+    # zone competitor intelligence
+    competitor_radius_m: float = field(default_factory=lambda: float(os.getenv("COMPETITOR_RADIUS_M", "1500")))
+    competitor_nearby: bool = field(default_factory=lambda: _bool("COMPETITOR_NEARBY", False))
+    # branding for the pre-sale PDF (only what is set here is printed; nothing is invented)
+    company_name: str = field(default_factory=lambda: os.getenv("COMPANY_NAME", "MB Softwash Miami"))
+    company_phone: str | None = field(default_factory=lambda: os.getenv("COMPANY_PHONE") or None)
+    company_email: str | None = field(default_factory=lambda: os.getenv("COMPANY_EMAIL") or None)
+    company_website: str | None = field(default_factory=lambda: os.getenv("COMPANY_WEBSITE") or None)
     crm_segment_mode: str = field(default_factory=lambda: os.getenv("CRM_SEGMENT_MODE", "pain").strip().lower())
     email_mx_check: bool = field(default_factory=lambda: _bool("EMAIL_MX_CHECK", True))
     crm_include_brief: bool = field(default_factory=lambda: _bool("CRM_INCLUDE_BRIEF", True))

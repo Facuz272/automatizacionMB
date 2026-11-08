@@ -50,6 +50,7 @@ def build(batch_id: str, strategy: str, leads: list[Lead], rejected: list[dict])
             "plan_b_contact": _pct(sum(bool(l.plan_b()) for l in leads), n),
             "office_hours": _pct(sum(bool(l.office_hours) for l in leads), n),
             "management_domain": _pct(sum(bool(l.management_domain) for l in leads), n),
+            "competitor_intel": _pct(sum(bool(l.competitor_intel.get("top_weakness")) for l in leads), n),
             "ai_qualified": _pct(sum(l.ai_used for l in leads), n),
         },
         "lead_score": {
@@ -98,7 +99,7 @@ def print_report(r: dict[str, Any], out_dir) -> None:
         ("Cluster multi-propiedad", p["multi_property_cluster"]), ("Ticket estimado", p["deal_estimated"]),
         ("Catastro oficial", p["cadastre_match"]), ("Ventana Milestone", p["milestone_window"]),
         ("Contacto plan B", p["plan_b_contact"]), ("Horario de oficina", p["office_hours"]),
-        ("Dominio administradora", p["management_domain"]),
+        ("Dominio administradora", p["management_domain"]), ("Debilidad competencia zona", p["competitor_intel"]),
         ("Precalificado con IA", p["ai_qualified"]),
     ]
     for label, v in rows:

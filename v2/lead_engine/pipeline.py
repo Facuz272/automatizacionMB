@@ -27,8 +27,9 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
-from . import (ai_enrich, apollo, appraiser, cam, costs, crm_importer, dbpr, email_verify, geo, lodging, mgmt_domains,
-               municipal_signals, npi, quality, render, scoring, search, valuation, verticals)
+from . import (ai_enrich, apollo, appraiser, cam, competitor_intel, costs, crm_importer, dbpr, email_verify, geo,
+               geocode, lodging, mgmt_domains, municipal_signals, npi, quality, render, scoring, search, valuation,
+               verticals)
 from .roles import pick_primary
 from .collectors import dbpr_seed, google_places, osm, seed_csv
 from .config import settings
@@ -365,6 +366,13 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
         apply_licenses(lead)
         apply_cluster(lead)
 
+    # Coordinates for leads that came without them (free Census geocoder).
+    if lead.lat is None and lead.address:
+        hit = geocode.geocode(lead.address)
+        if hit:
+            lead.lat, lead.lng = hit
+            lead.evidence["coords_from"] = "census_geocoder"
+
     # Physical profile (official cadastre overrides estimates) + annual contract estimate.
     osm_profile = geo.fetch_profile(lead.lat, lead.lng) if use_geo else {}
     units = (lead.public_records.get("dbpr") or {}).get("units") or lead.cadastre.get("units")
@@ -409,6 +417,22 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
         lead.evidence["rendered_pages"] = facts.rendered[:4]
 
 
+def apply_competitor_intel(leads: list[Lead], pool: list[dict]) -> None:
+    """Zone weaknesses of cleaning vendors (neighbours' reviews) → evidence + one closing line in the hook."""
+    for lead in leads:
+        neighbors = competitor_intel.neighbors_from_pool(lead.lat, lead.lng, pool, exclude_id=lead.source_id)
+        if lead.lat is not None and settings.competitor_nearby:
+            seen = {n.get("name") for n in neighbors}
+            neighbors += [n for n in competitor_intel.nearby_from_places(lead.lat, lead.lng)
+                          if n.get("name") not in seen and n.get("name") != lead.company_name]
+        summary = competitor_intel.analyze(neighbors, own_reviews=lead.reviews)
+        if summary.get("neighbors_scanned") or summary.get("mentions"):
+            lead.competitor_intel = summary
+        line = competitor_intel.hook_line(summary)
+        if line and lead.sales_strategy and line not in lead.sales_strategy:
+            lead.sales_strategy = f"{lead.sales_strategy} {line}"
+
+
 def write_needs_phone(path: Path, leads: list[Lead]) -> None:
     """DBPR buildings that passed every filter but no source gave a phone: a ready list for manual lookup."""
     import csv
@@ -433,7 +457,8 @@ def default_sources() -> list[str]:
 def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None = None, seed: str | None = None,
         use_ai: bool = True, use_apollo: bool = True, precheck: bool = True, send: bool = False,
         commit: bool = False, max_candidates: int | None = None, out_dir: Path | None = None,
-        use_search: bool = True, use_geo: bool = True, use_dbpr: bool = True, check_mx: bool | None = None) -> Path:
+        use_search: bool = True, use_geo: bool = True, use_dbpr: bool = True, check_mx: bool | None = None,
+        make_pdfs: bool = False) -> Path:
     sources = list(sources) if sources else default_sources()
     batch_id = new_batch_id(strategy)
     out = Path(out_dir or settings.out_dir) / batch_id
@@ -447,6 +472,7 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
                 settings.render_js if render.available() else "off")
 
     rejected: list[dict] = []
+    review_pool: list[dict] = []          # every building seen in this run with reviews (zone competitor intel)
     needs_phone: list[Lead] = []
     municipal_signals.reset()
     gated: list[tuple[Lead, SiteFacts | None]] = []
@@ -464,6 +490,9 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
             continue
         if lead.source in ("dbpr", "pa"):
             resolve_seed(lead, use_search)
+        if lead.reviews and lead.lat is not None:
+            review_pool.append({"id": lead.source_id, "name": lead.company_name, "lat": lead.lat, "lng": lead.lng,
+                                "reviews": lead.reviews})
         facts: SiteFacts | None = None
         needs_site = not lead.phone or address_problem(lead.address, settings.target_state)
         if needs_site and lead.website_url:
@@ -523,7 +552,8 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
     finally:
         render.close()
 
-    # ── 5: rank ───────────────────────────────────────────────────────────────
+    # ── 5: zone competitor intel, then rank ──────────────────────────────────
+    apply_competitor_intel(accepted, review_pool)
     accepted = scoring.rank(accepted)
 
     # ── 6: output ─────────────────────────────────────────────────────────────
@@ -553,7 +583,14 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
             if commit:
                 ledger.mark_imported(payloads, report)
 
+    pdfs: list[Path] = []
+    if make_pdfs and accepted:
+        from . import pdf_generator
+        pdfs = pdf_generator.generate_batch(
+            [{**l.internal_record(), "import_batch_id": batch_id} for l in accepted], out / "pdf")
+
     qr = quality.build(batch_id, strategy, accepted, rejected)
+    qr["pdfs"] = len(pdfs)
     if crm_summary:
         qr["crm"] = crm_summary
     (out / "quality_report.json").write_text(json.dumps(qr, ensure_ascii=False, indent=2), encoding="utf-8")
