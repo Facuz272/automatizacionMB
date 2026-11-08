@@ -128,7 +128,7 @@ OFFICER_TITLES = {
 }
 
 
-_KEEP_UPPER = {"NE", "NW", "SE", "SW", "LLC", "INC", "LLP", "PA", "II", "III", "IV", "USA", "HOA", "CAM", "LCAM", "FL"}
+_KEEP_UPPER = {"NE", "NW", "SE", "SW", "LLC", "INC", "LLP", "LP", "PA", "II", "III", "IV", "USA", "HOA", "CAM", "LCAM", "FL"}
 
 
 def _title_case(s: str) -> str:

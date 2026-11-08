@@ -16,7 +16,7 @@ import sys
 
 from loguru import logger
 
-from . import cam, crm_importer, dbpr, pipeline
+from . import cam, crm_importer, dbpr, lodging, pipeline
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -26,9 +26,10 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run", help="recolectar, validar, enriquecer y (opcional) enviar al CRM")
     r.add_argument("--strategy", choices=["onsite", "pain", "portfolio"], default="onsite")
     r.add_argument("--limit", type=int, default=20, help="leads enriquecidos a producir")
-    r.add_argument("--source", action="append", choices=["places", "osm", "csv", "dbpr"],
+    r.add_argument("--source", action="append", choices=["places", "osm", "csv", "dbpr", "npi", "pa"],
                    help="repetible; por defecto places si hay GOOGLE_PLACES_API_KEY, si no dbpr")
-    r.add_argument("--seed", help="'dbpr' = semilla desde el padrón DBPR; o un CSV para --source csv")
+    r.add_argument("--seed", help="dbpr (condominios) | npi (clínicas) | pa (catastro: --vertical) | archivo.csv")
+    r.add_argument("--vertical", choices=["plaza", "commercial", "clinic"], help="--seed pa: segmento a sembrar")
     r.add_argument("--min-units", type=int, help="semilla DBPR: mínimo de unidades (default MIN_UNITS=50)")
     r.add_argument("--max-candidates", type=int, default=None, help="tope de candidatos crudos (default 6×limit)")
     r.add_argument("--no-ai", action="store_true", help="solo reglas, sin Claude")
@@ -62,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "dbpr-sync":
         groups = [g.strip() for g in args.groups.split(",")] if args.groups else None
         print(dbpr.sync(groups))
+        print({"lodging": lodging.sync(groups)})
         if not args.no_cam:
             print({"cam_licenses": cam.load_and_reindex(cam.sync)})
         return 0
@@ -75,9 +77,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     sources = args.source
     seed_file = args.seed
-    if args.seed and args.seed.lower() == "dbpr":
-        sources, seed_file = (sources or []) + ["dbpr"], None
-    if args.min_units is not None or args.render:
+    if args.seed and args.seed.lower() in ("dbpr", "npi", "pa"):
+        sources, seed_file = (sources or []) + [args.seed.lower()], None
+    if args.min_units is not None or args.render or args.vertical:
         import dataclasses
 
         from . import config
@@ -87,6 +89,8 @@ def main(argv: list[str] | None = None) -> int:
             changes["min_units"] = args.min_units
         if args.render:
             changes["render_js"] = args.render
+        if args.vertical:
+            changes["seed_vertical"] = args.vertical
         config.settings = dataclasses.replace(config.settings, **changes)
         for mod in ("render", "web_extract", "pipeline", "collectors.dbpr_seed"):
             setattr(__import__(f"lead_engine.{mod}", fromlist=["settings"]), "settings", config.settings)

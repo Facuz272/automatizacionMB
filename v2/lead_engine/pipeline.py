@@ -27,8 +27,9 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
-from . import (ai_enrich, apollo, cam, costs, crm_importer, dbpr, email_verify, geo, municipal_signals, quality, render,
-               scoring, search, valuation)
+from . import (ai_enrich, apollo, appraiser, cam, costs, crm_importer, dbpr, email_verify, geo, lodging, mgmt_domains,
+               municipal_signals, npi, quality, render, scoring, search, valuation, verticals)
+from .roles import pick_primary
 from .collectors import dbpr_seed, google_places, osm, seed_csv
 from .config import settings
 from .models import Lead
@@ -53,6 +54,12 @@ def _candidates(strategy: str, sources: list[str], max_candidates: int, seed: st
             yield from osm.collect(strategy, max_candidates)
         elif src == "dbpr":
             yield from dbpr_seed.collect(strategy, max_candidates)
+        elif src == "npi":
+            from .config import cities_for
+            yield from npi.collect(strategy, max_candidates, cities_for(strategy))
+        elif src == "pa":
+            from .collectors import appraiser_seed
+            yield from appraiser_seed.collect(strategy, max_candidates, vertical=settings.seed_vertical)
         elif src == "csv":
             if not seed:
                 raise SystemExit("--source csv requiere --seed archivo.csv")
@@ -115,6 +122,9 @@ def resolve_seed(lead: Lead, use_search: bool) -> None:
                 if getattr(found, attr) and not getattr(lead, attr):
                     setattr(lead, attr, getattr(found, attr))
             lead.evidence["places_match"] = found.evidence.get("places_match")
+            if lead.source == "pa" and found.company_name:      # cadastre has the owner, Places has the business name
+                lead.evidence["owner_as_name"] = lead.company_name
+                lead.company_name = found.company_name
             lead.evidence["place_id"] = found.source_id
             lead.evidence["phone_raw"] = found.evidence.get("phone_raw")
     if lead.lat is None or not lead.phone:
@@ -154,6 +164,72 @@ def apply_licenses(lead: Lead) -> None:
             lead.contact_title = "LCAM (licencia activa)"
     if firm:
         lead.licenses["firm"] = firm
+
+
+# ZIPs within ~3 miles of the Atlantic / Biscayne Bay in Miami-Dade and Broward (milestone at 25 years).
+COASTAL_3MI_ZIPS = {
+    "33109", "33139", "33140", "33141", "33154", "33160", "33180", "33181", "33162", "33149", "33129", "33130",
+    "33131", "33132", "33133", "33137", "33138", "33136", "33125", "33128", "33156", "33157", "33158", "33176",
+    "33009", "33019", "33020", "33004", "33062", "33064", "33060", "33301", "33304", "33305", "33306", "33308",
+    "33316", "33315", "33441", "33432", "33431", "33480", "33062", "33308",
+}
+
+
+def coastal_3mi(lead: Lead) -> bool:
+    b = lead.building or {}
+    if b.get("coast_distance_m") is not None:
+        return b["coast_distance_m"] <= 4828
+    return bool(b.get("coastal")) or (dbpr.zip5(lead.address) or "") in COASTAL_3MI_ZIPS
+
+
+def apply_official_building(lead: Lead) -> None:
+    """Miami-Dade Property Appraiser facts override estimates (floors, units, area, year)."""
+    p, b = lead.cadastre, lead.building
+    if not p:
+        return
+    if p.get("floors") and (p.get("floors_source") == "appraiser" or not b.get("levels")):
+        if b.get("levels") and b["levels"] != p["floors"]:
+            b["levels_osm"] = b["levels"]
+        b["levels"] = p["floors"]
+        b["levels_source"] = p.get("floors_source")
+    if p.get("units") and not b.get("units"):
+        b["units"] = p["units"]
+    if p.get("building_sqft"):
+        b["building_sqft"] = p["building_sqft"]
+        if not b.get("footprint_m2") and p.get("kind") == "property" and b.get("levels"):
+            b["footprint_m2"] = round(p["building_sqft"] / b["levels"] / 10.7639)
+            b["footprint_source"] = "appraiser"
+        if p["building_sqft"] >= 100_000:
+            b["large"] = True
+    if p.get("year_built"):
+        b["year_built"] = p["year_built"]
+    if p.get("lot_sqft"):
+        b["lot_sqft"] = p["lot_sqft"]
+    b["vertical"] = lead.vertical
+
+
+def apply_property_owner(lead: Lead) -> None:
+    """Plazas / office buildings: the registered owner and the c/o management firm from the cadastre."""
+    p = lead.cadastre
+    if not p or lead.vertical == "community":
+        return
+    if p.get("care_of") and not lead.management_company:
+        lead.management_company = p["care_of"].title()
+        lead.management_type = "third_party"
+        lead.evidence["management_from"] = "appraiser_care_of"
+    if p.get("owner_name"):
+        lead.evidence["owner"] = {"name": p["owner_name"], "mailing": p.get("owner_mailing")}
+
+
+def apply_lodging(lead: Lead) -> None:
+    lg = lead.lodging
+    if not lg or not lg.get("phone"):
+        return
+    if not any(x["number"] == lg["phone"] for x in lead.phones):
+        lead.phones.append({"number": lg["phone"], "label": "front_desk", "source": "dbpr_lodging",
+                            "context": f"{lg.get('kind')} {lg.get('business_name')}"})
+    if not lead.phone:
+        lead.phone = lg["phone"]
 
 
 def apply_cluster(lead: Lead) -> None:
@@ -228,10 +304,15 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
     facts = facts or SiteFacts()
     choose_primary_phone(lead)
 
-    # Site: people (first PM-like title wins) and managed-by.
-    if not lead.contact_name and facts.people:
-        lead.contact_name, lead.contact_title = facts.people[0]
-        lead.evidence["contact_from"] = "website"
+    # Site: every person with a title (PM, facilities/engineering, board…), office hours, managed-by.
+    for name, title in facts.people:
+        lead.add_contact(name, title, "website")
+    lead.office_hours = lead.office_hours or facts.office_hours
+    if not lead.contact_name and lead.contacts:
+        best = pick_primary(lead.contacts)
+        if best:
+            lead.contact_name, lead.contact_title = best["name"], best["title"]
+            lead.evidence["contact_from"] = best["source"]
     if not lead.management_company and facts.managed_by:
         lead.management_company = facts.managed_by[0]
         lead.management_type = "third_party"
@@ -261,22 +342,53 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
         if ap and ap.get("email") and not lead.email:
             lead.email, lead.email_source = ap["email"], "apollo"
 
+    # Official cadastre + lodging licence, then the business vertical.
+    if lead.source != "pa":                      # cadastre seeds already carry their exact folio
+        lead.cadastre = appraiser.lookup(lead.address) or lead.cadastre
+    if use_dbpr:
+        lead.lodging = lodging.match(lead.address) or {}
+    lead.vertical = verticals.classify(appraiser=lead.cadastre.get("vertical"), source=lead.source,
+                                       places_types=lead.place_types, name=lead.company_name,
+                                       lodging_kind=lead.lodging.get("kind"))
+    apply_property_owner(lead)
+    apply_lodging(lead)
+    if lead.vertical == "clinic" and lead.source != "npi" and settings.npi_enabled:
+        npi.enrich(lead)
+    if not lead.contact_name and lead.contacts:
+        best = pick_primary(lead.contacts)
+        if best:
+            lead.contact_name, lead.contact_title = best["name"], best["title"]
+            lead.evidence["contact_from"] = best["source"]
+
     # Licences (CAM person / CAB firm) and the firm's other buildings in the area.
     if use_dbpr:
         apply_licenses(lead)
         apply_cluster(lead)
 
-    # Physical profile + annual contract estimate.
+    # Physical profile (official cadastre overrides estimates) + annual contract estimate.
     osm_profile = geo.fetch_profile(lead.lat, lead.lng) if use_geo else {}
-    units = (lead.public_records.get("dbpr") or {}).get("units")
+    units = (lead.public_records.get("dbpr") or {}).get("units") or lead.cadastre.get("units")
     lead.building = geo.merge_profile(osm_profile, lead.web_text, lead.address, units)
+    lead.building["vertical"] = lead.vertical
+    apply_official_building(lead)
     lead.estimated_deal = valuation.estimate(lead.building) or {}
 
-    # Municipal urgency (open data), then pain + email.
+    # Municipal urgency (open data) + milestone window, then pain + email.
     lead.municipal = municipal_signals.lookup(lead.address, lat=lead.lat, lng=lead.lng,
                                               dbpr_county=(lead.public_records.get("dbpr") or {}).get("county"))
+    ms = appraiser.milestone_signal(lead.cadastre.get("year_built"), lead.building.get("levels"),
+                                    coastal_3mi(lead), units=lead.building.get("units"),
+                                    condo=lead.vertical == "community")
+    if ms and lead.vertical in ("community", "commercial", "clinic", "plaza"):
+        lead.municipal.insert(0, ms)
     detect_pain(lead)
     pick_email(lead, emails, check_mx)
+
+    # No direct email but a known management firm: its verified corporate domain/inbox.
+    if lead.management_company and not lead.email:
+        md = mgmt_domains.resolve(lead.management_company, use_search=use_search, check_mx=check_mx)
+        if md:
+            lead.management_domain = md
 
     # Claude, guarded by the evidence.
     if use_ai and ai_enrich.available():
@@ -350,7 +462,7 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
     for lead in _candidates(strategy, list(sources), max_candidates, seed):
         if ledger.outcome(lead.source_id) in ("accepted", "imported", "in_crm"):
             continue
-        if lead.source == "dbpr":
+        if lead.source in ("dbpr", "pa"):
             resolve_seed(lead, use_search)
         facts: SiteFacts | None = None
         needs_site = not lead.phone or address_problem(lead.address, settings.target_state)
@@ -359,7 +471,7 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
             _fill_from_site(lead, facts)
         problem = contactability_problem(lead, settings.target_state)
         if problem:
-            if lead.source == "dbpr" and not lead.phone:
+            if lead.source in ("dbpr", "pa") and not lead.phone:
                 needs_phone.append(lead)
                 problem = "sin teléfono (semilla DBPR: sin Places/OSM/web con teléfono)"
             reject(lead, problem)

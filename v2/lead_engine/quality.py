@@ -45,6 +45,11 @@ def build(batch_id: str, strategy: str, leads: list[Lead], rejected: list[dict])
             "firm_cab_licensed": _pct(sum(bool((l.licenses.get("firm") or {}).get("active")) for l in leads), n),
             "multi_property_cluster": _pct(sum(l.portfolio_cluster.get("count", 0) > 1 for l in leads), n),
             "deal_estimated": _pct(sum(bool(l.estimated_deal) for l in leads), n),
+            "cadastre_match": _pct(sum(bool(l.cadastre) for l in leads), n),
+            "milestone_window": _pct(sum(any(m["category"] == "milestone" for m in l.municipal) for l in leads), n),
+            "plan_b_contact": _pct(sum(bool(l.plan_b()) for l in leads), n),
+            "office_hours": _pct(sum(bool(l.office_hours) for l in leads), n),
+            "management_domain": _pct(sum(bool(l.management_domain) for l in leads), n),
             "ai_qualified": _pct(sum(l.ai_used for l in leads), n),
         },
         "lead_score": {
@@ -66,6 +71,7 @@ def build(batch_id: str, strategy: str, leads: list[Lead], rejected: list[dict])
         },
         "municipal_categories": dict(Counter(m["category"] for l in leads for m in l.municipal)),
         "sources": dict(Counter(l.source for l in leads)),
+        "verticals": dict(Counter(l.vertical for l in leads)),
         "segments": dict(Counter(l.segment for l in leads)),
         "strategy_kinds": dict(Counter(l.strategy_kind for l in leads)),
         "top_pain_categories": dict(Counter(p["category"] for l in leads for p in l.pain).most_common(8)),
@@ -90,6 +96,9 @@ def print_report(r: dict[str, Any], out_dir) -> None:
         ("Cruce DBPR", p["dbpr_match"]), ("Señal municipal", p["municipal_signal"]),
         ("Contacto con LCAM activa", p["contact_cam_licensed"]), ("Firma CAM licenciada", p["firm_cab_licensed"]),
         ("Cluster multi-propiedad", p["multi_property_cluster"]), ("Ticket estimado", p["deal_estimated"]),
+        ("Catastro oficial", p["cadastre_match"]), ("Ventana Milestone", p["milestone_window"]),
+        ("Contacto plan B", p["plan_b_contact"]), ("Horario de oficina", p["office_hours"]),
+        ("Dominio administradora", p["management_domain"]),
         ("Precalificado con IA", p["ai_qualified"]),
     ]
     for label, v in rows:

@@ -11,6 +11,7 @@ area (ft²) × price per ft² per service (low/high) × services per year:
   pool deck   3,000–6,000 ft² by size, 4×/yr               (pool_deck)
   courts      7,200 ft² per court, 2×/yr                   (tennis_court)
   gatehouse   flat USD 150–300 per service, 4×/yr          (gatehouse)
+  lot         commercial verticals: 60% of the lot outside the footprint (parking, sidewalks), 4×/yr
 
 When the footprint is unknown it is derived from units (≈95 m² gross per unit,
 spread over the known levels, or levels ≈ units/12 capped at 20 — large unit
@@ -37,6 +38,7 @@ RATES: dict[str, tuple[float, float, float]] = {
     "garage": (0.08, 0.15, 2.0),
     "pool_deck": (0.15, 0.25, 4.0),
     "courts": (0.10, 0.18, 2.0),
+    "lot_hardscape": (0.04, 0.08, 4.0),     # commercial parking lots / sidewalks, quarterly
 }
 COASTAL_FACADE_FREQ = 1.5
 ROPE_ACCESS_LEVELS = 8
@@ -45,10 +47,14 @@ GATEHOUSE_FLAT = (150.0, 300.0, 4.0)
 
 
 def _geometry(building: dict[str, Any]) -> tuple[int | None, float | None]:
-    """(levels, footprint m²) with fallbacks from units."""
+    """(levels, footprint m²) with fallbacks from the official built area, then from units."""
     levels = building.get("levels")
     footprint = building.get("footprint_m2")
     units = building.get("units")
+    sqft = building.get("building_sqft")
+    if not footprint and sqft and building.get("vertical") not in (None, "community"):
+        levels = levels or 2
+        footprint = sqft / levels / M2_TO_FT2
     if not footprint and units:
         lv = levels or min(MAX_ASSUMED_LEVELS, max(1, math.ceil(units / 12)))
         footprint = units * GROSS_M2_PER_UNIT / lv
@@ -90,6 +96,12 @@ def estimate(building: dict[str, Any]) -> dict[str, Any] | None:
     if "tennis_court" in amenities:
         lo, hi, freq = RATES["courts"]
         comps["courts"] = (7200 * lo * freq, 7200 * hi * freq)
+    lot = (building or {}).get("lot_sqft")
+    if lot and (building or {}).get("vertical") in ("plaza", "commercial", "clinic"):
+        # Parking lots, sidewalks and service areas: ~60% of the lot not under the building.
+        hard = max(0.0, lot - footprint * M2_TO_FT2) * 0.6
+        lo, hi, freq = RATES["lot_hardscape"]
+        comps["lot_hardscape"] = (hard * lo * freq, hard * hi * freq)
     if "gatehouse" in amenities:
         lo, hi, freq = GATEHOUSE_FLAT
         comps["gatehouse"] = (lo * freq, hi * freq)

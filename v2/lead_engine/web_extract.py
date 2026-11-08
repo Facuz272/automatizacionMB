@@ -37,10 +37,12 @@ MAX_PAGES = 5
 TEXT_LIMIT = 8000
 
 TITLE_WORDS = (
-    r"Property Manager|Community Association Manager|Community Manager|Association Manager|"
-    r"General Manager|Building Manager|Site Manager|Portfolio Manager|LCAM|CAM|"
+    r"Assistant Property Manager|Assistant Manager|Property Manager|Community Association Manager|Community Manager|"
+    r"Association Manager|General Manager|Building Manager|Site Manager|Portfolio Manager|LCAM|CAM|"
     r"Board President|President|Vice President|Treasurer|Secretary|Director of Operations|"
-    r"Facilities Manager|Maintenance Manager|Chief Engineer|Owner|Principal|Managing Director"
+    r"Chief Engineer|Director of Facilities|Facilities Director|Facilities Manager|Facility Manager|Building Engineer|"
+    r"Maintenance Supervisor|Maintenance Director|Maintenance Manager|Director of Maintenance|Superintendent|"
+    r"Office Manager|Practice Manager|Administrator|Owner|Principal|Managing Director"
 )
 _NAME = r"[A-Z][a-z'’\-]+(?: [A-Z]\.)?(?: [A-Z][a-z'’\-]+){1,2}"  # spaces only: never spans lines
 PERSON_TITLE_RES = [
@@ -110,6 +112,7 @@ class SiteFacts:
     pages: list[str] = field(default_factory=list)
     rendered: list[str] = field(default_factory=list)            # pages re-rendered with Playwright
     embedded_json: bool = False
+    office_hours: str | None = None
 
     @property
     def phone_numbers(self) -> list[str]:
@@ -143,6 +146,7 @@ class SiteFacts:
             self.text = (self.text + "\n" + other.text)[:TEXT_LIMIT]
         self.pages.extend(other.pages)
         self.rendered.extend(other.rendered)
+        self.office_hours = self.office_hours or other.office_hours
         self.embedded_json = self.embedded_json or other.embedded_json
 
 
@@ -274,7 +278,13 @@ def parse_page(html: str, url: str = "") -> SiteFacts:
             ctx = _link_context(a)
             facts.add_phone(to_e164(href[4:]), label_phone(ctx), ctx, "tel_link")
 
+    jsonld_hours: list[str] = []
     for node in _jsonld_nodes(soup):
+        oh = node.get("openingHours")
+        if isinstance(oh, str):
+            jsonld_hours.append(oh)
+        elif isinstance(oh, list):
+            jsonld_hours += [x for x in oh if isinstance(x, str)]
         tel = node.get("telephone")
         if isinstance(tel, str):
             ctx = " ".join(str(node.get(k, "")) for k in ("contactType", "name", "@type"))
@@ -322,6 +332,9 @@ def parse_page(html: str, url: str = "") -> SiteFacts:
         co = m.group("co").strip(" ,.")
         if co and co not in facts.managed_by:
             facts.managed_by.append(co)
+    from .roles import office_hours
+
+    facts.office_hours = office_hours(text.replace("\n", " "), jsonld_hours)
     return facts
 
 

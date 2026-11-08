@@ -19,6 +19,11 @@ from test_search import RESULTS
 
 FIXTURE = Path(__file__).parent / "fixtures" / "dbpr_condo_md_sample.csv"
 CAM_FIXTURE = Path(__file__).parent / "fixtures" / "cam_lic38cam_sample.csv"
+# Shape of appraiser.lookup for 5555 Collins Ave (live values 2026-11-08).
+CADASTRE_5555 = {"kind": "condominium", "folio": "0232140100001", "units": 297, "year_built": 1967, "floors": 17,
+                 "floors_source": "unit_numbers", "building_sqft": 310037, "assessed_value": 116528282,
+                 "land_use": "RESIDENTIAL - TOTAL VALUE : CONDOMINIUM - RESIDENTIAL", "vertical": "community",
+                 "source": "miami_dade_property_appraiser"}
 RECERT = {"category": "municipal_recert", "label": "recertificación 40 años pendiente", "weight": 6.0,
           "quote": "City of Miami: 5555 COLLINS AV — recertificación 2015 pendiente (submitted and NOT approved)",
           "date": "2015", "source": "municipal", "layer": "miami_recert", "ref": "x"}
@@ -58,6 +63,13 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline.cam, "verify_person", lambda n, c=None: real_person(n, conn))
     monkeypatch.setattr(pipeline.cam, "verify_firm", lambda n, c=None: real_firm(n, conn))
     monkeypatch.setattr(pipeline.dbpr, "cluster", lambda **kw: real_cluster(**{**kw, "conn": conn}))
+    monkeypatch.setattr(pipeline.appraiser, "lookup", lambda address: dict(CADASTRE_5555)
+                        if address and address.startswith("5555 Collins") else None)
+    monkeypatch.setattr(pipeline.lodging, "match", lambda address, conn=None: None)
+    monkeypatch.setattr(pipeline.npi, "enrich", lambda lead: None)
+    monkeypatch.setattr(pipeline.mgmt_domains, "resolve", lambda firm, **kw: {
+        "domain": "castlegroup.com", "status": "mx", "source": "catalog", "firm": "Castle Group"}
+        if firm and "Castle" in firm else None)
     monkeypatch.setattr(pipeline.municipal_signals, "lookup",
                         lambda address, **kw: [dict(RECERT)] if address and address.startswith("5555 Collins") else [])
     monkeypatch.setattr(google_places, "_search", lambda q, tok, with_reviews: {"places": PLACES})
@@ -105,9 +117,15 @@ def test_full_run(wired, monkeypatch):
     assert payload[0]["sales_strategy"].startswith("Registro municipal: recertificación 40 años pendiente")
     assert "techo hormigón plano" in payload[0]["sales_strategy"] and "est. US$" in payload[0]["sales_strategy"]
     assert "firma CAM licenciada CAB3838" in payload[0]["sales_strategy"]
-    assert top["municipal"][0]["category"] == "municipal_recert" and top["pain"][0]["source"] == "municipal"
+    assert top["pain"][0]["category"] == "municipal_recert" and top["pain"][0]["source"] == "municipal"
     assert top["estimated_deal"]["high"] > top["estimated_deal"]["low"] > 10_000
     assert top["licenses"]["firm"]["license_id"] == "CAB3838"
+    # Official cadastre: OSM said 32 levels, the unit numbers say 17 → OSM kept (unit numbers only fill gaps).
+    assert top["cadastre"]["year_built"] == 1967 and top["building"]["year_built"] == 1967
+    assert [m["category"] for m in top["municipal"]] == ["milestone", "municipal_recert"]
+    assert [p["category"] for p in top["pain"]][:2] == ["municipal_recert", "milestone"]
+    assert top["vertical"] == "community" and "Gran Comunidad" in payload[0]["sales_strategy"]
+    assert top["contacts"][0]["name"] == "Ana Diaz" and top["contacts"][0]["role"] == "pm"
     inland = next(l for l in leads if l["company_name"] == "Inland Villas")
     assert (inland["management_company"], inland["contact_name"]) == ("Premier Assn Services", "Orly Iglesias")
 

@@ -113,6 +113,16 @@ class Lead:
     portfolio_cluster: dict[str, Any] = field(default_factory=dict)
     # valuation.estimate: {"low", "high", "components", "basis"} USD/year
     estimated_deal: dict[str, Any] = field(default_factory=dict)
+    # business vertical: community | plaza | commercial | clinic (verticals.LABEL has the CRM-facing names)
+    vertical: str = "community"
+    # every decision maker found: {"name","title","role" (pm|facilities|board|exec|other),"source","phone"?}
+    contacts: list[dict[str, Any]] = field(default_factory=list)
+    office_hours: str | None = None
+    # official cadastre (appraiser.lookup), lodging licence (lodging.match)
+    cadastre: dict[str, Any] = field(default_factory=dict)
+    lodging: dict[str, Any] = field(default_factory=dict)
+    # management firm's corporate domain (mgmt_domains.resolve): {"domain","status","source","email"?}
+    management_domain: dict[str, Any] = field(default_factory=dict)
     search_hits: list[dict[str, Any]] = field(default_factory=list)
     lead_score: int = 0
     score_breakdown: dict[str, int] = field(default_factory=dict)
@@ -121,6 +131,33 @@ class Lead:
     evidence: dict[str, Any] = field(default_factory=dict)
     ai_used: bool = False
     rejected_reason: str | None = None
+
+    # ── contacts ──────────────────────────────────────────────────────────
+    def add_contact(self, name: str | None, title: str | None, source: str, phone: str | None = None) -> None:
+        from .roles import role_of
+
+        if not name or len(name.split()) < 2:
+            return
+        for c in self.contacts:
+            if c["name"].lower() == name.lower():
+                if title and not c.get("title"):
+                    c["title"], c["role"] = title, role_of(title)
+                return
+        c = {"name": name, "title": title, "role": role_of(title), "source": source}
+        if phone:
+            c["phone"] = phone
+        self.contacts.append(c)
+
+    def plan_b(self) -> dict[str, Any] | None:
+        """Second door for the setter: facilities/engineering first, then an assistant PM, never the primary."""
+        from .roles import PLAN_B_ORDER
+
+        others = [c for c in self.contacts if (c["name"] or "").lower() != (self.contact_name or "").lower()]
+        for role in PLAN_B_ORDER:
+            for c in others:
+                if c["role"] == role:
+                    return c
+        return None
 
     # ── derived ───────────────────────────────────────────────────────────
     @property
@@ -137,8 +174,13 @@ class Lead:
 
     def brief(self) -> str:
         """One-line 'Ficha' for the setter: physical facts + labelled phones + score."""
+        from .verticals import label as vertical_label
+
         b = self.building or {}
-        parts: list[str] = []
+        prop = self.cadastre or {}
+        parts: list[str] = [vertical_label(self.vertical)]
+        if prop.get("year_built"):
+            parts.append(f"construido {prop['year_built']}")
         if b.get("levels"):
             parts.append(f"{b['levels']} pisos")
         if b.get("footprint_m2"):
@@ -146,6 +188,13 @@ class Lead:
         units = b.get("units")
         if units:
             parts.append(f"{units} unidades")
+        if prop.get("building_sqft") and prop.get("kind") == "property":
+            parts.append(f"{fmt_int(prop['building_sqft'])} ft² construidos")
+        if prop.get("owner_name") and self.vertical != "community":
+            from .dbpr import _title_case
+            parts.append(f"propietario {_title_case(prop['owner_name'])}" + (f" (c/o {_title_case(prop['care_of'])})" if prop.get("care_of") else ""))
+        if self.lodging.get("rooms"):
+            parts.append(f"{self.lodging['kind']} con {self.lodging['rooms']} habitaciones")
         if b.get("roof"):
             parts.append(f"techo {roof_es(b['roof'])}")
         amen = [AMENITY_LABEL[a] for a in AMENITY_LABEL if a in (b.get("amenities") or {})]
@@ -169,6 +218,15 @@ class Lead:
         if lic.get("firm", {}).get("active"):
             approx = "" if lic["firm"].get("matched_by") == "exact" else "≈"
             parts.append(f"firma CAM licenciada {approx}{lic['firm']['license_id']}")
+        pb = self.plan_b()
+        if pb:
+            parts.append(f"Plan B: {pb['title'] or 'contacto'} {pb['name']}" + (f" {pb['phone']}" if pb.get("phone") else ""))
+        if self.office_hours:
+            parts.append(f"oficina {self.office_hours}")
+        md = self.management_domain
+        if md.get("domain") and not self.email:
+            status = {"mx": "MX ok", "a_only": "sin MX, web activa", "unchecked": "sin verificar"}.get(md.get("status"), md.get("status"))
+            parts.append(f"administradora: {md['domain']} ({status})" + (f" · {md['email']}" if md.get("email") else ""))
         primary = next((p for p in self.phones if p["number"] == self.phone), None)
         if primary and primary["label"] in ("management", "hoa"):
             parts.append(f"tel. principal = {PHONE_LABEL[primary['label']]}")
@@ -193,10 +251,14 @@ class Lead:
         hook = (self.sales_strategy or "").strip()
         brief = self.brief() if include_brief else ""
         text = "\n".join(p for p in (hook, brief) if p)
+        from .config import settings as _settings
+        from .verticals import label as vertical_label
+
+        segment = vertical_label(self.vertical) if _settings.crm_segment_mode == "vertical" else self.segment
         payload: dict[str, Any] = {
             "company_name": clip(self.company_name, 200),
             "phone": self.phone,
-            "segment": self.segment,
+            "segment": segment,
             "strategy_kind": self.strategy_kind,
             "contact_name": clip(self.contact_name, 120),
             "contact_title": clip(self.contact_title, 120),

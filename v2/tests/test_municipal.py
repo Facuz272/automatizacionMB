@@ -30,6 +30,9 @@ def test_street_parts_and_same_street():
     assert ms.same_street("8912 SW 17th Terrace, Miami, FL 33155", "8912 SW 17 TER ")
     assert not ms.same_street("8912 SW 17th Ter, Miami, FL", "8912 SW 171 TER")
     assert ms.street_parts("Collins Ave & 25th St, Miami Beach") is None
+    assert ms.same_street("1750 Bayshore Drive, Miami, FL 33132", "1750 N BAYSHORE DR")      # directional on one side
+    assert not ms.same_street("100 NE 1 Ave, Miami, FL", "100 SW 1 AVE")                     # different directionals
+    assert ms.like_pattern(("250", "NW 108")) == "250 %108%"
 
 
 def test_county_of():
@@ -71,7 +74,7 @@ def test_lookup_filters_city_coords_and_degrades(monkeypatch):
     sigs = ms.lookup("1865 Brickell Ave, Miami, FL 33129", lat=25.7551, lng=-80.1963)
     assert [s["category"] for s in sigs] == ["municipal_recert", "municipal_permit"]   # sorted by weight
     assert "mdc_code" in ms._disabled                                                  # failing layer switched off
-    assert ("miami_recert", "1865 BRICKELL") in calls
+    assert ("miami_recert", "1865 %BRICKELL%") in calls
     calls.clear()
     assert ms.lookup("1865 Brickell Ave, Miami, FL 33129", lat=25.80, lng=-80.13) and all(c[0] != "mdc_code" for c in calls)
     # recert layer is City of Miami only; far coordinates drop the record

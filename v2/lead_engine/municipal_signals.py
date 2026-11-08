@@ -58,9 +58,33 @@ def street_parts(address: str | None) -> tuple[str, str] | None:
     return (m.group(1), " ".join(core)) if core else None
 
 
+_DIRS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
+
+
+def _strip_dirs(core: str) -> str:
+    return " ".join(t for t in core.split() if t not in _DIRS)
+
+
 def same_street(lead_address: str | None, record_address: str | None) -> bool:
+    """Same number and street; a directional present on only one side is tolerated
+    ('1750 Bayshore Dr' == '1750 N BAYSHORE DR'), different directionals are not."""
     a, b = street_parts(lead_address), street_parts(record_address)
-    return bool(a and b and a == b)
+    if not (a and b) or a[0] != b[0]:
+        return False
+    if a[1] == b[1]:
+        return True
+    da = {t for t in a[1].split() if t in _DIRS}
+    db = {t for t in b[1].split() if t in _DIRS}
+    if da and db:
+        return False
+    return bool(_strip_dirs(a[1])) and _strip_dirs(a[1]) == _strip_dirs(b[1])
+
+
+def like_pattern(parts: tuple[str, str]) -> str:
+    """SQL LIKE for 'number … street' that also finds the record when it carries a directional the lead lacks."""
+    words = [t for t in parts[1].split() if t not in _DIRS] or parts[1].split()
+    key = max(words, key=len).replace("'", "''")
+    return f"{parts[0]} %{key}%"
 
 
 def county_of(address: str | None, dbpr_county: str | None = None) -> str | None:
@@ -181,8 +205,8 @@ def reset() -> None:
     _disabled.clear()
 
 
-def _query(layer: Layer, prefix: str) -> list[dict]:
-    where = f"{layer.address_field} LIKE '{prefix}%'"
+def _query(layer: Layer, pattern: str) -> list[dict]:
+    where = f"{layer.address_field} LIKE '{pattern}'"
     if layer.extra_where:
         where += f" AND {layer.extra_where}"
     params = {"where": where, "outFields": layer.fields, "returnGeometry": "false", "resultRecordCount": 25, "f": "json"}
@@ -207,7 +231,7 @@ def lookup(address: str | None, *, lat: float | None = None, lng: float | None =
     if not parts or not county:
         return []
     postal_city = (address or "").upper().split(",")[1].strip() if "," in (address or "") else ""
-    prefix = f"{parts[0]} {parts[1]}".replace("'", "''")
+    prefix = like_pattern(parts)
     out: list[dict] = []
     for layer in layers or LAYERS:
         if layer.key in _disabled or layer.county != county:

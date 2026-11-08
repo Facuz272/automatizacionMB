@@ -27,7 +27,8 @@ from .pain import VERIFIED_PAIN
 WEIGHTS = {"decision_maker": 25, "onsite_or_pain": 25, "email_mx": 15, "exposure_size": 20, "mgmt_phone": 15}
 PM_TITLE = re.compile(
     r"(?i)\b(l?cam|community association manager|property manager|community manager|association manager|"
-    r"general manager|building manager|site manager|portfolio manager|administrador(?:a)?)\b")
+    r"general manager|building manager|site manager|portfolio manager|administrador(?:a)?|administrator|"
+    r"practice manager|facilities (?:director|manager)|director of facilities|chief engineer)\b")
 
 
 def _decision_maker(lead: Lead) -> int:
@@ -51,7 +52,7 @@ def _onsite_or_pain(lead: Lead) -> int:
 
 def _exposure_size(lead: Lead) -> int:
     b = lead.building or {}
-    if b.get("coastal") or b.get("large"):
+    if b.get("coastal") or b.get("large") or (b.get("building_sqft") or 0) >= 100_000:
         return 20
     footprint = b.get("complex_footprint_m2") or b.get("footprint_m2") or 0
     if (b.get("levels") or 0) >= 4 or footprint >= 800 or (b.get("units") or 0) >= 40:

@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 
 from .models import AMENITY_LABEL, Lead
+from .verticals import VOCAB
+from .dbpr import _title_case
 from .normalize import address_problem, to_e164
 from .pain import VERIFIED_PAIN, detect
 
@@ -35,7 +37,8 @@ def has_pain(lead: Lead) -> bool:
 def detect_pain(lead: Lead) -> None:
     """Review/site pains plus municipal signals; municipal records always lead (highest priority)."""
     signals, score = detect(lead.reviews, lead.web_text)
-    muni = sorted(lead.municipal, key=lambda s: -s["weight"])
+    # A real municipal record outranks the computed milestone window at the same weight.
+    muni = sorted(lead.municipal, key=lambda s: (-s["weight"], s.get("layer") == "milestone_rule"))
     lead.pain = muni + signals
     lead.pain_score = min(10.0, round(score + sum(s["weight"] for s in muni), 2))
 
@@ -67,8 +70,14 @@ def rule_qualify(lead: Lead) -> None:
 
 
 def surfaces_phrase(lead: Lead, max_items: int = 3) -> str:
-    """'deck de piscina, garaje/parking multinivel y fachada de 32 pisos expuesta al salitre'."""
+    """Washable surfaces in the vertical's words, e.g. community: 'deck de piscina, garaje/parking multinivel y
+    fachada de 32 pisos expuesta al salitre'; plaza: 'aceras, frentes de locales, estacionamiento… y dumpster pads'."""
     b = lead.building or {}
+    if lead.vertical != "community":
+        base = VOCAB[lead.vertical]["surfaces"]
+        if b.get("levels") and lead.vertical == "commercial":
+            base = base.replace("fachada", f"fachada de {b['levels']} pisos", 1)
+        return base + (" expuestas al salitre" if b.get("coastal") else "")
     items = [AMENITY_LABEL[a] for a in AMENITY_LABEL if a in (b.get("amenities") or {})][:max_items]
     facade = "fachada"
     if b.get("levels"):
@@ -89,8 +98,11 @@ def cluster_phrase(lead: Lead) -> str:
 
 
 def default_hook(lead: Lead) -> str:
+    v = VOCAB.get(lead.vertical, VOCAB["community"])
     if lead.source == "dbpr" and lead.management_company:
         default_who = "el/la CAM asignado/a al edificio"
+    elif lead.vertical != "community":
+        default_who = v["ask_for"]
     else:
         default_who = "el/la Property Manager" if lead.strategy_kind != "portfolio" else "el director de operaciones"
     who = lead.contact_name or default_who
@@ -100,15 +112,25 @@ def default_hook(lead: Lead) -> str:
     multi = cluster_phrase(lead)
     if lead.pain:
         top = lead.pain[0]
-        quote = top["quote"] if len(top["quote"]) <= 130 else top["quote"][:127] + "…"
+        limit = 240 if top["source"] == "municipal" else 130     # official records are quoted whole
+        quote = top["quote"] if len(top["quote"]) <= limit else top["quote"][: limit - 3] + "…"
         quote = quote.rstrip(" .")
         if top["source"] == "municipal":
             return (f"Registro municipal: {top['label']} — {quote}. Pedir por {who} y ofrecer inspección gratis "
                     f"de {surfaces} antes del plazo.{multi}")
+        if lead.vertical != "community":
+            when = f" ({top['date']})" if top.get("date") else ""
+            return (f"Reseña{when} de {v['audience']} menciona {top['label']}: «{quote}». Pedir por {who}: "
+                    f"{v['close']} ({surfaces}).")
         when = f" ({top['date']})" if top.get("date") else ""
         src = "Reseña" if top["source"] == "review" else "Su web"
         return (f"{src}{when} menciona {top['label']}: «{quote}». Pedir por {who} y ofrecer "
                 f"inspección gratis de {surfaces}.{multi}")
+    if lead.vertical != "community":
+        owner = (lead.cadastre or {}).get("owner_name")
+        lead_in = f"Propiedad de {_title_case(owner)}" + (f", administrada por {lead.management_company}" if lead.management_company else "") \
+            + ". " if owner else ""
+        return f"{lead_in}Pedir por {who}: {v['angle']}. Ofrecer {v['close']} ({surfaces})."
     if lead.source == "dbpr" and lead.management_company:
         return f"Edificio administrado por {lead.management_company}: pedir por {who} y ofrecer inspección gratis de {surfaces}.{multi}"
     if lead.strategy_kind == "portfolio":

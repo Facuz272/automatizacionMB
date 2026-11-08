@@ -46,6 +46,18 @@ piscina y parking multinivel expuestos al salitre") and, when present, the stron
 No greetings, no generic marketing text, max 300 characters.
 - public_records.dbpr is the official Florida condominium registry (association, units, care-of line): trust it \
 for the management company / on-site office unless the website clearly says otherwise.
+- vertical is the kind of property; adapt the hook's vocabulary to it:
+  community (Gran Comunidad): board and residents, salt air and mold on the facade, recertification / milestone \
+inspection, next board meeting;
+  plaza (Shopping/Plaza Comercial): foot traffic, sidewalks and storefronts, oil/grease stains in the parking lot, \
+dumpster pads, night work without closing stores;
+  commercial (Edificio Comercial): corporate image, facade and glass, main entrance, garage, after-hours work;
+  clinic (Clínica/Hospital): sanitary image at patient entrances, slippery walkways (fall risk), compliance, work \
+outside patient hours.
+- contacts lists every decision maker found with a role; when the primary contact is a manager, you may name the \
+facilities/engineering contact as the second door ("si no está, pedir por el Chief Engineer …").
+- cadastre is the official Miami-Dade Property Appraiser record (year built, floors, area, owner): prefer it over \
+any estimate. A "milestone" pain signal means the building is in Florida's legal milestone-inspection window.
 - municipal_signals are official city/county records (40-year recertification pending, unsafe structure, open \
 maintenance code case, recent exterior permit): when present, open the hook with them — they are the most urgent pain.
 - portfolio_cluster lists other condos run by the same management firm/manager: when count > 1, suggest a combined \
@@ -110,6 +122,13 @@ def build_evidence(lead: Lead, people: list[tuple[str, str]], emails: list[str],
                          for p in lead.pain[:4]],
         "pain_score": lead.pain_score,
         "municipal_signals": [{"label": m["label"], "quote": m["quote"], "date": m.get("date")} for m in lead.municipal[:3]],
+        "vertical": lead.vertical,
+        "contacts": lead.contacts[:6],
+        "office_hours": lead.office_hours,
+        "cadastre": {k: lead.cadastre.get(k) for k in ("year_built", "floors", "building_sqft", "units", "owner_name",
+                                                       "care_of", "land_use", "assessed_value")} if lead.cadastre else None,
+        "lodging": lead.lodging or None,
+        "management_domain": lead.management_domain or None,
         "licenses": lead.licenses,
         "portfolio_cluster": {"count": lead.portfolio_cluster.get("count"), "by": lead.portfolio_cluster.get("by"),
                               "siblings": [x["name"] for x in lead.portfolio_cluster.get("siblings", [])]}

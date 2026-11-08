@@ -67,6 +67,13 @@ class Settings:
     min_units: int = field(default_factory=lambda: int(os.getenv("MIN_UNITS", "50")))
     priority_units: int = field(default_factory=lambda: int(os.getenv("PRIORITY_UNITS", "80")))
     municipal_signals: bool = field(default_factory=lambda: _bool("MUNICIPAL_SIGNALS", True))
+    appraiser_enabled: bool = field(default_factory=lambda: _bool("APPRAISER_ENABLED", True))
+    npi_enabled: bool = field(default_factory=lambda: _bool("NPI_ENABLED", True))
+    # CRM segment: "pain" (Dolor Urgente / Gran Comunidad, what the CRM accepts today) or "vertical"
+    # (Gran Comunidad / Shopping/Plaza Comercial / Edificio Comercial / Clínica/Hospital) once the CRM enum has them.
+    # --seed pa: which vertical to pull from the cadastre (plaza | commercial | clinic)
+    seed_vertical: str = field(default_factory=lambda: os.getenv("SEED_VERTICAL", "plaza").strip().lower())
+    crm_segment_mode: str = field(default_factory=lambda: os.getenv("CRM_SEGMENT_MODE", "pain").strip().lower())
     email_mx_check: bool = field(default_factory=lambda: _bool("EMAIL_MX_CHECK", True))
     crm_include_brief: bool = field(default_factory=lambda: _bool("CRM_INCLUDE_BRIEF", True))
     user_agent: str = field(

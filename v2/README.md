@@ -32,6 +32,7 @@ v2/
 │   │   ├── google_places.py  Places API (New): coordenadas + reseñas con fecha
 │   │   ├── osm.py            Overpass (gratis): edificios con número de calle + búsqueda por dirección
 │   │   ├── dbpr_seed.py      semilla desde el padrón DBPR (sin Google Places)
+│   │   ├── appraiser_seed.py semilla desde el catastro: plazas, edificios comerciales, hospitales
 │   │   └── seed_csv.py       listas públicas / directorios / exports
 │   ├── web_extract.py     mailto/tel con etiqueta, JSON-LD, __NEXT_DATA__/estado hidratado, personas, «managed by»
 │   ├── render.py          Playwright opcional para SPAs (RENDER_JS=auto)
@@ -41,6 +42,12 @@ v2/
 │   ├── names.py           normalización de firmas y personas (abreviaturas, tipeos, variantes de espaciado)
 │   ├── municipal_signals.py  open data municipal: recertificación pendiente, estructura insegura, código, permisos
 │   ├── valuation.py       ticket anual estimado de limpieza exterior (rango USD)
+│   ├── appraiser.py       catastro Miami-Dade (Property Appraiser) + ventana Milestone / recertificación
+│   ├── lodging.py         padrón DBPR de alojamiento (hoteles, moteles, apart-hoteles): habitaciones, operador, teléfono
+│   ├── npi.py             NPI Registry (CMS): clínicas/hospitales con Authorized Official
+│   ├── verticals.py       segmentos de negocio y vocabulario comercial por segmento
+│   ├── roles.py           roles de decisión (PM, facilities, asistente, junta) y horario de oficina
+│   ├── mgmt_domains.py    dominios corporativos verificados de administradoras
 │   ├── geo.py             perfil físico OSM: pisos, huella m², techo, amenities lavables, distancia a la costa
 │   ├── pain.py            detector de dolor ponderado EN/ES con cita y fecha
 │   ├── email_verify.py    DNS MX/A con caché y sonda de resolvedor
@@ -97,7 +104,7 @@ tarjeta (se apaga con `CRM_INCLUDE_BRIEF=false`). El registro completo queda en 
 ### Padrón oficial DBPR
 
 ```bash
-python -m lead_engine dbpr-sync              # Condo_MD.csv + condo_PB.csv (~13.000 condominios) + lic38cam.csv
+python -m lead_engine dbpr-sync              # condominios + licencias CAM + alojamiento (hrlodge1/2)
 python -m lead_engine dbpr-sync --groups MD,PB,CE
 ```
 
@@ -105,6 +112,74 @@ Cruza cada lead por número + calle normalizada + ZIP (o por nombre dentro del Z
 línea «C/O» del registro: administradora («C/O CASTLE MANAGEMENT LLC»), oficina en el edificio
 («C/O MANAGEMENT OFFICE»), directivo de la junta («C/O PETER BATTY, PRESIDENT») o agente
 registrado (no se usa como contacto). Con los datos de nov-2026 interpreta el 99 % de esas líneas.
+
+### Segmentos de negocio
+
+Cada lead tiene un `vertical` — `community` (Gran Comunidad), `plaza` (Shopping/Plaza Comercial),
+`commercial` (Edificio Comercial: oficinas, hoteles) o `clinic` (Clínica/Hospital) — tomado del uso
+de suelo oficial del catastro, la fuente (DBPR → comunidad, NPI → clínica), la licencia de alojamiento,
+los tipos de Google Places o el nombre. Cambia el gancho, el prompt de Claude y la ficha:
+
+| segmento | a quién | superficies | ángulo |
+| --- | --- | --- | --- |
+| Gran Comunidad | Property Manager (LCAM), junta | fachada, balcones, garaje, áreas comunes | salitre, moho, recertificación / Milestone, asamblea |
+| Shopping/Plaza | PM del centro comercial | aceras, frentes, parking (aceite/grasa), dumpster pads | tráfico peatonal, trabajo nocturno sin cerrar locales |
+| Edificio Comercial | PM o Chief Engineer | fachada y vidrios, entrada, garaje, plaza de acceso | imagen corporativa, fuera de horario |
+| Clínica/Hospital | administrador/a o Facilities | entradas de pacientes, rampas, aceras, parking | imagen sanitaria, caídas, normativa |
+
+**El CRM hoy solo acepta `segment` = `Dolor Urgente` | `Gran Comunidad`** (`src/lib/lead-import.ts`
+en `main`). Por eso `segment` sigue siendo el de dolor y el segmento de negocio va en la ficha
+(«Ficha: Clínica/Hospital · …»). Cuando el CRM agregue los cuatro nombres, `CRM_SEGMENT_MODE=vertical`
+los manda como `segment`.
+
+### Catastro oficial y Milestone Inspection
+
+`appraiser.py` consulta la capa pública `PaGISView` del Property Appraiser de Miami-Dade (verificada en
+vivo, sin clave) por número + calle + ZIP. Un condominio son N folios de unidad: se agregan (unidades,
+año más frecuente, ft² y valor tasado sumados, pisos leídos de los números de unidad). Otra propiedad
+es un folio con pisos, ft² construidos, lote, año, propietario, dirección postal (con «C/O» de la
+administradora) y valor tasado. El dato oficial pisa la estimación de OSM cuando existe. Cobertura:
+Miami-Dade (Broward no expone una capa equivalente accesible).
+
+Ventana Milestone: condominios/co-ops de 3+ pisos tienen inspección estructural a los 30 años (25 a
+<3 millas de la costa, FS 553.899 / SB 4-D) y cada 10 después; además el condado recertifica a los
+30/40/50… Si la edad está a ±1 año de uno de esos hitos, se genera una señal de dolor de máxima
+prioridad. Para plazas, oficinas, hoteles y hospitales solo cuenta la recertificación del condado.
+
+```bash
+python -m lead_engine run --seed pa --vertical plaza --limit 20 --dry-run        # Dolphin Mall, CocoWalk…
+python -m lead_engine run --seed pa --vertical commercial --limit 20 --dry-run   # torres de oficinas, hoteles
+python -m lead_engine run --seed pa --vertical clinic --limit 20 --dry-run       # hospitales
+```
+
+### Hoteles (DBPR Lodging) y clínicas (NPI Registry)
+
+`dbpr-sync` también carga `hrlodge1.csv` / `hrlodge2.csv` (~44.000 licencias de alojamiento): para
+hoteles, moteles y apart-hoteles da habitaciones, licenciatario, administrador y el teléfono del
+front desk. Las licencias de grupos de alquiler dentro de condominios se cuentan, pero nunca se usan
+como teléfono del edificio.
+
+`--seed npi` busca clínicas y hospitales en las ciudades objetivo en el NPI Registry federal
+(taxonomías Hospital, Clinic/Center, Ambulatory Surgical, Urgent Care), salteando consultorios dentro
+de suites y priorizando cargos de facilities/administración sobre facturación. Deja el Authorized
+Official como contacto con su teléfono directo. Las clínicas que llegan por otra fuente se cruzan
+con NPI por ZIP y nombre.
+
+### Contactos múltiples, plan B y horario
+
+El extractor web captura todas las personas con cargo — PM/LCAM, **Chief Engineer, Director of
+Facilities, Maintenance Supervisor, Assistant Property Manager**, junta — y el horario de oficina
+(texto o JSON-LD `openingHours`). El principal es el PM; el plan B, facilities o el asistente:
+`Plan B: Chief Engineer Carlos Ruiz · oficina L–V 9–17`.
+
+### Dominio de la administradora
+
+Si el lead tiene administradora pero no email directo, `mgmt_domains.py` resuelve su dominio
+corporativo (catálogo curado: FirstService, Castle, KW, AKAM, Campbell, RealManage, Associa,
+Continental, Miami Management, Seacrest, Leland, Sentry, Vesta; ampliable con `MGMT_DOMAINS_FILE`;
+o el sitio oficial vía búsqueda API), verifica MX y, si su página de contacto publica un buzón de
+ese dominio, lo agrega: `administradora: castlegroup.com (MX ok) · info@castlegroup.com`. Nunca se
+inventan direcciones personales.
 
 ### Modo semilla DBPR (`--seed dbpr`)
 
