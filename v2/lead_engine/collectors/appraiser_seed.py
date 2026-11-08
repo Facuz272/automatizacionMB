@@ -66,7 +66,8 @@ def collect(strategy: str, max_candidates: int, *, vertical: str = "plaza", citi
     min_sqft = min_sqft if min_sqft is not None else int(os.getenv("SEED_MIN_SQFT", "20000"))
     params = {"where": where_clause(vertical, cities or cities_for(strategy), min_sqft), "outFields": appraiser.FIELDS,
               "orderByFields": "BUILDING_ACTUAL_AREA DESC", "returnGeometry": "false",
-              "resultRecordCount": max(1, min(max_candidates, 2000)), "f": "json"}
+              # extra rows so buildings seen in earlier runs can be skipped and the ranking still fills the batch
+              "resultRecordCount": max(1, min(max_candidates * 5 + 200, 2000)), "f": "json"}
     try:
         r = requests.get(appraiser.URL, params=params, timeout=60, headers={"User-Agent": settings.user_agent})
         costs.tracker.add("arcgis")

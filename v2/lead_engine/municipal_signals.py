@@ -115,9 +115,12 @@ def _date(v: Any) -> str | None:
 
 # ── classification of layer records (pure) ──────────────────────────────────
 
-def signal(category: str, label: str, weight: float, quote: str, when: str | None, src: str, ref: str | None) -> dict:
+def signal(category: str, label: str, weight: float, quote: str, when: str | None, src: str, ref: str | None,
+           data: dict | None = None) -> dict:
+    """`quote` is the Spanish line for the setter; `data` keeps the raw facts so the PDF can render
+    them in English (pdf_i18n)."""
     return {"category": category, "label": label, "weight": weight, "quote": quote, "date": when,
-            "source": "municipal", "layer": src, "ref": ref}
+            "source": "municipal", "layer": src, "ref": ref, "data": data or {}}
 
 
 def classify_recert(a: dict) -> dict | None:
@@ -129,7 +132,8 @@ def classify_recert(a: dict) -> dict | None:
     plan = (a.get("PlanStatus") or "").strip()
     q = f"City of Miami: {a.get('Address', '').strip()} — recertificación {year} pendiente ({detail}" + (f", plan {plan}" if plan else "") + ")"
     return signal("municipal_recert", "recertificación 40 años pendiente", 6.0, q, str(year) if year else None,
-                  "miami_recert", a.get("FolioNumber"))
+                  "miami_recert", a.get("FolioNumber"),
+                  {"address": a.get("Address", "").strip(), "year": year, "detail": detail, "plan": plan})
 
 
 def classify_building_violation(a: dict) -> dict | None:
@@ -138,10 +142,12 @@ def classify_building_violation(a: dict) -> dict | None:
     addr = (a.get("PROP_ADDR") or "").strip()
     if kind == "Unsafe Structure":
         return signal("municipal_unsafe", "caso abierto de estructura insegura", 5.0,
-                      f"Miami-Dade: {addr} — Unsafe Structure abierto (caso {a.get('CASE_NUM')})", when, "mdc_bldg_viol", a.get("CASE_NUM"))
+                      f"Miami-Dade: {addr} — Unsafe Structure abierto (caso {a.get('CASE_NUM')})", when, "mdc_bldg_viol",
+                      a.get("CASE_NUM"), {"address": addr, "case": a.get("CASE_NUM"), "opened": when})
     if kind == "All Other Code Violations":
         return signal("municipal_violation", "violación de edificación abierta", 3.0,
-                      f"Miami-Dade: {addr} — violación de edificación abierta (caso {a.get('CASE_NUM')})", when, "mdc_bldg_viol", a.get("CASE_NUM"))
+                      f"Miami-Dade: {addr} — violación de edificación abierta (caso {a.get('CASE_NUM')})", when, "mdc_bldg_viol",
+                      a.get("CASE_NUM"), {"address": addr, "case": a.get("CASE_NUM"), "opened": when})
     return None
 
 
@@ -151,7 +157,9 @@ def classify_code_case(a: dict) -> dict | None:
         return None
     return signal("municipal_code", "caso de código abierto por mantenimiento", 4.0,
                   f"Miami-Dade Code Compliance: {(a.get('ADDRESS') or '').strip()} — {problem} (caso {a.get('CASE_NUM')})",
-                  _date(a.get("CASE_DATE")), "mdc_code", a.get("CASE_NUM"))
+                  _date(a.get("CASE_DATE")), "mdc_code", a.get("CASE_NUM"),
+                  {"address": (a.get("ADDRESS") or "").strip(), "problem": problem, "case": a.get("CASE_NUM"),
+                   "opened": _date(a.get("CASE_DATE"))})
 
 
 def classify_permit(a: dict, today: date | None = None) -> dict | None:
@@ -164,7 +172,8 @@ def classify_permit(a: dict, today: date | None = None) -> dict | None:
         return None
     what = " ".join((a.get("DetailDescriptionComments") or "").split())
     return signal("municipal_permit", "obra exterior con permiso reciente", 2.5,
-                  f"Permiso {a.get('PermitNumber') or ''} ({when}): {what}".strip(), when, "mdc_permits", a.get("PermitNumber"))
+                  f"Permiso {a.get('PermitNumber') or ''} ({when}): {what}".strip(), when, "mdc_permits", a.get("PermitNumber"),
+                  {"permit": a.get("PermitNumber"), "issued": when, "work": what})
 
 
 # ── sources ─────────────────────────────────────────────────────────────────

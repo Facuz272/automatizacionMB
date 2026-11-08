@@ -82,6 +82,20 @@ class Settings:
     company_phone: str | None = field(default_factory=lambda: os.getenv("COMPANY_PHONE") or None)
     company_email: str | None = field(default_factory=lambda: os.getenv("COMPANY_EMAIL") or None)
     company_website: str | None = field(default_factory=lambda: os.getenv("COMPANY_WEBSITE") or None)
+    company_booking_url: str | None = field(default_factory=lambda: os.getenv("COMPANY_BOOKING_URL") or None)
+    # Documents the company really has; the PDF only says "available upon request" for these (never "attached").
+    documents_available: list[str] = field(default_factory=lambda: _list("COMPANY_DOCUMENTS") or [])
+    brand_color: str = field(default_factory=lambda: os.getenv("BRAND_COLOR", "#0E5A8A"))
+    pdf_lang: str = field(default_factory=lambda: os.getenv("PDF_LANG", "en").strip().lower())
+    # Preferred Vendor Program tiers for portfolio dossiers: [[min_buildings, discount_pct], …] (tenant-editable)
+    pvp_tiers: list = field(default_factory=lambda: _tiers(os.getenv("PVP_TIERS")) or [[3, 5], [10, 8], [25, 12]])
+    # Phone cascade without Places: use the management firm's office line as last resort (labelled).
+    allow_mgmt_firm_phone: bool = field(default_factory=lambda: _bool("ALLOW_MGMT_FIRM_PHONE", False))
+    # Phones the tenant verified itself: {"Firm name": "+1…"} (override the website lookup)
+    mgmt_phones: dict = field(default_factory=dict)
+    # Per-strategy city lists from a tenant profile (wins over TARGET_CITIES env)
+    target_cities: dict = field(default_factory=dict)
+    tenant: str | None = field(default_factory=lambda: os.getenv("TENANT") or None)
     crm_segment_mode: str = field(default_factory=lambda: os.getenv("CRM_SEGMENT_MODE", "pain").strip().lower())
     email_mx_check: bool = field(default_factory=lambda: _bool("EMAIL_MX_CHECK", True))
     crm_include_brief: bool = field(default_factory=lambda: _bool("CRM_INCLUDE_BRIEF", True))
@@ -136,8 +150,20 @@ _DEFAULT_CITIES: dict[str, list[str]] = {
 }
 
 
+def _tiers(raw: str | None) -> list[list[int]]:
+    """'3:5,10:8' -> [[3, 5], [10, 8]] (minimum buildings : % off)."""
+    out = []
+    for part in (raw or "").split(","):
+        if ":" in part:
+            n, pct = part.split(":", 1)
+            out.append([int(n), int(pct)])
+    return out
+
+
 def cities_for(strategy: str) -> list[str]:
-    return _list(f"TARGET_CITIES_{strategy.upper()}") or _list("TARGET_CITIES") or _DEFAULT_CITIES[strategy]
+    tenant = settings.target_cities if "settings" in globals() else {}
+    return (_list(f"TARGET_CITIES_{strategy.upper()}") or tenant.get(strategy) or tenant.get("all")
+            or _list("TARGET_CITIES") or _DEFAULT_CITIES[strategy])
 
 
 def _bbox() -> tuple[float, float, float, float]:

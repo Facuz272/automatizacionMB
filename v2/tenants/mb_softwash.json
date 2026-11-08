@@ -1,0 +1,32 @@
+{
+  "slug": "mb_softwash",
+  "notes": "Perfil de ejemplo. Completá teléfono, email y URL de agenda reales; los documentos solo se mencionan si los tenés.",
+  "company": {
+    "name": "MB Softwash Miami",
+    "phone": "",
+    "email": "",
+    "website": "https://mbsoftwashmiami.com",
+    "booking_url": "",
+    "documents_available": []
+  },
+  "brand_color": "#0E5A8A",
+  "pdf_lang": "en",
+  "target_cities": {
+    "onsite": ["Miami Beach", "Sunny Isles Beach", "Aventura", "Brickell Miami", "Key Biscayne", "Bal Harbour",
+               "North Miami Beach", "Hallandale Beach", "Hollywood FL", "Fort Lauderdale"],
+    "portfolio": ["Miami", "Doral", "Coral Gables", "Aventura", "Fort Lauderdale", "Hialeah"]
+  },
+  "min_units": 50,
+  "valuation_rates": {
+    "facade": [0.12, 0.22, 1.0],
+    "walkways": [0.10, 0.18, 4.0],
+    "garage": [0.08, 0.15, 2.0],
+    "pool_deck": [0.15, 0.25, 4.0],
+    "courts": [0.10, 0.18, 2.0],
+    "lot_hardscape": [0.04, 0.08, 4.0]
+  },
+  "pvp_tiers": [[3, 5], [10, 8], [25, 12]],
+  "allow_mgmt_firm_phone": false,
+  "mgmt_phones": {},
+  "inspectors": ["Tomás", "Mateo"]
+}

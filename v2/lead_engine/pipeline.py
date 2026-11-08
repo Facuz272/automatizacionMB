@@ -139,6 +139,11 @@ def resolve_seed(lead: Lead, use_search: bool) -> None:
             if hit["website"] and not lead.website_url:
                 lead.website_url = hit["website"]
             lead.evidence["osm_address_match"] = hit["osm_id"]
+    if not lead.phone:
+        from . import phone_resolver
+        step = phone_resolver.resolve(lead)
+        if step:
+            lead.evidence["phone_cascade"] = step
     if not lead.website_url and use_search:
         url = search.find_website(lead.company_name, search.city_of(lead.address))
         if url:
@@ -458,7 +463,8 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
         use_ai: bool = True, use_apollo: bool = True, precheck: bool = True, send: bool = False,
         commit: bool = False, max_candidates: int | None = None, out_dir: Path | None = None,
         use_search: bool = True, use_geo: bool = True, use_dbpr: bool = True, check_mx: bool | None = None,
-        make_pdfs: bool = False) -> Path:
+        make_pdfs: bool = False, pdf_lang: str | None = None, ignore_seen: bool = False,
+        retry_needs_phone: bool = False) -> Path:
     sources = list(sources) if sources else default_sources()
     batch_id = new_batch_id(strategy)
     out = Path(out_dir or settings.out_dir) / batch_id
@@ -483,11 +489,18 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
         rejected.append({"company_name": lead.company_name, "source": lead.source, "source_id": lead.source_id,
                          "phone": lead.phone, "address": lead.address, "website": lead.website_url, "reason": reason})
         ledger.mark(lead.source_id, lead.source, lead.phone, "rejected", reason, batch_id)
+        ledger.mark_seen(lead, "needs_phone" if lead in needs_phone else "in_crm" if reason == "ya existe en el CRM"
+                         else "rejected", batch_id, reason)
 
     # ── 1-2: collect + contactability gate ────────────────────────────────────
+    attempts = skipped_seen = 0
     for lead in _candidates(strategy, list(sources), max_candidates, seed):
-        if ledger.outcome(lead.source_id) in ("accepted", "imported", "in_crm"):
+        if ledger.should_skip(lead, ignore_seen=ignore_seen, retry_needs_phone=retry_needs_phone):
+            skipped_seen += 1                 # worked on in an earlier run: the ranking moves on
             continue
+        attempts += 1
+        if attempts > max_candidates:
+            break
         if lead.source in ("dbpr", "pa"):
             resolve_seed(lead, use_search)
         if lead.reviews and lead.lat is not None:
@@ -510,7 +523,12 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
             continue
         key = phone_key(lead.phone or "")
         if key in seen_keys or ledger.is_imported(lead.phone):
-            reject(lead, "teléfono repetido")
+            if lead.evidence.get("phone_from") == "firm_central":
+                # The CRM keeps one lead per phone: the firm's line can only enter once.
+                needs_phone.append(lead)
+                reject(lead, "teléfono central de la administradora ya usado (el CRM no acepta teléfonos repetidos)")
+            else:
+                reject(lead, "teléfono repetido")
             continue
         seen_keys.add(key)
         gated.append((lead, facts))
@@ -546,6 +564,7 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
                    use_geo=use_geo, use_dbpr=use_dbpr, check_mx=check_mx)
             accepted.append(lead)
             ledger.mark(lead.source_id, lead.source, lead.phone, "accepted", None, batch_id)
+            ledger.mark_seen(lead, "processed", batch_id)
             logger.success("[{:>3}] {} · {} · {} · contacto={} · admin={} · email={}({})", lead.lead_score,
                            lead.company_name, lead.phone, lead.segment, lead.contact_name or "—",
                            lead.management_company or lead.management_type, lead.email or "—", lead.email_status)
@@ -582,15 +601,23 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
             crm_summary = {k: v for k, v in report.as_dict().items() if k != "responses"}
             if commit:
                 ledger.mark_imported(payloads, report)
+                bad = {d["index"] for d in report.duplicates} | {r["index"] for r in report.rejected} | {
+                    x["index"] for x in report.skipped_local}
+                for i, l in enumerate(accepted):
+                    ledger.mark_seen(l, "in_crm" if i in bad else "imported", batch_id)
 
     pdfs: list[Path] = []
     if make_pdfs and accepted:
         from . import pdf_generator
         pdfs = pdf_generator.generate_batch(
-            [{**l.internal_record(), "import_batch_id": batch_id} for l in accepted], out / "pdf")
+            [{**l.internal_record(), "import_batch_id": batch_id} for l in accepted], out / "pdf", lang=pdf_lang)
 
     qr = quality.build(batch_id, strategy, accepted, rejected)
     qr["pdfs"] = len(pdfs)
+    qr["skipped_seen_in_earlier_runs"] = skipped_seen
+    if skipped_seen:
+        logger.info("{} edificios ya trabajados en corridas anteriores fueron salteados (--ignore-seen para incluirlos)",
+                    skipped_seen)
     if crm_summary:
         qr["crm"] = crm_summary
     (out / "quality_report.json").write_text(json.dumps(qr, ensure_ascii=False, indent=2), encoding="utf-8")

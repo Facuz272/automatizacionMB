@@ -116,7 +116,8 @@ def candidates(strategy: str, conn: sqlite3.Connection | None = None, cities: li
 def collect(strategy: str, max_candidates: int, conn: sqlite3.Connection | None = None,
             cities: list[str] | None = None) -> Iterator[Lead]:
     conn = conn or connect()
-    for d in candidates(strategy, conn, cities)[:max_candidates]:
+    # No slicing here: the pipeline skips buildings worked on in earlier runs and stops at max_candidates.
+    for d in candidates(strategy, conn, cities):
         address = _clean_address(d["address"])
         lead = Lead(
             source="dbpr",

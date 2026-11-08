@@ -48,7 +48,13 @@ v2/
 │   ├── verticals.py       segmentos de negocio y vocabulario comercial por segmento
 │   ├── roles.py           roles de decisión (PM, facilities, asistente, junta) y horario de oficina
 │   ├── mgmt_domains.py    dominios corporativos verificados de administradoras
-│   ├── pdf_generator.py   informe técnico preliminar de preventa (PDF de 2 páginas) por lead
+│   ├── pdf_generator.py   informe técnico preliminar de preventa (PDF de 2 páginas, EN/ES, QR) por lead
+│   ├── pdf_common.py      estilos, formatos EN/ES, QR vectorial y pie compartidos por los PDF
+│   ├── pdf_i18n.py        textos EN/ES con terminología de Florida (SB 4-D, 40-Year Recertification)
+│   ├── portfolios.py      ranking de administradoras por portafolio + señales en vivo
+│   ├── portfolio_pdf.py   dossier ejecutivo de 2 páginas por firma (Preferred Vendor Program)
+│   ├── phone_resolver.py  cascada gratuita de teléfonos (DBPR Lodging, central de la firma)
+│   ├── tenant.py          perfiles de empresa white-label (tenants/<slug>.json)
 │   ├── competitor_intel.py  debilidades de la competencia en reseñas de edificios vecinos
 │   ├── route_optimizer.py rutas de inspección por zonas e inspector
 │   ├── geocode.py         geocodificación gratuita (US Census) para leads sin coordenadas
@@ -133,6 +139,55 @@ segmento, cuadro con el rango del contrato anual por componente y próximo paso.
 página se ajusta para que el informe sea siempre de 2 páginas. Lleva la marca de `COMPANY_*` (solo
 lo que esté definido) y la aclaración de que es una estimación preliminar, no una inspección
 estructural ni una cotización vinculante.
+
+**Idioma** (`--pdf-lang en|es`, `pdf --lang`, default `PDF_LANG=en`): la versión en inglés usa la
+terminología del mercado de Florida — *SB 4-D Milestone Structural Inspection (F.S. 553.899)*,
+*40-Year Recertification*, *Softwash Biological Treatment*, *surface preparation before elastomeric
+coating* — y formatos de EE. UU. ($1,234 · mm/dd/yyyy). Las señales y reseñas se reescriben desde
+los datos estructurados, así el PDF nunca mezcla idiomas. COI y W-9 solo aparecen si están en
+`COMPANY_DOCUMENTS` ("available upon request"; nunca "adjunto").
+
+**QR**: en el pie de la página 2, un QR vectorial (`reportlab` QrCodeWidget, sin dependencias) que
+apunta a `COMPANY_BOOKING_URL`, o al sitio web, o a `tel:`; sin ninguno de los tres no se imprime.
+
+### Dossiers de portafolio (`portfolios`)
+
+```bash
+python -m lead_engine portfolios --top 15 --pdf            # ranking + dossier por firma (inglés)
+python -m lead_engine portfolios --top 30 --offline        # solo el padrón, sin consultas en vivo
+```
+
+Agrupa todo el padrón DBPR de `CLUSTER_COUNTIES` por firma (licencia CAB cuando el padrón de CAM la
+conoce; si no, el nombre normalizado; y une variantes que el catálogo de dominios identifica como
+la misma empresa, p. ej. «Castle Group» + «Castle Management LLC»). Por firma: edificios, unidades
+y contrato anual combinado estimado; ordena por el extremo alto. Para el top consulta en vivo los
+`--depth` (10) edificios más grandes **en Miami-Dade** (donde hay catastro y capas municipales):
+cuántos están en ventana Milestone/recertificación y cuántos tienen registros municipales abiertos.
+Deja `out/portfolios/<fecha>/ranking.csv`, `ranking.json` (con los edificios) y, con `--pdf`, un
+dossier ejecutivo de 2 páginas por firma: KPIs del portafolio, propiedades más urgentes, propuesta
+de *Preferred Vendor Program* con las escalas del perfil (`pvp_tiers`), piloto sugerido, próximos
+pasos y QR. Corrida de nov-2026: FirstService Residential 82 edificios / 16.380 unidades; Castle 33
+edificios, 2 de 6 analizados en ventana Milestone.
+
+### Perfiles de empresa (`--tenant`)
+
+```bash
+python -m lead_engine --tenant mb_softwash run --seed dbpr --limit 20 --pdf
+```
+
+`tenants/<slug>.json` define marca (nombre, teléfono, web, agenda, documentos), color e idioma del
+PDF, ciudades objetivo por estrategia, `min_units`, tarifas de `valuation.py`, escalas del PVP,
+teléfonos de administradoras propios e inspectores. Claves desconocidas o tarifas mal formadas
+abortan la corrida. Ejemplo: `tenants/mb_softwash.json`.
+
+### Memoria entre corridas
+
+`data/state.db` → tabla `seen_leads`: cada edificio trabajado, por dirección normalizada (la misma
+torre que llega por DBPR, catastro o Places es una sola) y por id de origen, con estado
+(`processed`, `imported`, `in_crm`, `needs_phone`, `rejected`; nunca baja de estado). La corrida
+siguiente los salta, así `--seed dbpr --limit 20` trae los 20 siguientes del ranking.
+`--ignore-seen` los vuelve a incluir; `--retry-needs-phone` reintenta solo los que quedaron sin
+teléfono. El `quality_report.json` cuenta `skipped_seen_in_earlier_runs`.
 
 ### Inteligencia competitiva de la zona
 
@@ -250,8 +305,13 @@ la dirección del propio edificio, `portfolio` cuando es una administradora exte
 primero los de `PRIORITY_UNITS`+ (80). Es la fuente por defecto si no hay `GOOGLE_PLACES_API_KEY`.
 
 Para cada edificio busca el teléfono, en este orden: Google Places **por nombre + dirección**
-(una consulta puntual por edificio, si hay clave), etiquetas de OpenStreetMap en esa dirección,
-y el sitio oficial vía búsqueda API + rastreo. Los que pasan todos los filtros pero no tienen
+(una consulta puntual por edificio, si hay clave), el padrón DBPR de alojamiento (licencia de
+hotel/apartamentos del edificio → *front desk*; licencia CNDO solo si el titular es la propia
+asociación, nunca la de un propietario), etiquetas de OpenStreetMap en esa dirección, el sitio
+oficial vía búsqueda API + rastreo y, solo con `ALLOW_MGMT_FIRM_PHONE=true`, la central de la
+administradora (perfil del tenant o su sitio oficial, prefiriendo números del sur de Florida),
+etiquetada «central administradora». Como el CRM acepta cada teléfono una sola vez, la central
+entra en un único lead por firma; los demás van a `needs_phone.csv`. Los que pasan todos los filtros pero no tienen
 teléfono quedan en `out/<lote>/needs_phone.csv` (edificio, dirección, unidades, asociación,
 administradora) para buscarlos a mano.
 

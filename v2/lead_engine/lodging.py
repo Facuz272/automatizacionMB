@@ -108,3 +108,38 @@ def match(address: str | None, conn: sqlite3.Connection | None = None) -> dict[s
             "phone": o["phone"], "rooms": o["units"],
         })
     return out
+
+
+def building_phone(address: str | None, names: list[str | None], conn: sqlite3.Connection | None = None,
+                   min_similarity: float = 0.6) -> dict[str, Any] | None:
+    """A phone that belongs to the building itself, from the lodging registry:
+      * a whole-property operator licence (hotel/motel/apartments) at the address → front desk;
+      * a condo rental licence (CNDO) held by the association itself (licensee ≈ association or condo name)
+        → association office. CNDO licences held by owners or rental agents are never used."""
+    from .dbpr import name_similarity
+
+    key = address_key(address)
+    if not key:
+        return None
+    try:
+        conn = conn or connect()
+        ensure(conn)
+        rows = conn.execute("SELECT * FROM dbpr_lodging WHERE address_key = ? AND status = '20' AND phone IS NOT NULL",
+                            (key,)).fetchall()
+    except sqlite3.Error:
+        return None
+    ops = sorted((r for r in rows if r["rank"] in OPERATOR_RANKS), key=lambda r: -(r["units"] or 0))
+    if ops:
+        o = ops[0]
+        return {"phone": o["phone"], "label": "front_desk", "license_number": o["license_number"],
+                "licensee": _title_case(o["licensee"] or ""), "why": f"licencia {o['rank']} del edificio"}
+    wanted = [n for n in names if n]
+    for r in rows:
+        if r["rank"] != "CNDO":
+            continue
+        sim = max((name_similarity(n, r["licensee"]) for n in wanted), default=0.0)
+        sim = max(sim, max((name_similarity(n, r["business_name"]) for n in wanted), default=0.0))
+        if sim >= min_similarity:
+            return {"phone": r["phone"], "label": "hoa", "license_number": r["license_number"],
+                    "licensee": _title_case(r["licensee"] or ""), "why": f"licencia CNDO a nombre de la asociación (~{sim:.2f})"}
+    return None

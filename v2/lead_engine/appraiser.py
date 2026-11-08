@@ -230,6 +230,8 @@ def milestone_signal(year_built: int | None, floors: int | None, coastal: bool, 
     else:
         quote = f"Construido en {year_built} ({age} años): {when} — {stage} (programa de recertificación de edificios)."
         label = "ventana de recertificación estructural del condado"
-    return {"category": "milestone", "label": label,
+    data = {"year_built": int(year_built), "age": age, "milestone": m, "milestone_year": int(year_built) + m,
+            "coastal": coastal, "condo": condo}
+    return {"data": data, "category": "milestone", "label": label,
             "weight": 6.0, "quote": quote, "date": str(int(year_built) + m), "source": "municipal",
             "layer": "milestone_rule", "ref": f"age={age}"}

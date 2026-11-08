@@ -45,12 +45,13 @@ def _pages_and_text(path: Path) -> tuple[int, str]:
 # ── PDF ─────────────────────────────────────────────────────────────────────
 
 def test_pdf_has_two_pages_with_official_data_diagnosis_scope_and_range(tmp_path):
-    path = pdf_generator.build(LEAD, tmp_path / "x.pdf")
+    path = pdf_generator.build(LEAD, tmp_path / "x.pdf", lang="es")
     n, text = _pages_and_text(path)
     assert n == 2
     for s in ("INFORME TÉCNICO PRELIMINAR DE PREVENTA", "Oceanside Plaza Condo", "Datos oficiales de la propiedad",
               "1967", "310.037 ft²", "US$ 116.528.282", "Miami-Dade Property Appraiser", "Ana Diaz (Property Manager)",
               "Diagnóstico técnico preliminar", "Milestone", "WATERPROOFING", "black mold", "salitre",
+              "elastomérica",
               "Alcance propuesto del servicio Softwash", "Acceso por cuerdas", "US$ 37.000 – US$ 68.000",
               "Fachada (softwash)", "Inspección gratuita", "Página 2 de 2"):
         assert s in text, s
@@ -59,9 +60,9 @@ def test_pdf_has_two_pages_with_official_data_diagnosis_scope_and_range(tmp_path
 def test_pdf_stays_two_pages_with_a_lot_of_content_and_with_almost_nothing(tmp_path):
     heavy = {**LEAD, "municipal": LEAD["municipal"] * 6,
              "pain": [{**LEAD["pain"][0], "quote": "x " * 120}] * 6}
-    assert _pages_and_text(pdf_generator.build(heavy, tmp_path / "h.pdf"))[0] == 2
+    assert _pages_and_text(pdf_generator.build(heavy, tmp_path / "h.pdf", lang="es"))[0] == 2
     bare = {"company_name": "Plaza Ñandú & Co <test>", "address": "1 Main St, Miami, FL 33101", "vertical": "plaza"}
-    n, text = _pages_and_text(pdf_generator.build(bare, tmp_path / "b.pdf"))
+    n, text = _pages_and_text(pdf_generator.build(bare, tmp_path / "b.pdf", lang="es"))
     assert n == 2 and "Plaza Ñandú & Co <test>" in text and "se define en la inspección" in text
     assert "aceras" in text.lower()                                  # plaza scope
 
@@ -70,7 +71,7 @@ def test_filenames_and_batch_order(tmp_path):
     assert pdf_generator.safe_filename("Tides On Hollywood Beach, The / #2") == "Tides_On_Hollywood_Beach_The_2"
     assert pdf_generator.safe_filename("Ñandú") == "Nandu"
     recs = [{**LEAD, "lead_score": 40}, {**LEAD, "lead_score": 90}, {**LEAD, "company_name": "Otro", "lead_score": 10}]
-    files = pdf_generator.generate_batch(recs, tmp_path / "pdf", top=2)
+    files = pdf_generator.generate_batch(recs, tmp_path / "pdf", top=2, lang="es")
     assert [f.name for f in files] == ["Oceanside_Plaza_Condo.pdf", "Oceanside_Plaza_Condo_2.pdf"]
     assert all(f.exists() for f in files)
 

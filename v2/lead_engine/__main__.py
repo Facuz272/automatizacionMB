@@ -7,6 +7,8 @@
   python -m lead_engine run --seed dbpr --strategy onsite --limit 20 --dry-run   # semilla desde el padrón DBPR
   python -m lead_engine dbpr-sync [--groups MD,PB]         # padrón de condominios + licencias CAM (DBPR)
   python -m lead_engine dbpr-load Condo_MD.csv [...]       # o cargar CSVs ya descargados
+  python -m lead_engine --tenant mb_softwash run --seed dbpr --limit 20 --pdf --pdf-lang en
+  python -m lead_engine portfolios --top 15 --pdf          # ranking de administradoras + dossiers PDF
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from . import cam, crm_importer, dbpr, lodging, pipeline
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="lead_engine", description="MB Lead Engine v2")
+    ap.add_argument("--tenant", help="perfil de empresa en tenants/<slug>.json (default TENANT)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="recolectar, validar, enriquecer y (opcional) enviar al CRM")
@@ -45,6 +48,11 @@ def main(argv: list[str] | None = None) -> int:
                       help="envía al CRM con dry_run=true (no escribe) y guarda la respuesta")
     mode.add_argument("--commit", action="store_true", help="inserta de verdad en el CRM")
     r.add_argument("--pdf", action="store_true", help="generar el informe PDF de preventa por lead en out/<lote>/pdf/")
+    r.add_argument("--pdf-lang", choices=["en", "es"], help="idioma del PDF (default PDF_LANG o en)")
+    r.add_argument("--ignore-seen", action="store_true",
+                   help="no saltar edificios ya procesados en corridas anteriores (memoria seen_leads)")
+    r.add_argument("--retry-needs-phone", action="store_true",
+                   help="reintentar los que quedaron sin teléfono en corridas anteriores")
     r.add_argument("-v", "--verbose", action="store_true")
 
     i = sub.add_parser("import", help="enviar un crm_payload.json ya generado")
@@ -58,6 +66,14 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--out", help="carpeta destino (default: <lote>/pdf)")
     pp.add_argument("--top", type=int, help="solo los N de mayor lead_score")
     pp.add_argument("--min-score", type=int, default=0)
+    pp.add_argument("--lang", choices=["en", "es"], help="idioma (default PDF_LANG o en)")
+    pf = sub.add_parser("portfolios", help="ranking de administradoras por portafolio + dossiers PDF")
+    pf.add_argument("--top", type=int, default=15)
+    pf.add_argument("--depth", type=int, default=10, help="edificios por firma consultados en vivo (catastro/municipio)")
+    pf.add_argument("--offline", action="store_true", help="solo el padrón DBPR, sin consultas en vivo")
+    pf.add_argument("--pdf", action="store_true", help="dossier ejecutivo de 2 páginas por firma")
+    pf.add_argument("--lang", choices=["en", "es"], help="idioma del PDF (default PDF_LANG o en)")
+    pf.add_argument("--out", help="carpeta base (default OUT_DIR)")
     rt = sub.add_parser("route", help="ruta de inspecciones optimizada por zonas")
     rt.add_argument("input", help="leads.jsonl del lote o export del CRM (.csv/.json) con address e inspection_at")
     rt.add_argument("--date", help="día (YYYY-MM-DD, default hoy en Miami)")
@@ -70,6 +86,20 @@ def main(argv: list[str] | None = None) -> int:
     dl.add_argument("files", nargs="+")
 
     args = ap.parse_args(argv)
+    from . import tenant
+    prof = tenant.use(args.tenant)
+    if prof:
+        logger.info("Perfil de empresa: {}", prof.get("company", {}).get("name") or args.tenant)
+    if args.cmd == "portfolios":
+        from pathlib import Path
+
+        from . import portfolios
+        out = portfolios.run(top=args.top, depth=args.depth, live=not args.offline, pdf=args.pdf, lang=args.lang,
+                             out_dir=Path(args.out) if args.out else None)
+        import json
+        portfolios.print_table(json.loads((out / "ranking.json").read_text(encoding="utf-8")))
+        print(f"Archivos: {out}/ranking.csv · ranking.json" + (" · pdf/" if args.pdf else ""))
+        return 0
     if args.cmd == "import":
         return crm_importer.main(args.rest)
     if args.cmd == "dbpr-sync":
@@ -85,7 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         from . import pdf_generator
         src = Path(args.leads)
         out = Path(args.out) if args.out else src.parent / "pdf"
-        files = pdf_generator.generate_batch(pdf_generator.load_jsonl(src), out, top=args.top, min_score=args.min_score)
+        files = pdf_generator.generate_batch(pdf_generator.load_jsonl(src), out, top=args.top, min_score=args.min_score,
+                                              lang=args.lang)
         print(f"{len(files)} PDF en {out}/")
         return 0
     if args.cmd == "route":
@@ -124,7 +155,8 @@ def main(argv: list[str] | None = None) -> int:
         use_ai=not args.no_ai, use_apollo=not args.no_apollo, precheck=not args.no_precheck,
         send=args.dry_run or args.commit, commit=args.commit, max_candidates=args.max_candidates,
         use_search=not args.no_search, use_geo=not args.no_geo, use_dbpr=not args.no_dbpr,
-        check_mx=False if args.no_mx else None, make_pdfs=args.pdf,
+        check_mx=False if args.no_mx else None, make_pdfs=args.pdf, pdf_lang=args.pdf_lang,
+        ignore_seen=args.ignore_seen, retry_needs_phone=args.retry_needs_phone,
     )
     return 0
 

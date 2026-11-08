@@ -42,6 +42,7 @@ PHONE_LABEL = {
     "leasing": "leasing/ventas",
     "maintenance": "mantenimiento",
     "google_main": "Google",
+    "firm_central": "central administradora",
     "unlabeled": "otro",
 }
 
@@ -230,7 +231,7 @@ class Lead:
             status = {"mx": "MX ok", "a_only": "sin MX, web activa", "unchecked": "sin verificar"}.get(md.get("status"), md.get("status"))
             parts.append(f"administradora: {md['domain']} ({status})" + (f" · {md['email']}" if md.get("email") else ""))
         primary = next((p for p in self.phones if p["number"] == self.phone), None)
-        if primary and primary["label"] in ("management", "hoa"):
+        if primary and primary["label"] in ("management", "hoa", "firm_central"):
             parts.append(f"tel. principal = {PHONE_LABEL[primary['label']]}")
         others = [f"{PHONE_LABEL.get(p['label'], p['label'])} {p['number']}" for p in self.secondary_phones()[:2]]
         if others:

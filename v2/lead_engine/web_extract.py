@@ -67,7 +67,7 @@ PHONE_LABEL_RES: list[tuple[str, re.Pattern[str]]] = [
     ("leasing", re.compile(r"(?i)leasing|sales|rentals?|ventas|alquiler|renting")),
 ]
 LABEL_PRIORITY = {"management": 0, "hoa": 1, "google_main": 2, "unlabeled": 3, "maintenance": 4,
-                  "front_desk": 5, "leasing": 6, "fax": 9}
+                  "front_desk": 5, "leasing": 6, "firm_central": 7, "fax": 9}
 GENERIC_LABELS = {"unlabeled", "google_main"}
 
 
