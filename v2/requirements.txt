@@ -4,3 +4,5 @@ loguru>=0.7
 pydantic>=2.7
 python-dotenv>=1.0
 requests>=2.31
+dnspython>=2.6
+# Opcional (sitios SPA): playwright>=1.45  →  pip install -e '.[browser]'

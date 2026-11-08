@@ -11,11 +11,11 @@ se pueden llamar o visitar, completa decisor/email/administración, precalifica 
 Claude y envía el lote a `POST /api/public/leads-import` del CRM.
 
 ```
-collect ──► gate ──► precheck CRM ──► enrich ──► output ──► (send)
-Places      E.164    dry_run: quita    web +       out/<lote>/  dry_run o
-OSM         + calle  teléfonos que     Apollo +    *.json(l)    --commit
-CSV         (web     ya están, antes   reglas +
-            rellena) de gastar IA      Claude
+collect ─► gate ─► precheck CRM ─► enrich (por lead) ───────────────────────────► rank ─► output ─► (send)
+Places     E.164   dry_run: quita   web (+Playwright/JSON hidratado) → teléfonos    lead_score  out/<lote>/   dry_run o
+OSM        + calle teléfonos que    etiquetados → DBPR → búsqueda API → Apollo →    desc.       *.json(l)     --commit
+CSV                ya están         OSM (pisos/m²/amenities/costa) → dolor →                    quality_report
+                                    email MX → Claude (con guardas) → reglas → score
 ```
 
 ## Estructura
@@ -24,23 +24,97 @@ CSV         (web     ya están, antes   reglas +
 v2/
 ├── pyproject.toml / requirements.txt / .env.example
 ├── lead_engine/
-│   ├── __main__.py        CLI: run | import
+│   ├── __main__.py        CLI: run | import | dbpr-sync | dbpr-load
 │   ├── config.py          env + ciudades y consultas por estrategia (onsite/pain/portfolio)
 │   ├── normalize.py       extract_domain, to_e164, phone_key, address_problem, emails (puro)
-│   ├── models.py          Lead + crm_payload() (contrato exacto del endpoint)
+│   ├── models.py          Lead + brief() «Ficha» + crm_payload() (contrato exacto del endpoint)
 │   ├── collectors/
-│   │   ├── google_places.py  Places API (New) Text Search, reseñas solo en `pain`
+│   │   ├── google_places.py  Places API (New): coordenadas + reseñas con fecha
 │   │   ├── osm.py            Overpass (gratis): edificios con número de calle
-│   │   └── seed_csv.py       listas públicas / directorios / exports (DBPR, CAI, Apollo…)
-│   ├── web_extract.py     mailto:, tel:, JSON-LD, «Nombre, Property Manager», «managed by X»
+│   │   └── seed_csv.py       listas públicas / directorios / exports
+│   ├── web_extract.py     mailto/tel con etiqueta, JSON-LD, __NEXT_DATA__/estado hidratado, personas, «managed by»
+│   ├── render.py          Playwright opcional para SPAs (RENDER_JS=auto)
+│   ├── search.py          SerpAPI / Google CSE / Brave → administradora, CAM, email (solo resultados que nombran el edificio)
+│   ├── dbpr.py            padrón oficial de condominios FL: descarga, carga y cruce por dirección / nombre
+│   ├── geo.py             perfil físico OSM: pisos, huella m², techo, amenities lavables, distancia a la costa
+│   ├── pain.py            detector de dolor ponderado EN/ES con cita y fecha
+│   ├── email_verify.py    DNS MX/A con caché y sonda de resolvedor
+│   ├── scoring.py         lead_score 0–100 y orden del lote
+│   ├── quality.py         quality_report.json + resumen en consola
+│   ├── costs.py           contadores de uso por API y costo estimado
 │   ├── apollo.py          decisor por dominio (títulos de PM; revelar email es opcional)
-│   ├── qualify.py         gate de contactabilidad, señales de dolor, segment y gancho por reglas
-│   ├── ai_enrich.py       Claude con salida estructurada + filtro anti-inventos
+│   ├── qualify.py         gate de contactabilidad, segment y gancho por reglas con superficies y evidencia
+│   ├── ai_enrich.py       Claude con salida estructurada + guardas anti-inventos (personas, emails, superficies)
 │   ├── crm_importer.py    cliente del endpoint: lotes ≤200, dry-run, reintentos, reporte
 │   ├── state.py           SQLite local: no volver a pagar por lugares ya procesados
-│   └── pipeline.py        orquestación y resumen de cobertura
-└── tests/                 pytest (sin red)
+│   └── pipeline.py        orquestación
+└── tests/                 pytest sin red (fixtures reales del DBPR)
 ```
+
+## Radiografía de cada lead
+
+| bloque | de dónde sale | qué deja |
+| --- | --- | --- |
+| **Físico** | OSM alrededor de las coordenadas de Places + texto del sitio + DBPR | `building`: pisos, huella m²/ft² (edificio y complejo), techo, `amenities` (parking_garage, pool_deck, tennis_court, sidewalks, gatehouse con su fuente), costero (distancia a la costa), unidades, `large` |
+| **Decisor y administración** | sitio (HTML, JSON-LD, `__NEXT_DATA__`, render JS) → padrón DBPR («C/O …») → búsqueda API → Apollo → Claude | `contact_name/title`, `management_company`, `management_type`, `association_name`, `public_records.dbpr`, `search_hits` |
+| **Teléfonos** | `tel:`, texto, JSON-LD `contactPoint`, estado hidratado | `phones[]` con etiqueta (management, hoa, front_desk, leasing, maintenance); el principal es el de administración; fax nunca |
+| **Dolor** | reseñas de Google (con fecha) + avisos del sitio | `pain[]` con categoría, cita exacta y fecha; `pain_score` 0–10 (≥3 = verificado) |
+| **Email** | mailto/texto/JSON/búsqueda/Apollo | el mejor cuyo dominio existe; `email_status` mx / a_only / unchecked (nxdomain y sin correo se descartan) |
+| **Prioridad** | `scoring.py` | `lead_score` 0–100 + `score_breakdown`; el lote se envía ordenado de mayor a menor |
+
+### lead_score (0–100)
+
+| componente | pts | regla |
+| --- | --- | --- |
+| Decisor | 25 | nombre y apellido + LCAM/CAM/Property/Community/General/Building Manager (15 con otro cargo, 8 solo nombre) |
+| Onsite o dolor | 25 | administración en el edificio confirmada o `pain_score ≥ 3` (10 si la estrategia es onsite sin confirmar) |
+| Email MX | 15 | dominio con registros MX |
+| Exposición/tamaño | 20 | costero (salitre) o grande: ≥8 pisos, ≥2.000 m² o ≥100 unidades (10 si mediano) |
+| Tel. de administración | 15 | teléfono principal etiquetado Management Office / Property Manager (8 si HOA) |
+
+El CRM agrega los leads importados al final de la cola en el orden recibido y el reparto de
+las 6 AM los toma por posición: por eso `crm_payload.json` sale ordenado por `lead_score`.
+
+### Qué ve la setter (`sales_strategy`)
+
+```
+Reseña (hace 2 meses) menciona moho/hongos: «Garage has oil stains and black mold in the hallways».
+Pedir por Ana Diaz (Property Manager) y ofrecer inspección gratis de garaje/parking multinivel,
+deck de piscina, canchas de tenis y fachada de 32 pisos expuesta al salitre.
+Ficha: 32 pisos · ~2.002 m² de huella (~21.549 ft²) · 299 unidades · techo hormigón plano · garaje/parking
+multinivel, deck de piscina, canchas de tenis, caminos/aceras, garita de acceso · frente costero (salitre) ·
+tel. principal = administración · otros tel.: front desk +13058661301 · score 100/100
+```
+
+El CRM no tiene columnas para pisos, m², amenities ni score; la línea «Ficha» los lleva a la
+tarjeta (se apaga con `CRM_INCLUDE_BRIEF=false`). El registro completo queda en `leads.jsonl`.
+
+### Padrón oficial DBPR
+
+```bash
+python -m lead_engine dbpr-sync              # descarga Condo_MD.csv + condo_PB.csv (~13.000 condominios)
+python -m lead_engine dbpr-sync --groups MD,PB,CE
+```
+
+Cruza cada lead por número + calle normalizada + ZIP (o por nombre dentro del ZIP) y lee la
+línea «C/O» del registro: administradora («C/O CASTLE MANAGEMENT LLC»), oficina en el edificio
+(«C/O MANAGEMENT OFFICE»), directivo de la junta («C/O PETER BATTY, PRESIDENT») o agente
+registrado (no se usa como contacto). Con los datos de nov-2026 interpreta el 99 % de esas líneas.
+
+### Búsqueda externa
+
+Solo APIs oficiales (`SERPAPI_KEY`, `GOOGLE_CSE_KEY`+`GOOGLE_CSE_CX` o `BRAVE_SEARCH_KEY`); no se
+hace scraping de páginas de resultados de buscadores. Se usa cuando el lead no tiene web o
+cuando web + DBPR no dieron decisor y administradora. Solo se atribuye lo que aparece en un
+resultado que nombra al edificio.
+
+### Auditoría por lote
+
+Cada `run` imprime y guarda `out/<lote>/quality_report.json`: % con decisor (y con cargo), %
+con administradora identificada, % email verificado MX, % con señales de dolor (y verificado),
+% con tel. de administración, % con perfil físico, % costero o grande, % cruce DBPR, % con IA,
+`lead_score` promedio/mediana/bandas, categorías de dolor más frecuentes, motivos de rechazo y
+costo estimado de APIs (total y por lead, precios ajustables con `PRICE_<API>`).
 
 ## Reglas que garantiza
 
@@ -69,7 +143,7 @@ Cada lead va con sus columnas nativas (migración `0045_lead_import_trace` del C
 | `email` | mailto / texto / JSON-LD / Apollo (opcional) |
 | `management_company` | «managed by …», OSM `operator`, Claude; si es propia: «Administración en el edificio» |
 | `segment`, `strategy_kind`, `properties_count` | reglas + Claude |
-| `sales_strategy` | **solo** el gancho de 1–2 líneas para la setter |
+| `sales_strategy` | gancho de 1–2 líneas con evidencia + línea «Ficha» (ver arriba) |
 | `source` | `lead-engine-v2:<colector>` |
 | `import_batch_id` | id del lote (`le2-AAAAMMDD-HHMM-<estrategia>-xxxx`); `imported_at` lo pone el CRM |
 
@@ -91,9 +165,10 @@ IA) queda en `out/<lote>/leads.jsonl`.
 ```bash
 cd v2
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[dev]'
+pip install -e '.[dev]'          # + '.[dev,browser]' y `playwright install chromium` para sitios SPA
 cp .env.example .env    # completar GOOGLE_PLACES_API_KEY, ANTHROPIC_API_KEY, CRM_WEBHOOK_SECRET (Apollo opcional)
 pytest -q
+python -m lead_engine dbpr-sync
 python -m lead_engine run --strategy onsite --limit 20 --dry-run
 ```
 
@@ -101,11 +176,11 @@ Deja en `out/<lote>/`:
 
 | archivo | contenido |
 | --- | --- |
-| `crm_payload.json` | exactamente lo que se enviaría al CRM |
+| `quality_report.json` | auditoría de calidad y costo del lote |
+| `crm_payload.json` | exactamente lo que se enviaría al CRM, ordenado por `lead_score` |
 | `crm_response_dry.json` | respuesta real del CRM en dry-run (`would_insert`, `duplicates`, `rejected`) |
 | `leads.jsonl` | registro completo por lead con evidencia |
 | `rejected.jsonl` | descartados y motivo |
-| `summary.json` | cobertura de dirección, decisor, email, administración, IA |
 
 Inyectar ese mismo lote a producción, después de revisarlo:
 
@@ -124,8 +199,11 @@ python -m lead_engine run --strategy onsite --limit 20 --no-ai          # solo r
 
 ## Costos por corrida de 20
 
-- Places (New) Text Search: ~1–8 páginas de 20 resultados (Enterprise SKU por los campos
-  de teléfono/web; `pain` suma reseñas). Se corta al llegar a 20 leads válidos.
+- Places (New) Text Search: ~1–8 páginas de 20 resultados con reseñas (Enterprise + Atmosphere,
+  ~US$0,04 por página). Se corta al llegar a 20 leads válidos.
+- Búsqueda externa: como mucho 1 consulta por lead con huecos (SerpAPI ~US$0,015; CSE/Brave ~US$0,005).
+- OpenStreetMap, DBPR, DNS y Playwright: gratis.
 - Claude Sonnet 5.5: una llamada por lead aceptado (`ANTHROPIC_EFFORT=low`), ~5–8k tokens de
   entrada y <1k de salida ≈ US$0,02 por lead, ~US$0,40 por lote de 20.
 - Apollo: 0 créditos salvo `APOLLO_REVEAL_EMAILS=true`.
+- El costo real estimado de cada corrida queda en `quality_report.json` → `cost_estimate_usd`.

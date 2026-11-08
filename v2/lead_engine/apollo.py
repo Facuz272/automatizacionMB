@@ -14,6 +14,7 @@ import time
 import requests
 from loguru import logger
 
+from . import costs
 from .config import settings
 from .normalize import clean_email
 
@@ -58,6 +59,7 @@ def find_contact(domain: str) -> dict | None:
     """{'name','title','email'|None,'linkedin'} for the best PM-type person at `domain`."""
     if not settings.apollo_api_key or not domain:
         return None
+    costs.tracker.add("apollo_search")
     data = _post(SEARCH_URL, {
         "q_organization_domains_list": [domain],
         "person_titles": TITLES,
@@ -73,6 +75,7 @@ def find_contact(domain: str) -> dict | None:
         if MASKED in email.lower():
             email = ""
         if not email and settings.apollo_reveal_emails and p.get("id"):
+            costs.tracker.add("apollo_reveal")
             m = _post(MATCH_URL, {"id": p["id"], "reveal_personal_emails": False})
             email = ((m or {}).get("person") or {}).get("email") or ""
             if MASKED in email.lower():

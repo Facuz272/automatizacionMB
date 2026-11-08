@@ -10,10 +10,12 @@ dependencies = [
   "pydantic>=2.7",
   "python-dotenv>=1.0",
   "requests>=2.31",
+  "dnspython>=2.6",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+browser = ["playwright>=1.45"]
 
 [project.scripts]
 lead-engine = "lead_engine.__main__:main"

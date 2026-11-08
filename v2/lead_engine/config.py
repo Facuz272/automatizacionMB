@@ -48,6 +48,21 @@ class Settings:
     out_dir: Path = field(default_factory=lambda: Path(os.getenv("LEAD_ENGINE_OUT", str(BASE_DIR / "out"))))
     state_db: Path = field(default_factory=lambda: Path(os.getenv("LEAD_ENGINE_DB", str(BASE_DIR / "data" / "state.db"))))
     http_timeout_s: float = field(default_factory=lambda: float(os.getenv("HTTP_TIMEOUT_S", "12")))
+    # ── deep enrichment ──
+    # Places reviews (Enterprise + Atmosphere SKU) feed the pain detector for every strategy.
+    places_reviews: bool = field(default_factory=lambda: _bool("PLACES_REVIEWS", True))
+    geo_enabled: bool = field(default_factory=lambda: _bool("GEO_ENABLED", True))
+    overpass_url: str = field(default_factory=lambda: os.getenv("OVERPASS_URL", "https://overpass-api.de/api/interpreter"))
+    render_js: str = field(default_factory=lambda: os.getenv("RENDER_JS", "auto").strip().lower())  # off|auto|always
+    playwright_chromium_path: str | None = field(default_factory=lambda: os.getenv("PLAYWRIGHT_CHROMIUM_PATH") or None)
+    search_provider: str = field(default_factory=lambda: os.getenv("SEARCH_PROVIDER", "auto").strip().lower())
+    serpapi_key: str | None = field(default_factory=lambda: os.getenv("SERPAPI_KEY") or None)
+    google_cse_key: str | None = field(default_factory=lambda: os.getenv("GOOGLE_CSE_KEY") or None)
+    google_cse_cx: str | None = field(default_factory=lambda: os.getenv("GOOGLE_CSE_CX") or None)
+    brave_search_key: str | None = field(default_factory=lambda: os.getenv("BRAVE_SEARCH_KEY") or None)
+    dbpr_groups: list[str] = field(default_factory=lambda: _list("DBPR_GROUPS") or ["MD", "PB"])
+    email_mx_check: bool = field(default_factory=lambda: _bool("EMAIL_MX_CHECK", True))
+    crm_include_brief: bool = field(default_factory=lambda: _bool("CRM_INCLUDE_BRIEF", True))
     user_agent: str = field(
         default_factory=lambda: os.getenv(
             "LEAD_ENGINE_UA", "Mozilla/5.0 (compatible; MBLeadEngine/2.0; +https://mbsoftwashmiami.com)"

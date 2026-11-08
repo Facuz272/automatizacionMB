@@ -1,27 +1,20 @@
 """Deterministic gates and precalification rules (pure, tested).
 
 The AI step improves these, but every lead is fully qualified even with no
-ANTHROPIC_API_KEY: segment, strategy_kind and a sales hook always exist.
+ANTHROPIC_API_KEY: segment, management type and an evidence-based hook (real
+surfaces from the building profile + the strongest pain quote with its date).
 """
 
 from __future__ import annotations
 
 import re
 
-from .models import Lead
+from .models import AMENITY_LABEL, Lead
 from .normalize import address_problem, to_e164
+from .pain import VERIFIED_PAIN, detect
 
-PAIN_TERMS = {
-    "mold": "moho", "mildew": "moho", "algae": "algas", "stain": "manchas", "dirty": "suciedad",
-    "filthy": "suciedad", "grime": "suciedad", "disgusting": "suciedad", "black streak": "manchas negras",
-    "pressure wash": "lavado a presión", "power wash": "lavado a presión", "peeling": "pintura pelada",
-    "rust": "óxido", "bird droppings": "excremento de aves", "pigeon": "palomas", "smell": "olor",
-    "cobweb": "telarañas", "dirty windows": "ventanas sucias", "facade": "fachada",
-    "poorly maintained": "mal mantenimiento", "not maintained": "mal mantenimiento",
-    "maintenance is": "quejas de mantenimiento", "needs cleaning": "falta limpieza",
-}
-_PAIN_RE = re.compile("|".join(re.escape(t) for t in sorted(PAIN_TERMS, key=len, reverse=True)), re.I)
-ONSITE_HINTS = re.compile(r"(?i)\b(on[- ]?site|management office|manager'?s office|front desk|concierge|building office)\b")
+ONSITE_HINTS = re.compile(r"(?i)\b(on[- ]?site (?:manag|office|staff)|management office|manager'?s office|building office|"
+                          r"oficina de administraci[oó]n)\b")
 
 
 def contactability_problem(lead: Lead, state: str | None = None) -> str | None:
@@ -33,20 +26,14 @@ def contactability_problem(lead: Lead, state: str | None = None) -> str | None:
     return address_problem(lead.address, state)
 
 
-def pain_signals(reviews: list[str], max_items: int = 3) -> list[str]:
-    """Short evidence snippets like 'moho: "...black mold on the balconies..."'."""
-    out: list[str] = []
-    for rv in reviews:
-        m = _PAIN_RE.search(rv)
-        if not m:
-            continue
-        start = max(0, m.start() - 50)
-        snippet = " ".join(rv[start : m.end() + 60].split())
-        label = PAIN_TERMS[m.group(0).lower()] if m.group(0).lower() in PAIN_TERMS else m.group(0).lower()
-        out.append(f'{label}: "…{snippet}…"')
-        if len(out) >= max_items:
-            break
-    return out
+def has_pain(lead: Lead) -> bool:
+    """Any pain hit at all (used by the `pain` strategy gate)."""
+    signals, _ = detect(lead.reviews)
+    return bool(signals)
+
+
+def detect_pain(lead: Lead) -> None:
+    lead.pain, lead.pain_score = detect(lead.reviews, lead.web_text)
 
 
 def infer_management_type(lead: Lead) -> str:
@@ -54,31 +41,55 @@ def infer_management_type(lead: Lead) -> str:
         return "third_party"
     if lead.strategy_kind == "portfolio":
         return "third_party"
-    if ONSITE_HINTS.search(lead.web_text or "") or "on-site" in " ".join(lead.reviews).lower():
+    reviews = " ".join(r.get("text", "") for r in lead.reviews)
+    if ONSITE_HINTS.search(lead.web_text or "") or ONSITE_HINTS.search(reviews):
+        return "onsite"
+    if any(p["label"] == "management" and p["source"] != "google_places" for p in lead.phones):
         return "onsite"
     return lead.management_type or "unknown"
 
 
 def rule_qualify(lead: Lead) -> None:
     """Fill segment / management_type / sales_strategy with rules (AI may override later)."""
-    lead.pain_signals = lead.pain_signals or pain_signals(lead.reviews)
+    if not lead.pain and lead.reviews:
+        detect_pain(lead)
     if lead.management_type == "unknown":
         lead.management_type = infer_management_type(lead)
     if not lead.segment:
-        lead.segment = "Dolor Urgente" if lead.pain_signals or lead.strategy_kind == "pain" else "Gran Comunidad"
+        urgent = lead.pain_score >= VERIFIED_PAIN or (lead.strategy_kind == "pain" and lead.pain)
+        lead.segment = "Dolor Urgente" if urgent else "Gran Comunidad"
     if not lead.sales_strategy:
         lead.sales_strategy = default_hook(lead)
 
 
+def surfaces_phrase(lead: Lead, max_items: int = 3) -> str:
+    """'deck de piscina, garaje/parking multinivel y fachada de 32 pisos expuesta al salitre'."""
+    b = lead.building or {}
+    items = [AMENITY_LABEL[a] for a in AMENITY_LABEL if a in (b.get("amenities") or {})][:max_items]
+    facade = "fachada"
+    if b.get("levels"):
+        facade += f" de {b['levels']} pisos"
+    if b.get("coastal"):
+        facade += " expuesta al salitre"
+    items.append(facade)
+    return ", ".join(items[:-1]) + (" y " if len(items) > 1 else "") + items[-1]
+
+
 def default_hook(lead: Lead) -> str:
     who = lead.contact_name or ("el/la Property Manager" if lead.strategy_kind != "portfolio" else "el director de operaciones")
-    if lead.pain_signals:
-        issue = lead.pain_signals[0].split(":", 1)[0]
-        return (f"Reseñas mencionan {issue}: pedir por {who} y ofrecer una inspección gratis de fachada/áreas "
-                f"comunes antes de que la junta reciba más quejas.")
+    if lead.contact_name and lead.contact_title:
+        who = f"{lead.contact_name} ({lead.contact_title})"
+    surfaces = surfaces_phrase(lead)
+    if lead.pain:
+        top = lead.pain[0]
+        when = f" ({top['date']})" if top.get("date") else ""
+        src = "Reseña" if top["source"] == "review" else "Su web"
+        quote = top["quote"] if len(top["quote"]) <= 110 else top["quote"][:107] + "…"
+        quote = quote.rstrip(" .")
+        return (f"{src}{when} menciona {top['label']}: «{quote}». Pedir por {who} y ofrecer "
+                f"inspección gratis de {surfaces}.")
     if lead.strategy_kind == "portfolio":
         n = f"{lead.properties_count} propiedades" if lead.properties_count else "varias comunidades"
         return (f"Administradora con {n}: pedir por {who} y proponer un proveedor único de softwash "
                 f"con precio por portafolio y una prueba en un edificio.")
-    return (f"Edificio de condominio: pedir por {who} y ofrecer inspección gratis de fachada, "
-            f"garajes y áreas comunes para el próximo presupuesto de mantenimiento.")
+    return f"Pedir por {who} y ofrecer inspección gratis de {surfaces} para el próximo presupuesto de mantenimiento."

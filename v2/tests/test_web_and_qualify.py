@@ -1,5 +1,5 @@
 from lead_engine.models import Lead
-from lead_engine.qualify import contactability_problem, pain_signals, rule_qualify
+from lead_engine.qualify import contactability_problem, rule_qualify
 from lead_engine.web_extract import parse_page
 
 HTML = """
@@ -25,8 +25,8 @@ HTML = """
 def test_parse_page_extracts_everything():
     f = parse_page(HTML, "https://oceanvillas.org")
     assert f.emails == {"manager@oceanvillas.org": "mailto", "info@oceanvillas.org": "text"}
-    assert f.phones[0] == "+13058614001"            # tel: link first
-    assert "+13058614000" in f.phones              # JSON-LD
+    assert f.phone_numbers[0] == "+13058614001"     # tel: link first
+    assert "+13058614000" in f.phone_numbers       # JSON-LD
     assert f.addresses == ["6000 Collins Ave, Miami Beach, FL 33140"]
     assert ("Maria Perez", "Property Manager") in f.people
     assert ("John Smith", "Board President") in f.people
@@ -48,13 +48,14 @@ def test_gate_requires_e164_and_street_address():
 
 
 def test_pain_signals_and_segment():
-    reviews = ["Nice pool but the garage has black mold everywhere and nobody cleans it.", "Great staff"]
-    sig = pain_signals(reviews)
-    assert len(sig) == 1 and sig[0].startswith("moho")
+    reviews = [{"text": "Nice pool but the garage has black mold everywhere and nobody cleans it.",
+                "rating": 2, "published": None, "relative": "a month ago"},
+               {"text": "Great staff", "rating": 5}]
     lead = _lead(reviews=reviews)
     rule_qualify(lead)
+    assert lead.pain[0]["category"] == "mold" and lead.pain_score >= 3
     assert lead.segment == "Dolor Urgente"
-    assert "moho" in lead.sales_strategy
+    assert "moho" in lead.sales_strategy and "black mold" in lead.sales_strategy
 
     calm = _lead()
     rule_qualify(calm)
@@ -75,9 +76,10 @@ def test_crm_payload_contract():
     assert p["phone"] == "+13058614000" and p["segment"] in ("Dolor Urgente", "Gran Comunidad")
     assert (p["contact_title"], p["management_company"]) == ("Property Manager", "FirstService Residential")
     assert (p["source"], p["import_batch_id"], p["strategy_kind"]) == ("lead-engine-v2:google_places", "le2-test", "onsite")
-    # the hook stays clean: no folded facts or trace tags
-    assert p["sales_strategy"] == lead.sales_strategy
+    # hook first; no trace tags or folded contact facts (the brief only adds physical/phone/score facts)
+    assert p["sales_strategy"].startswith(lead.sales_strategy)
     assert "[LE2" not in p["sales_strategy"] and "Administra:" not in p["sales_strategy"]
+    assert lead.crm_payload("le2-test", include_brief=False)["sales_strategy"] == lead.sales_strategy
 
 
 def test_onsite_without_company_gets_label():

@@ -77,6 +77,9 @@ def collect(strategy: str, max_candidates: int) -> Iterator[Lead]:
             website_url=website if is_company_site(website) else None,
             domain=extract_domain(website) if is_company_site(website) else "",
             maps_url=f"https://www.google.com/maps/search/?api=1&query={lat},{lon}" if lat and lon else None,
+            lat=lat,
+            lng=lon,
+            phones=[{"number": phone, "label": "unlabeled", "source": "osm", "context": ""}] if phone else [],
             evidence={"osm_tags": {k: v for k, v in t.items() if k.startswith(("addr:", "building", "operator"))}},
             management_company=t.get("operator"),
         )

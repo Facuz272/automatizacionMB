@@ -39,6 +39,8 @@ def collect(path: str | Path, strategy: str, max_candidates: int) -> Iterator[Le
                 strategy_kind=strategy,  # type: ignore[arg-type]
                 company_name=name,
                 phone=to_e164(row.get("phone")),
+                phones=[{"number": to_e164(row.get("phone")), "label": "unlabeled", "source": "seed", "context": ""}]
+                if to_e164(row.get("phone")) else [],
                 address=clean_address(row.get("address")),
                 website_url=website if is_company_site(website) else None,
                 domain=extract_domain(website) if is_company_site(website) else "",

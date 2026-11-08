@@ -3,7 +3,9 @@
 Needs "Places API (New)" enabled on the key (the v1 scraper used the legacy API
 through the `googlemaps` package). One searchText request returns name, address,
 phone, website, rating and Maps URL, so there is no per-place Details call.
-Reviews are requested only for the `pain` strategy (more expensive SKU).
+Reviews (with their dates) are requested when PLACES_REVIEWS=true (default) or
+for the `pain` strategy; they feed the pain detector. `location` gives the
+coordinates used for the OpenStreetMap building profile.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from typing import Iterator
 import requests
 from loguru import logger
 
+from .. import costs
 from ..config import QUERIES, cities_for, settings
 from ..models import Lead
 from ..normalize import clean_address, extract_domain, is_company_site, to_e164
@@ -23,7 +26,7 @@ SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 BASE_FIELDS = [
     "places.id", "places.displayName", "places.formattedAddress", "places.nationalPhoneNumber",
     "places.internationalPhoneNumber", "places.websiteUri", "places.googleMapsUri", "places.rating",
-    "places.userRatingCount", "places.businessStatus", "places.types", "nextPageToken",
+    "places.userRatingCount", "places.businessStatus", "places.types", "places.location", "nextPageToken",
 ]
 REVIEW_FIELDS = ["places.reviews"]
 
@@ -56,6 +59,7 @@ def _search(query: str, page_token: str | None, with_reviews: bool) -> dict:
             time.sleep(2 ** attempt)
             continue
         if r.status_code == 200:
+            costs.tracker.add("places_text_search_reviews" if with_reviews else "places_text_search")
             return r.json()
         if r.status_code in (429, 500, 502, 503, 504):
             time.sleep(2 ** attempt)
@@ -76,9 +80,15 @@ def _to_lead(place: dict, strategy: str) -> Lead | None:
     website = place.get("websiteUri")
     phone_raw = place.get("nationalPhoneNumber") or place.get("internationalPhoneNumber")
     reviews = [
-        ((rv.get("text") or {}).get("text") or "").strip()
+        {
+            "text": ((rv.get("originalText") or rv.get("text") or {}).get("text") or "").strip(),
+            "rating": rv.get("rating"),
+            "published": rv.get("publishTime"),
+            "relative": rv.get("relativePublishTimeDescription"),
+        }
         for rv in (place.get("reviews") or [])
     ]
+    loc = place.get("location") or {}
     return Lead(
         source="google_places",
         source_id=place.get("id", ""),
@@ -93,7 +103,11 @@ def _to_lead(place: dict, strategy: str) -> Lead | None:
         google_rating=place.get("rating"),
         total_reviews=place.get("userRatingCount"),
         place_types=types,
-        reviews=[r for r in reviews if r],
+        reviews=[r for r in reviews if r["text"]],
+        lat=loc.get("latitude"),
+        lng=loc.get("longitude"),
+        phones=[{"number": to_e164(phone_raw), "label": "google_main", "source": "google_places", "context": ""}]
+        if to_e164(phone_raw) else [],
         evidence={"phone_raw": phone_raw, "website_raw": website},
     )
 
@@ -107,7 +121,7 @@ def collect(strategy: str, max_candidates: int, cities: list[str] | None = None)
             query = f"{q} {city}"
             token: str | None = None
             for page in range(3):  # Google caps text search at 60 results
-                data = _search(query, token, with_reviews=strategy == "pain")
+                data = _search(query, token, with_reviews=settings.places_reviews or strategy == "pain")
                 places = data.get("places") or []
                 logger.info("Places '{}' pág {}: {} resultados", query, page + 1, len(places))
                 for p in places:

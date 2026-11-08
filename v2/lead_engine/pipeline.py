@@ -3,9 +3,15 @@
   1. collect     Google Places / OSM / seed CSV candidates for a strategy
   2. gate        phone E.164 + street address (a website crawl may fill either first)
   3. precheck    dry-run against the CRM: drop phones it already has (before paying enrichment)
-  4. enrich      site crawl (people, mailto, managed-by) → Apollo → rules → Claude
-  5. output      out/<batch_id>/{leads.jsonl, crm_payload.json, rejected.jsonl, summary.json}
-  6. send        optional: POST to the CRM (dry_run unless --commit)
+  4. enrich      per lead, in this order:
+                   site crawl (+Playwright for SPAs, hydrated JSON) → labelled phones, people, emails
+                   DBPR registry (association, units, care-of management/officer)
+                   external search API when the site/registry leave gaps
+                   Apollo → OSM building profile → pain detector → email MX
+                   → Claude (evidence-guarded) → rules → lead_score
+  5. rank        sort by lead_score (CRM appends in order → 6 AM distribution gives the best first)
+  6. output      out/<batch_id>/{leads.jsonl, crm_payload.json, rejected.jsonl, quality_report.json}
+  7. send        optional: POST to the CRM (dry_run unless --commit)
 
 Stops as soon as `limit` leads are fully enriched, so `--limit 20` bounds spend.
 """
@@ -14,7 +20,6 @@ from __future__ import annotations
 
 import json
 import secrets
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -22,14 +27,14 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
-from . import ai_enrich, apollo, crm_importer
+from . import ai_enrich, apollo, costs, crm_importer, dbpr, email_verify, geo, quality, render, scoring, search
 from .collectors import google_places, osm, seed_csv
 from .config import settings
 from .models import Lead
-from .normalize import address_problem, best_email, phone_key
-from .qualify import contactability_problem, pain_signals, rule_qualify
+from .normalize import address_problem, clean_email, phone_key, rank_email
+from .qualify import contactability_problem, detect_pain, has_pain, rule_qualify
 from .state import Ledger
-from .web_extract import SiteFacts, crawl
+from .web_extract import LABEL_PRIORITY, SiteFacts, better_label, crawl
 
 
 def new_batch_id(strategy: str) -> str:
@@ -51,9 +56,36 @@ def _candidates(strategy: str, sources: list[str], max_candidates: int, seed: st
             yield from seed_csv.collect(seed, strategy, max_candidates)
 
 
+# ── phones ──────────────────────────────────────────────────────────────────
+
+def merge_phones(lead: Lead, facts: SiteFacts) -> None:
+    for p in facts.phones:
+        if p["label"] == "fax":
+            continue
+        existing = next((x for x in lead.phones if x["number"] == p["number"]), None)
+        if existing is None:
+            lead.phones.append(dict(p))
+        elif better_label(existing["label"], p["label"]):
+            existing.update(label=p["label"], context=p.get("context", ""), source=p["source"])
+
+
+def choose_primary_phone(lead: Lead) -> None:
+    """Management office / property manager line beats Google's main number; front desk/leasing never win."""
+    usable = [p for p in lead.phones if p["label"] != "fax"]
+    if not usable:
+        return
+    best = sorted(usable, key=lambda p: LABEL_PRIORITY.get(p["label"], 9))[0]
+    current = next((p for p in usable if p["number"] == lead.phone), None)
+    if current is None or LABEL_PRIORITY.get(best["label"], 9) < LABEL_PRIORITY.get(current["label"], 9):
+        if lead.phone and lead.phone != best["number"]:
+            lead.evidence["phone_replaced"] = {"from": lead.phone, "to": best["number"], "label": best["label"]}
+        lead.phone = best["number"]
+
+
 def _fill_from_site(lead: Lead, facts: SiteFacts) -> None:
-    if not lead.phone and facts.phones:
-        lead.phone = facts.phones[0]
+    merge_phones(lead, facts)
+    if not lead.phone and facts.best_phone():
+        lead.phone = facts.best_phone()["number"]
         lead.evidence["phone_from"] = "website"
     if address_problem(lead.address, settings.target_state) and facts.addresses:
         for a in facts.addresses:
@@ -64,12 +96,91 @@ def _fill_from_site(lead: Lead, facts: SiteFacts) -> None:
     lead.web_text = facts.text
 
 
-def _enrich(lead: Lead, facts: SiteFacts | None, use_apollo: bool, use_ai: bool) -> None:
+# ── enrichment steps ────────────────────────────────────────────────────────
+
+def apply_dbpr(lead: Lead, rec: dict | None) -> None:
+    if not rec:
+        return
+    lead.public_records["dbpr"] = {k: rec[k] for k in (
+        "project_number", "condo_name", "association", "units", "projects_at_address", "status", "route_raw",
+        "management_company", "contact_name", "contact_title", "management_type", "registered_agent", "matched_by")}
+    lead.association_name = lead.association_name or rec.get("association")
+    if rec.get("management_company") and not lead.management_company:
+        lead.management_company = rec["management_company"]
+        lead.management_type = "third_party"
+    elif rec.get("management_type") in ("onsite", "self_managed") and lead.management_type == "unknown":
+        lead.management_type = rec["management_type"]
+    if rec.get("contact_name") and not lead.contact_name:
+        lead.contact_name = rec["contact_name"]
+        lead.contact_title = rec.get("contact_title") or "Contacto registrado de la asociación (DBPR)"
+        lead.evidence["contact_from"] = "dbpr"
+
+
+def apply_search(lead: Lead, found: dict) -> None:
+    if not found:
+        return
+    lead.search_hits = found.get("hits", [])[:8]
+    lead.evidence["search_query"] = found.get("query")
+    lead.evidence["search_companies"] = found.get("companies", [])
+    lead.evidence["search_people"] = found.get("people", [])
+    companies = found.get("companies") or []
+    if companies and not lead.management_company:
+        lead.management_company = companies[0][0]
+        lead.management_type = "third_party"
+        lead.evidence["management_from"] = "search"
+
+
+def pick_email(lead: Lead, candidates: dict[str, str], check_mx: bool) -> None:
+    """Best email whose domain is alive. Order: current, then ranked candidates."""
+    ordered: list[str] = []
+    original, original_source = lead.email, lead.email_source
+    if lead.email:
+        ordered.append(lead.email)
+    ranked = sorted({c for c in (clean_email(e) for e in candidates) if c},
+                    key=lambda e: rank_email(e, lead.domain, lead.contact_name or ""))
+    ordered += [e for e in ranked if e not in ordered]
+    if not ordered:
+        lead.email, lead.email_status = None, "unchecked"
+        return
+    if not check_mx:
+        lead.email, lead.email_status = ordered[0], "unchecked"
+    else:
+        costs.tracker.add("dns", len(ordered))
+        chosen, status = email_verify.first_deliverable(ordered)
+        dropped = [e for e in ordered[: ordered.index(chosen)]] if chosen else ordered
+        if dropped:
+            lead.evidence["emails_dropped_dns"] = dropped
+        lead.email, lead.email_status = chosen, (email_verify.email_status(chosen) if chosen else status)
+    if lead.email:
+        lead.email_source = original_source if lead.email == original and original_source else candidates.get(lead.email, "text")
+
+
+def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: bool, use_search: bool,
+           use_geo: bool, use_dbpr: bool, check_mx: bool) -> None:
     facts = facts or SiteFacts()
-    lead.pain_signals = pain_signals(lead.reviews)
-    # People from the site (first PM-like title wins), then Apollo.
+    choose_primary_phone(lead)
+
+    # Site: people (first PM-like title wins) and managed-by.
     if not lead.contact_name and facts.people:
         lead.contact_name, lead.contact_title = facts.people[0]
+        lead.evidence["contact_from"] = "website"
+    if not lead.management_company and facts.managed_by:
+        lead.management_company = facts.managed_by[0]
+        lead.management_type = "third_party"
+
+    # Official registry.
+    if use_dbpr:
+        apply_dbpr(lead, dbpr.match(lead.address, lead.company_name))
+
+    # External search when the site and registry left gaps.
+    emails: dict[str, str] = dict(facts.emails)
+    if use_search and (not lead.website_url or not (lead.contact_name and lead.management_company)):
+        found = search.discover(lead.company_name, search.city_of(lead.address))
+        apply_search(lead, found)
+        for e in found.get("emails", []) if found else []:
+            emails.setdefault(e, "search")
+
+    # Apollo by domain.
     ap = None
     if use_apollo and lead.domain and (not lead.contact_name or not lead.email):
         ap = apollo.find_contact(lead.domain)
@@ -78,32 +189,51 @@ def _enrich(lead: Lead, facts: SiteFacts | None, use_apollo: bool, use_ai: bool)
             lead.evidence["contact_from"] = "apollo"
         if ap and ap.get("email") and not lead.email:
             lead.email, lead.email_source = ap["email"], "apollo"
-    if not lead.management_company and facts.managed_by:
-        lead.management_company = facts.managed_by[0]
-    # Email: never required (primary channel is the phone), best candidate kept.
-    if not lead.email:
-        e = best_email(list(facts.emails), lead.domain, lead.contact_name or "")
-        if e:
-            lead.email, lead.email_source = e, facts.emails.get(e, "text")
+
+    # Physical profile.
+    osm_profile = geo.fetch_profile(lead.lat, lead.lng) if use_geo else {}
+    units = (lead.public_records.get("dbpr") or {}).get("units")
+    lead.building = geo.merge_profile(osm_profile, lead.web_text, lead.address, units)
+
+    # Pain + email.
+    detect_pain(lead)
+    pick_email(lead, emails, check_mx)
+
+    # Claude, guarded by the evidence.
     if use_ai and ai_enrich.available():
-        candidate_emails = sorted(set(facts.emails) | ({lead.email} if lead.email else set()))
+        candidate_emails = sorted(set(emails) | ({lead.email} if lead.email else set()))
+        if check_mx:
+            candidate_emails = [e for e in candidate_emails if email_verify.email_status(e) not in email_verify.DROP]
         evidence = ai_enrich.build_evidence(lead, facts.people, candidate_emails, facts.managed_by, ap)
         result = ai_enrich.enrich(lead, evidence)
         if result:
+            before = lead.email
             ai_enrich.apply(lead, result, evidence)
+            if lead.email != before and check_mx:
+                lead.email_status = email_verify.email_status(lead.email)
     rule_qualify(lead)  # fills whatever is still empty
+    scoring.apply(lead)
     lead.evidence["site_pages"] = facts.pages[:6]
+    if facts.rendered:
+        lead.evidence["rendered_pages"] = facts.rendered[:4]
 
+
+# ── run ─────────────────────────────────────────────────────────────────────
 
 def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] = ("places",), seed: str | None = None,
         use_ai: bool = True, use_apollo: bool = True, precheck: bool = True, send: bool = False,
-        commit: bool = False, max_candidates: int | None = None, out_dir: Path | None = None) -> Path:
+        commit: bool = False, max_candidates: int | None = None, out_dir: Path | None = None,
+        use_search: bool = True, use_geo: bool = True, use_dbpr: bool = True, check_mx: bool | None = None) -> Path:
     batch_id = new_batch_id(strategy)
     out = Path(out_dir or settings.out_dir) / batch_id
     out.mkdir(parents=True, exist_ok=True)
     ledger = Ledger()
+    costs.tracker.reset()
+    check_mx = settings.email_mx_check if check_mx is None else check_mx
     max_candidates = max_candidates or limit * 6
-    logger.info("Lote {} · estrategia={} · límite={} · fuentes={}", batch_id, strategy, limit, list(sources))
+    logger.info("Lote {} · estrategia={} · límite={} · fuentes={} · búsqueda={} · render={}",
+                batch_id, strategy, limit, list(sources), search.provider() or "off",
+                settings.render_js if render.available() else "off")
 
     rejected: list[dict] = []
     gated: list[tuple[Lead, SiteFacts | None]] = []
@@ -128,7 +258,7 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] = ("pl
         if problem:
             reject(lead, problem)
             continue
-        if strategy == "pain" and not pain_signals(lead.reviews):
+        if strategy == "pain" and not has_pain(lead):
             reject(lead, "sin señales de dolor en reseñas")
             continue
         key = phone_key(lead.phone or "")
@@ -160,18 +290,26 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] = ("pl
 
     # ── 4: enrichment ─────────────────────────────────────────────────────────
     accepted: list[Lead] = []
-    for lead, facts in gated[:limit]:
-        if facts is None and lead.website_url:
-            facts = crawl(lead.website_url)
-            _fill_from_site(lead, facts)
-        _enrich(lead, facts, use_apollo, use_ai)
-        accepted.append(lead)
-        ledger.mark(lead.source_id, lead.source, lead.phone, "accepted", None, batch_id)
-        logger.success("{} · {} · {} · contacto={} · email={}", lead.company_name, lead.phone, lead.segment,
-                       lead.contact_name or "—", lead.email or "—")
+    try:
+        for lead, facts in gated[:limit]:
+            if facts is None and lead.website_url:
+                facts = crawl(lead.website_url)
+                _fill_from_site(lead, facts)
+            enrich(lead, facts, use_apollo=use_apollo, use_ai=use_ai, use_search=use_search,
+                   use_geo=use_geo, use_dbpr=use_dbpr, check_mx=check_mx)
+            accepted.append(lead)
+            ledger.mark(lead.source_id, lead.source, lead.phone, "accepted", None, batch_id)
+            logger.success("[{:>3}] {} · {} · {} · contacto={} · admin={} · email={}({})", lead.lead_score,
+                           lead.company_name, lead.phone, lead.segment, lead.contact_name or "—",
+                           lead.management_company or lead.management_type, lead.email or "—", lead.email_status)
+    finally:
+        render.close()
 
-    # ── 5: output ─────────────────────────────────────────────────────────────
-    payloads = [l.crm_payload(batch_id) for l in accepted]
+    # ── 5: rank ───────────────────────────────────────────────────────────────
+    accepted = scoring.rank(accepted)
+
+    # ── 6: output ─────────────────────────────────────────────────────────────
+    payloads = [l.crm_payload(batch_id, include_brief=settings.crm_include_brief) for l in accepted]
     with open(out / "leads.jsonl", "w", encoding="utf-8") as fh:
         for l in accepted:
             fh.write(json.dumps({**l.internal_record(), "import_batch_id": batch_id}, ensure_ascii=False) + "\n")
@@ -181,9 +319,9 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] = ("pl
     (out / "crm_payload.json").write_text(json.dumps(
         {"import_batch_id": batch_id, "source": "lead-engine-v2", "dry_run": True, "leads": payloads},
         ensure_ascii=False, indent=2), encoding="utf-8")
-    summary = summarize(batch_id, strategy, accepted, rejected)
 
-    # ── 6: send ───────────────────────────────────────────────────────────────
+    # ── 7: send ───────────────────────────────────────────────────────────────
+    crm_summary = None
     if send and payloads:
         if not client.configured:
             logger.warning("No se envía al CRM: falta CRM_WEBHOOK_SECRET")
@@ -191,50 +329,17 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] = ("pl
             report = crm_importer.import_leads(payloads, batch_id, dry_run=not commit, client=client)
             name = "crm_response_commit.json" if commit else "crm_response_dry.json"
             (out / name).write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-            summary["crm"] = {k: v for k, v in report.as_dict().items() if k != "responses"}
+            crm_summary = {k: v for k, v in report.as_dict().items() if k != "responses"}
             if commit:
                 ledger.mark_imported(payloads, report)
-    (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print_summary(summary, out)
-    return out
 
-
-def _pct(n: int, d: int) -> str:
-    return f"{(100 * n / d):.0f}%" if d else "—"
-
-
-def summarize(batch_id: str, strategy: str, accepted: list[Lead], rejected: list[dict]) -> dict:
-    n = len(accepted)
-    return {
-        "import_batch_id": batch_id,
-        "strategy": strategy,
-        "accepted": n,
-        "rejected": len(rejected),
-        "rejected_reasons": dict(Counter(r["reason"] for r in rejected).most_common()),
-        "coverage": {
-            "phone_e164": _pct(sum(bool(l.phone) for l in accepted), n),
-            "address_street": _pct(sum(not address_problem(l.address, None) for l in accepted), n),
-            "contact_name": _pct(sum(bool(l.contact_name) for l in accepted), n),
-            "contact_title": _pct(sum(bool(l.contact_title) for l in accepted), n),
-            "email": _pct(sum(bool(l.email) for l in accepted), n),
-            "management_known": _pct(sum(l.management_type != "unknown" for l in accepted), n),
-            "ai_qualified": _pct(sum(l.ai_used for l in accepted), n),
-        },
-        "segments": dict(Counter(l.segment for l in accepted)),
-        "strategy_kinds": dict(Counter(l.strategy_kind for l in accepted)),
-    }
-
-
-def print_summary(summary: dict, out: Path) -> None:
-    print("\n=== Lead Engine v2 ===")
-    print(f"Lote: {summary['import_batch_id']}  ({summary['strategy']})")
-    print(f"Aceptados: {summary['accepted']}  ·  Rechazados: {summary['rejected']}")
-    for k, v in summary["coverage"].items():
-        print(f"  {k:<16} {v}")
-    if summary["rejected_reasons"]:
-        print("Motivos de rechazo:", summary["rejected_reasons"])
-    if "crm" in summary:
-        c = summary["crm"]
+    qr = quality.build(batch_id, strategy, accepted, rejected)
+    if crm_summary:
+        qr["crm"] = crm_summary
+    (out / "quality_report.json").write_text(json.dumps(qr, ensure_ascii=False, indent=2), encoding="utf-8")
+    quality.print_report(qr, out)
+    if crm_summary:
+        c = crm_summary
         print(f"CRM (dry_run={c['dry_run']}): insertaría={c['would_insert']} insertados={c['inserted']} "
               f"duplicados={len(c['duplicates'])} rechazados={len(c['rejected'])}")
-    print(f"Archivos: {out}/  (crm_payload.json = lo que se enviaría)")
+    return out
