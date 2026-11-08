@@ -46,6 +46,10 @@ piscina y parking multinivel expuestos al salitre") and, when present, the stron
 No greetings, no generic marketing text, max 300 characters.
 - public_records.dbpr is the official Florida condominium registry (association, units, care-of line): trust it \
 for the management company / on-site office unless the website clearly says otherwise.
+- municipal_signals are official city/county records (40-year recertification pending, unsafe structure, open \
+maintenance code case, recent exterior permit): when present, open the hook with them — they are the most urgent pain.
+- portfolio_cluster lists other condos run by the same management firm/manager: when count > 1, suggest a combined \
+inspection naming one or two of them.
 - search.hits are third-party web results that already mention this building; use them for management company \
 or manager names only when the snippet clearly ties them to this building."""
 
@@ -105,6 +109,13 @@ def build_evidence(lead: Lead, people: list[tuple[str, str]], emails: list[str],
         "pain_signals": [{"label": p["label"], "quote": p["quote"], "date": p.get("date"), "source": p["source"]}
                          for p in lead.pain[:4]],
         "pain_score": lead.pain_score,
+        "municipal_signals": [{"label": m["label"], "quote": m["quote"], "date": m.get("date")} for m in lead.municipal[:3]],
+        "licenses": lead.licenses,
+        "portfolio_cluster": {"count": lead.portfolio_cluster.get("count"), "by": lead.portfolio_cluster.get("by"),
+                              "siblings": [x["name"] for x in lead.portfolio_cluster.get("siblings", [])]}
+        if lead.portfolio_cluster else None,
+        "estimated_annual_contract_usd": {"low": lead.estimated_deal.get("low"), "high": lead.estimated_deal.get("high")}
+        if lead.estimated_deal else None,
         "reviews": [{"text": r["text"][:400], "date": r.get("published") or r.get("relative"), "rating": r.get("rating")}
                     for r in lead.reviews[:5]],
         "site_text": (lead.web_text or "")[:5000],

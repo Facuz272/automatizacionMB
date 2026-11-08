@@ -9,6 +9,7 @@ lists poorly (no category, no reviews).
 
 from __future__ import annotations
 
+import re
 from typing import Iterator
 
 import requests
@@ -86,3 +87,54 @@ def collect(strategy: str, max_candidates: int) -> Iterator[Lead]:
         emitted += 1
         if emitted >= max_candidates:
             return
+
+
+def address_query(number: str, street_core: str, bbox: tuple[float, float, float, float]) -> str:
+    """Overpass: features tagged with this house number on a street whose name contains the core word."""
+    s, w, n, e = bbox
+    core = street_core.split()[-1] if street_core else ""
+    core_rx = re.escape(core.title()) if not core.isdigit() else rf"\b{core}"
+    return f"""
+[out:json][timeout:30];
+nwr["addr:housenumber"="{number}"]["addr:street"~"{core_rx}",i]({s},{w},{n},{e});
+out tags center 10;
+"""
+
+
+def pick_address_match(elements: list[dict], name: str | None = None) -> dict | None:
+    """Best OSM element for a building: prefers one with phone/website, then a building/name."""
+    def rank(el: dict) -> tuple:
+        t = el.get("tags") or {}
+        return (not (t.get("phone") or t.get("contact:phone")), not (t.get("website") or t.get("contact:website")),
+                not t.get("building"), not t.get("name"))
+    els = [e for e in elements if e.get("tags")]
+    if not els:
+        return None
+    el = sorted(els, key=rank)[0]
+    t = el["tags"]
+    lat = el.get("lat") or (el.get("center") or {}).get("lat")
+    lon = el.get("lon") or (el.get("center") or {}).get("lon")
+    website = t.get("website") or t.get("contact:website")
+    return {
+        "lat": lat, "lng": lon, "name": t.get("name"),
+        "phone": to_e164(t.get("phone") or t.get("contact:phone")),
+        "website": website if is_company_site(website) else None,
+        "levels": t.get("building:levels"), "osm_id": f"{el.get('type')}/{el.get('id')}",
+    }
+
+
+def lookup_address(address: str | None, name: str | None = None) -> dict | None:
+    """Coordinates (and phone/website when mapped) for a street address in OSM_BBOX."""
+    from ..municipal_signals import street_parts
+
+    parts = street_parts(address)
+    if not parts:
+        return None
+    try:
+        r = requests.post(OVERPASS_URL, data={"data": address_query(parts[0], parts[1], OSM_BBOX)},
+                          headers={"User-Agent": settings.user_agent}, timeout=45)
+        r.raise_for_status()
+        return pick_address_match(r.json().get("elements", []), name)
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("Overpass (dirección) falló para {}: {}", address, exc)
+        return None

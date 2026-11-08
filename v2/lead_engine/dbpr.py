@@ -109,8 +109,9 @@ _COMPANY_WORDS = re.compile(
     r"(?i)\b(MANAGEMENT|MGMT|MGT|PROPERTY|PROPERTIES|SERVICES|SERVICE|RESIDENTIAL|GROUP|REALTY|LLC|INC|CORP|"
     r"ASSOCIATES|SOLUTIONS|CONSULTANTS|PARTNERS|ADVISORS|COMPANY|CO)\b\.?")
 _ONSITE = re.compile(
-    r"(?i)^(?:THE\s+)?(?:(?:MANAGEMENT|MGMT|MANAGER'?S?|ADMINISTRATION|ADMIN|ASSOCIATION|ASSN|CONDO|BUILDING)\s+OFFICE|"
-    r"OFFICE|LOBBY|FRONT DESK|SECURITY DESK)\b")
+    r"(?i)^(?:THE\s+)?(?:(?:MANAGEMENT|MGMT\.?|MGT\.?|MANAGER'?S?|ADMINISTRATION|ADMIN\.?|ASSOCIATION|ASSN\.?|CONDO|BUILDING)\s+OFFICE|"
+    r"OFFICE|LOBBY|FRONT DESK|SECURITY DESK|"
+    r"(?:PROPERTY|GENERAL|COMMUNITY|BUILDING|SITE|RESIDENT|ASSOCIATION|ASSN\.?|CONDO|ON[- ]?SITE)?\s*MANAGER)\b(?![' ]?S\b)")
 _BOARD = re.compile(r"(?i)^BOARD(?:\s+OF\s+DIRECTORS)?\b")
 # Single-word firms that carry no company word in the name.
 KNOWN_SHORT_FIRMS = {"AKAM": "AKAM", "REALMANAGE": "RealManage", "CIRACONNECT": "CiraConnect", "ASSOCIA": "Associa",
@@ -127,11 +128,15 @@ OFFICER_TITLES = {
 }
 
 
+_KEEP_UPPER = {"NE", "NW", "SE", "SW", "LLC", "INC", "LLP", "PA", "II", "III", "IV", "USA", "HOA", "CAM", "LCAM", "FL"}
+
+
 def _title_case(s: str) -> str:
     small = {"Of", "And", "The", "De", "Del", "La"}
-    out = " ".join(w.capitalize() if not re.fullmatch(r"(?:LLC|INC|LLP|PA|II|III|IV|USA|HOA|CAM|LCAM)", w.strip(".,"))
-                   else w for w in s.split())
-    return " ".join(w if w not in small else w.lower() for w in out.split())
+    s = re.sub(r"\b([NS])\.\s?([EW])\.", r"\1\2", s, flags=re.I)        # N.E. -> NE
+    out = " ".join(w.upper() if w.strip(".,").upper() in _KEEP_UPPER else w.capitalize() for w in s.split())
+    words = out.split()
+    return " ".join(w if i == 0 or w not in small else w.lower() for i, w in enumerate(words))
 
 
 def parse_route(route: str | None) -> dict[str, Any]:
@@ -139,7 +144,10 @@ def parse_route(route: str | None) -> dict[str, Any]:
     out: dict[str, Any] = {"management_company": None, "contact_name": None, "contact_title": None,
                            "management_type": None, "registered_agent": None}
     r = " ".join((route or "").split()).strip()
-    r = re.sub(r"(?i)^(?:C/O|C\\O|CO|ATTN:?|ATTENTION:?)\s+", "", r).strip(" ,")
+    prev = None
+    while prev != r:                                        # "C/O ATTENTION MANAGEMENT OFFICE"
+        prev = r
+        r = re.sub(r"(?i)^(?:C/O|C\\O|CO|ATTN\.?:?|ATTENTION:?)\s+", "", r).strip(" ,")
     r = re.sub(r"(?i)\s+C/O\s+", " / ", r)               # "SOBE MANAGEMENT C/O PHILIPPE LAMERY"
     if not r:
         return out
@@ -199,11 +207,29 @@ CREATE TABLE IF NOT EXISTS dbpr_condos (
 );
 CREATE INDEX IF NOT EXISTS dbpr_condos_key ON dbpr_condos(address_key);
 CREATE INDEX IF NOT EXISTS dbpr_condos_zip ON dbpr_condos(zip);
+-- Derived from managing_entity_route (rebuilt by index_routes after every load).
+CREATE TABLE IF NOT EXISTS dbpr_routes (
+  project_number TEXT PRIMARY KEY, city TEXT, route_type TEXT, company TEXT, company_key TEXT,
+  person TEXT, person_key TEXT, person_title TEXT, same_address INTEGER, firm_id TEXT
+);
+CREATE INDEX IF NOT EXISTS dbpr_routes_company ON dbpr_routes(company_key);
+CREATE INDEX IF NOT EXISTS dbpr_routes_person ON dbpr_routes(person_key);
+CREATE INDEX IF NOT EXISTS dbpr_routes_city ON dbpr_routes(city);
 """
 
 
 def _db_path() -> Path:
     return settings.state_db.with_name("dbpr.db")
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive schema upgrades for databases created by earlier versions."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(dbpr_routes)")}
+    if "firm_id" not in cols:
+        conn.execute("ALTER TABLE dbpr_routes ADD COLUMN firm_id TEXT")
+        conn.execute("DELETE FROM dbpr_routes")       # rebuilt below with firm ids
+    conn.execute("CREATE INDEX IF NOT EXISTS dbpr_routes_firm ON dbpr_routes(firm_id)")
+    conn.commit()
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
@@ -212,6 +238,10 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(p)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
+    # Databases loaded before dbpr_routes existed get it built once.
+    if conn.execute("SELECT EXISTS(SELECT 1 FROM dbpr_condos) AND NOT EXISTS(SELECT 1 FROM dbpr_routes)").fetchone()[0]:
+        index_routes(conn)
     return conn
 
 
@@ -234,7 +264,77 @@ def load_rows(conn: sqlite3.Connection, rows: Iterable[dict[str, str]]) -> int:
         )
         n += 1
     conn.commit()
+    index_routes(conn)
     return n
+
+
+def city_of(address: str | None) -> str | None:
+    """'5555 COLLINS AVE, MIAMI BEACH, FL 33140-2559' -> 'MIAMI BEACH'."""
+    parts = [p.strip() for p in (address or "").upper().split(",")]
+    if len(parts) >= 3:
+        return parts[-2] or None
+    return None
+
+
+def route_type(route: dict[str, Any], same_address: bool) -> str:
+    """onsite | portfolio | self_managed | person | agent | unknown (for the DBPR seed filter)."""
+    if route.get("management_type") == "onsite" or same_address:
+        return "onsite"
+    if route.get("management_company"):
+        return "portfolio"
+    if route.get("management_type") == "self_managed":
+        return "self_managed"
+    if route.get("registered_agent"):
+        return "agent"
+    if route.get("contact_name"):
+        return "person"
+    return "unknown"
+
+
+def firm_identity(company: str | None, conn: sqlite3.Connection, cache: dict[str, str] | None = None) -> str | None:
+    """One id per real firm: its CAB licence when the registry knows it, else the spacing-free name key
+    ('FIRST SERVICE RESIDENTIAL' and 'FIRSTSERVICE RESIDENTIAL' -> same id)."""
+    from .names import firm_key
+
+    key = firm_key(company) if company else ""
+    if not key:
+        return None
+    if cache is not None and key in cache:
+        return cache[key]
+    fid = "KEY:" + key.replace(" ", "")
+    try:
+        from . import cam
+
+        lic = cam.verify_firm(company, conn)
+        if lic:
+            fid = "LIC:" + lic["license_id"]
+    except sqlite3.Error:
+        pass
+    if cache is not None:
+        cache[key] = fid
+    return fid
+
+
+def index_routes(conn: sqlite3.Connection) -> int:
+    from .names import firm_key, person_key
+
+    _migrate(conn)
+    cache: dict[str, str] = {}
+    conn.execute("DELETE FROM dbpr_routes")
+    rows = conn.execute("SELECT project_number, address, address_key, managing_entity_route, managing_entity_address "
+                        "FROM dbpr_condos").fetchall()
+    for r in rows:
+        route = parse_route(r["managing_entity_route"])
+        me_key = address_key(r["managing_entity_address"])
+        same = bool(me_key and r["address_key"] and me_key.split("|")[:2] == r["address_key"].split("|")[:2])
+        company = route.get("management_company")
+        person = route.get("contact_name")
+        conn.execute("INSERT OR REPLACE INTO dbpr_routes VALUES (?,?,?,?,?,?,?,?,?,?)", (
+            r["project_number"], city_of(r["address"]), route_type(route, same), company,
+            firm_key(company) or None if company else None, person, person_key(person), route.get("contact_title"),
+            int(same), firm_identity(company, conn, cache)))
+    conn.commit()
+    return len(rows)
 
 
 def load_csv(path: str | Path, conn: sqlite3.Connection | None = None) -> int:
@@ -300,3 +400,71 @@ def match(address: str | None, name: str | None = None, conn: sqlite3.Connection
         "matched_by": how,
         **route,
     }
+
+
+# ── portfolio cluster ───────────────────────────────────────────────────────
+
+def _coverage_counties() -> list[str]:
+    return [c.upper() for c in settings.cluster_counties]
+
+
+def cluster(*, company: str | None = None, person: str | None = None, exclude_project: str | None = None,
+            near_zip: str | None = None, near_city: str | None = None, conn: sqlite3.Connection | None = None,
+            max_siblings: int = 3) -> dict[str, Any] | None:
+    """Other condos in the coverage counties managed by the same firm (or, failing that, the same person).
+
+    Siblings are ordered by proximity proxy — same ZIP, then same city — and then by units.
+    """
+    from .names import person_key
+
+    try:
+        conn = conn or connect()
+    except sqlite3.Error:
+        return None
+    counties = _coverage_counties()
+    marks = ",".join("?" * len(counties))
+    for by, key in (("company", firm_identity(company, conn) if company else None),
+                    ("person", person_key(person) if person else None)):
+        if not key:
+            continue
+        col = "firm_id" if by == "company" else "person_key"
+        rows = conn.execute(
+            f"SELECT c.project_number, c.condo_name, c.address, c.zip, c.units, r.city FROM dbpr_routes r "
+            f"JOIN dbpr_condos c USING (project_number) WHERE r.{col} = ? AND UPPER(c.county) IN ({marks}) "
+            f"AND c.primary_status = 'Approved'", (key, *counties)).fetchall()
+        # One building per street address (several projects can share it).
+        seen: dict[str, sqlite3.Row] = {}
+        for r in rows:
+            k = address_key(r["address"]) or r["project_number"]
+            if k not in seen or (r["units"] or 0) > (seen[k]["units"] or 0):
+                seen[k] = r
+        own = None
+        if exclude_project:
+            own_row = conn.execute("SELECT address FROM dbpr_condos WHERE project_number = ?", (exclude_project,)).fetchone()
+            own = address_key(own_row["address"]) if own_row else None
+        others = [r for k, r in seen.items() if r["project_number"] != exclude_project and k != own]
+        if not others:
+            continue
+        others.sort(key=lambda r: (r["zip"] != near_zip, (r["city"] or "") != (near_city or "").upper(), -(r["units"] or 0)))
+        return {
+            "by": by,
+            "key": key,
+            "count": len(others) + 1,
+            "total_units": sum(r["units"] or 0 for r in others),
+            "siblings": [{"name": _short_condo_name(r["condo_name"]), "address": r["address"], "units": r["units"],
+                          "zip": r["zip"], "project_number": r["project_number"]} for r in others[:max_siblings]],
+        }
+    return None
+
+
+_CONDO_SUFFIX = re.compile(r"(?i)[,\s]+(?:A\s+)?(?:CONDOMINIUM|CONDO)\.?(?:\s+(?:ASSOCIATION|ASSN)\.?)?(?:,?\s+INC\.?)?\s*$")
+
+
+def _short_condo_name(name: str | None) -> str:
+    """'OCEANIA II, A CONDO' -> 'Oceania II'; 'TIDES ON HOLLYWOOD BEACH CONDO, THE' -> 'The Tides On Hollywood Beach'."""
+    n = (name or "").strip()
+    the = bool(re.search(r"(?i)(?:,|\bCONDO(?:MINIUM)?)\s*THE\s*$", n))
+    n = re.sub(r"(?i),?\s*THE\s*$", "", n)
+    n = _CONDO_SUFFIX.sub("", n) or n
+    n = re.sub(r"(?i)\s+(?:CONDO(?:MINIUM)?)\s*$", "", n).strip(" ,") or n
+    return _title_case(("THE " if the else "") + n)

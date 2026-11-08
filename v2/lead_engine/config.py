@@ -61,6 +61,12 @@ class Settings:
     google_cse_cx: str | None = field(default_factory=lambda: os.getenv("GOOGLE_CSE_CX") or None)
     brave_search_key: str | None = field(default_factory=lambda: os.getenv("BRAVE_SEARCH_KEY") or None)
     dbpr_groups: list[str] = field(default_factory=lambda: _list("DBPR_GROUPS") or ["MD", "PB"])
+    # Counties (DBPR spelling) that count as "the area" for portfolio clusters.
+    cluster_counties: list[str] = field(default_factory=lambda: _list("CLUSTER_COUNTIES") or ["Dade", "Broward", "Palm Beach"])
+    # DBPR seed: minimum units and the size that ranks first.
+    min_units: int = field(default_factory=lambda: int(os.getenv("MIN_UNITS", "50")))
+    priority_units: int = field(default_factory=lambda: int(os.getenv("PRIORITY_UNITS", "80")))
+    municipal_signals: bool = field(default_factory=lambda: _bool("MUNICIPAL_SIGNALS", True))
     email_mx_check: bool = field(default_factory=lambda: _bool("EMAIL_MX_CHECK", True))
     crm_include_brief: bool = field(default_factory=lambda: _bool("CRM_INCLUDE_BRIEF", True))
     user_agent: str = field(

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from lead_engine import costs, dbpr, email_verify, geo, pipeline, search
+from lead_engine import cam, costs, dbpr, email_verify, geo, municipal_signals, pipeline, search
 from lead_engine.collectors import google_places
 from lead_engine.state import Ledger
 from lead_engine.web_extract import parse_page
@@ -18,6 +18,10 @@ from test_geo import ELEMENTS, LAT, LON
 from test_search import RESULTS
 
 FIXTURE = Path(__file__).parent / "fixtures" / "dbpr_condo_md_sample.csv"
+CAM_FIXTURE = Path(__file__).parent / "fixtures" / "cam_lic38cam_sample.csv"
+RECERT = {"category": "municipal_recert", "label": "recertificación 40 años pendiente", "weight": 6.0,
+          "quote": "City of Miami: 5555 COLLINS AV — recertificación 2015 pendiente (submitted and NOT approved)",
+          "date": "2015", "source": "municipal", "layer": "miami_recert", "ref": "x"}
 
 OCEANSIDE_SITE = """
 <html><body><h1>Oceanside Plaza</h1>
@@ -49,6 +53,13 @@ PLACES = [
 def wired(monkeypatch, tmp_path):
     conn = dbpr.connect(tmp_path / "dbpr.db")
     dbpr.load_csv(FIXTURE, conn)
+    cam.load_csv(CAM_FIXTURE, conn)
+    real_person, real_firm, real_cluster = cam.verify_person, cam.verify_firm, dbpr.cluster
+    monkeypatch.setattr(pipeline.cam, "verify_person", lambda n, c=None: real_person(n, conn))
+    monkeypatch.setattr(pipeline.cam, "verify_firm", lambda n, c=None: real_firm(n, conn))
+    monkeypatch.setattr(pipeline.dbpr, "cluster", lambda **kw: real_cluster(**{**kw, "conn": conn}))
+    monkeypatch.setattr(pipeline.municipal_signals, "lookup",
+                        lambda address, **kw: [dict(RECERT)] if address and address.startswith("5555 Collins") else [])
     monkeypatch.setattr(google_places, "_search", lambda q, tok, with_reviews: {"places": PLACES})
     monkeypatch.setattr(pipeline, "crawl", lambda url, max_pages=5: parse_page(OCEANSIDE_SITE, url))
     real_match = dbpr.match
@@ -91,7 +102,12 @@ def test_full_run(wired, monkeypatch):
     assert top["pain_score"] >= 3 and top["lead_score"] == 100
     assert "deck de piscina" in payload[0]["sales_strategy"] and "32 pisos" in payload[0]["sales_strategy"]
     assert "front desk +13058661301" in payload[0]["sales_strategy"]
-    assert "hace 2 meses" in payload[0]["sales_strategy"] and "techo hormigón plano" in payload[0]["sales_strategy"]
+    assert payload[0]["sales_strategy"].startswith("Registro municipal: recertificación 40 años pendiente")
+    assert "techo hormigón plano" in payload[0]["sales_strategy"] and "est. US$" in payload[0]["sales_strategy"]
+    assert "firma CAM licenciada CAB3838" in payload[0]["sales_strategy"]
+    assert top["municipal"][0]["category"] == "municipal_recert" and top["pain"][0]["source"] == "municipal"
+    assert top["estimated_deal"]["high"] > top["estimated_deal"]["low"] > 10_000
+    assert top["licenses"]["firm"]["license_id"] == "CAB3838"
     inland = next(l for l in leads if l["company_name"] == "Inland Villas")
     assert (inland["management_company"], inland["contact_name"]) == ("Premier Assn Services", "Orly Iglesias")
 
@@ -101,5 +117,44 @@ def test_full_run(wired, monkeypatch):
     assert oceania["public_records"]["dbpr"]["units"] == 330
 
     assert report["accepted"] == 3 and report["pct"]["dbpr_match"] == 100.0
+    assert report["pct"]["municipal_signal"] == round(100 / 3, 1) and report["pct"]["deal_estimated"] == 100.0
+    assert report["estimated_deal_usd"]["sum_high"] >= top["estimated_deal"]["high"]
     assert report["lead_score"]["max"] == 100
     assert report["cost_estimate_usd"]["by_api"]["dns"]["count"] >= 1   # Places is faked here; its counter is unit-tested
+
+
+
+def test_dbpr_seed_run_without_places(wired, monkeypatch):
+    """--seed dbpr with no Places key: discovery from the registry, phone from Places-less sources."""
+    from lead_engine import config
+    from lead_engine.collectors import dbpr_seed
+    s = type(config.settings)(**{**config.settings.__dict__, "google_places_api_key": None, "crm_webhook_secret": None,
+                                 "min_units": 100, "priority_units": 150})
+    for mod in (pipeline, dbpr_seed):
+        monkeypatch.setattr(mod, "settings", s)
+    conn = dbpr.connect(wired / "dbpr.db")
+    real_collect = dbpr_seed.collect
+    monkeypatch.setattr(pipeline.dbpr_seed, "collect",
+                        lambda strategy, n: real_collect(strategy, n, conn, cities=["Miami Beach", "Sunny Isles Beach"]))
+    # OSM knows Oceania II's phone (tagged), nothing for the rest.
+    monkeypatch.setattr(pipeline.osm, "lookup_address", lambda address, name=None: {
+        "lat": 25.9300, "lng": -80.1210, "phone": "+13059491000", "website": None, "name": "Oceania II",
+        "levels": "28", "osm_id": "way/1"} if address.startswith("16485") else None)
+    assert pipeline.default_sources() == ["dbpr"]
+    out = pipeline.run(strategy="onsite", limit=5, use_ai=False, use_apollo=False, precheck=False, use_search=False,
+                       out_dir=wired / "out2")
+    leads = [json.loads(l) for l in (out / "leads.jsonl").read_text().splitlines()]
+    assert [l["company_name"] for l in leads] == ["Oceania II"]
+    l = leads[0]
+    assert l["source"] == "dbpr" and l["phone"] == "+13059491000" and l["management_type"] == "onsite"
+    assert l["building"]["units"] == 330 and l["estimated_deal"]["low"] > 0
+    assert not (out / "needs_phone.csv").exists()          # Oceania I has no care-of → not an onsite seed
+    report = json.loads((out / "quality_report.json").read_text())
+    assert report["sources"] == {"dbpr": 1}
+
+    # Portfolio seed: Oceanside Plaza (Castle) qualifies but nothing gives it a phone → manual list.
+    out = pipeline.run(strategy="portfolio", limit=5, use_ai=False, use_apollo=False, precheck=False, use_search=False,
+                       out_dir=wired / "out3")
+    assert (out / "leads.jsonl").read_text() == ""
+    needs = (out / "needs_phone.csv").read_text()
+    assert "Oceanside Plaza,\"5555 Collins Ave, Miami Beach, FL 33140\",299" in needs and "Castle Management LLC" in needs

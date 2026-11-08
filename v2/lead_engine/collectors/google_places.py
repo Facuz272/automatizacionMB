@@ -41,10 +41,10 @@ class PlacesError(RuntimeError):
     pass
 
 
-def _search(query: str, page_token: str | None, with_reviews: bool) -> dict:
+def _search(query: str, page_token: str | None, with_reviews: bool, page_size: int = 20) -> dict:
     if not settings.google_places_api_key:
         raise PlacesError("Falta GOOGLE_PLACES_API_KEY")
-    body: dict = {"textQuery": query, "regionCode": "us", "languageCode": "en", "pageSize": 20}
+    body: dict = {"textQuery": query, "regionCode": "us", "languageCode": "en", "pageSize": page_size}
     if page_token:
         body["pageToken"] = page_token
     headers = {
@@ -139,3 +139,30 @@ def collect(strategy: str, max_candidates: int, cities: list[str] | None = None)
                 if not token:
                     break
                 time.sleep(2)  # page tokens need a moment to become valid
+
+
+def find_place(name: str, address: str, strategy: str) -> Lead | None:
+    """One targeted lookup for a known building (DBPR seed): "<name>, <address>".
+
+    Accepts the result only when its street address is the same building (number +
+    street + ZIP) or, within the same ZIP, the name is clearly the same. One request
+    per building instead of sweeping whole zones.
+    """
+    from ..dbpr import address_key, name_similarity, zip5
+
+    try:
+        data = _search(f"{name}, {address}", None, with_reviews=settings.places_reviews, page_size=3)
+    except PlacesError as exc:
+        logger.warning("Places find_place {}: {}", name, exc)
+        return None
+    want_key, want_zip = address_key(address), zip5(address)
+    for p in data.get("places") or []:
+        lead = _to_lead(p, strategy)
+        if not lead:
+            continue
+        same_addr = want_key and address_key(lead.address) == want_key
+        same_name = zip5(lead.address) == want_zip and name_similarity(name, lead.company_name) >= 0.5
+        if same_addr or same_name:
+            lead.evidence["places_match"] = "address" if same_addr else "name"
+            return lead
+    return None

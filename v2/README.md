@@ -24,18 +24,23 @@ CSV                ya están         OSM (pisos/m²/amenities/costa) → dolor �
 v2/
 ├── pyproject.toml / requirements.txt / .env.example
 ├── lead_engine/
-│   ├── __main__.py        CLI: run | import | dbpr-sync | dbpr-load
+│   ├── __main__.py        CLI: run | import | dbpr-sync | dbpr-load | cam-load
 │   ├── config.py          env + ciudades y consultas por estrategia (onsite/pain/portfolio)
 │   ├── normalize.py       extract_domain, to_e164, phone_key, address_problem, emails (puro)
 │   ├── models.py          Lead + brief() «Ficha» + crm_payload() (contrato exacto del endpoint)
 │   ├── collectors/
 │   │   ├── google_places.py  Places API (New): coordenadas + reseñas con fecha
-│   │   ├── osm.py            Overpass (gratis): edificios con número de calle
+│   │   ├── osm.py            Overpass (gratis): edificios con número de calle + búsqueda por dirección
+│   │   ├── dbpr_seed.py      semilla desde el padrón DBPR (sin Google Places)
 │   │   └── seed_csv.py       listas públicas / directorios / exports
 │   ├── web_extract.py     mailto/tel con etiqueta, JSON-LD, __NEXT_DATA__/estado hidratado, personas, «managed by»
 │   ├── render.py          Playwright opcional para SPAs (RENDER_JS=auto)
 │   ├── search.py          SerpAPI / Google CSE / Brave → administradora, CAM, email (solo resultados que nombran el edificio)
-│   ├── dbpr.py            padrón oficial de condominios FL: descarga, carga y cruce por dirección / nombre
+│   ├── dbpr.py            padrón oficial de condominios FL: descarga, cruce por dirección/nombre, rutas «C/O», cluster
+│   ├── cam.py             padrón de licencias CAM (personas) y CAB (firmas) del DBPR: verificación de nombres
+│   ├── names.py           normalización de firmas y personas (abreviaturas, tipeos, variantes de espaciado)
+│   ├── municipal_signals.py  open data municipal: recertificación pendiente, estructura insegura, código, permisos
+│   ├── valuation.py       ticket anual estimado de limpieza exterior (rango USD)
 │   ├── geo.py             perfil físico OSM: pisos, huella m², techo, amenities lavables, distancia a la costa
 │   ├── pain.py            detector de dolor ponderado EN/ES con cita y fecha
 │   ├── email_verify.py    DNS MX/A con caché y sonda de resolvedor
@@ -92,7 +97,7 @@ tarjeta (se apaga con `CRM_INCLUDE_BRIEF=false`). El registro completo queda en 
 ### Padrón oficial DBPR
 
 ```bash
-python -m lead_engine dbpr-sync              # descarga Condo_MD.csv + condo_PB.csv (~13.000 condominios)
+python -m lead_engine dbpr-sync              # Condo_MD.csv + condo_PB.csv (~13.000 condominios) + lic38cam.csv
 python -m lead_engine dbpr-sync --groups MD,PB,CE
 ```
 
@@ -100,6 +105,71 @@ Cruza cada lead por número + calle normalizada + ZIP (o por nombre dentro del Z
 línea «C/O» del registro: administradora («C/O CASTLE MANAGEMENT LLC»), oficina en el edificio
 («C/O MANAGEMENT OFFICE»), directivo de la junta («C/O PETER BATTY, PRESIDENT») o agente
 registrado (no se usa como contacto). Con los datos de nov-2026 interpreta el 99 % de esas líneas.
+
+### Modo semilla DBPR (`--seed dbpr`)
+
+```bash
+python -m lead_engine run --seed dbpr --strategy onsite --limit 20 --dry-run
+python -m lead_engine run --seed dbpr --strategy portfolio --min-units 80 --limit 30 --dry-run
+```
+
+Descubre edificios desde el padrón oficial (no desde Google): filtra por `TARGET_CITIES` (ciudad
+postal del DBPR o alias de barrio: «Brickell Miami» → 33129/33130/33131, «Sunny Isles Beach» → 33160…),
+`MIN_UNITS` (50) y tipo de administración — `onsite` cuando el «C/O» es la oficina del edificio o
+la dirección del propio edificio, `portfolio` cuando es una administradora externa — y ordena
+primero los de `PRIORITY_UNITS`+ (80). Es la fuente por defecto si no hay `GOOGLE_PLACES_API_KEY`.
+
+Para cada edificio busca el teléfono, en este orden: Google Places **por nombre + dirección**
+(una consulta puntual por edificio, si hay clave), etiquetas de OpenStreetMap en esa dirección,
+y el sitio oficial vía búsqueda API + rastreo. Los que pasan todos los filtros pero no tienen
+teléfono quedan en `out/<lote>/needs_phone.csv` (edificio, dirección, unidades, asociación,
+administradora) para buscarlos a mano.
+
+Con el padrón de nov-2026 y los filtros por defecto: 442 edificios `onsite` (366 con 80+ unidades)
+y 322 `portfolio` en las ciudades objetivo.
+
+### Licencias CAM y efecto multi-propiedad
+
+`dbpr-sync` también descarga `lic38cam.csv` (19.575 CAM personas, 2.070 firmas CAB). Cada
+contacto y administradora se verifica contra ese padrón: «LCAM activa CAM12345» / «firma CAM
+licenciada CAB2893» en la ficha (`≈` cuando el cruce es por variante de escritura). Un contacto
+con licencia activa pasa a cargo «LCAM».
+
+Las rutas «C/O» del padrón de condominios se agrupan por firma (por su licencia CAB, así
+«First Service Residential» y «Firstservice Residential» son la misma) o por persona. Si la
+administradora del lead maneja otros condominios en `CLUSTER_COUNTIES`, la ficha y el gancho lo
+dicen y proponen una inspección combinada con los 2 edificios hermanos más cercanos (mismo ZIP,
+misma ciudad, luego más grandes):
+
+```
+Edificio administrado por First Service Residential: pedir por el/la CAM asignado/a al edificio y ofrecer
+inspección gratis de fachada expuesta al salitre. Proponer inspección combinada con Sunset Harbour North y
+300 Collins (misma administradora, 81 condominios en la zona).
+```
+
+### Señales municipales (open data)
+
+| capa (ArcGIS REST, pública) | qué detecta | peso |
+| --- | --- | --- |
+| City of Miami · 40_Year_Recertification | recertificación 40 años **pendiente** | 6 |
+| Miami-Dade · Open_Building_Violations | caso abierto de **estructura insegura** / violación de edificación | 5 / 3 |
+| Miami-Dade · CodeComplianceViolation_Open_View | caso de código abierto por mantenimiento | 4 |
+| Miami-Dade · miamidade_permit_data | permiso reciente (24 meses) de pintura, impermeabilización, restauración, fachada, techo, pool deck | 2,5 |
+
+Se consultan por número + calle; el de recertificación además exige ciudad postal Miami y
+cercanía a las coordenadas. Una señal municipal pesa más que cualquier reseña y encabeza el
+gancho («Registro municipal: …»). Si una capa no responde, se apaga por el resto de la corrida
+sin cortar nada. Miami Beach, Broward y Fort Lauderdale no exponen capas accesibles desde
+nuestra red (nov-2026): esos leads simplemente no tienen señal municipal.
+
+### Ticket anual estimado
+
+`valuation.py` estima el rango anual del contrato (fachada por perímetro×altura, ×1,5 con
+salitre y ×1,3 con acceso por cuerdas desde 8 pisos; caminos; garaje; pool deck; canchas;
+garita) con pisos/huella de OSM o, si faltan, derivados de las unidades del DBPR. Va a la ficha
+(`est. US$ 36k–65k/año`) y desempata el `lead_score`: entre leads igual de calificados, la
+setter llama primero al contrato más grande. Las tarifas están en una tabla al inicio del
+módulo para ajustarlas con las primeras cotizaciones reales.
 
 ### Búsqueda externa
 
@@ -114,7 +184,7 @@ Cada `run` imprime y guarda `out/<lote>/quality_report.json`: % con decisor (y c
 con administradora identificada, % email verificado MX, % con señales de dolor (y verificado),
 % con tel. de administración, % con perfil físico, % costero o grande, % cruce DBPR, % con IA,
 `lead_score` promedio/mediana/bandas, categorías de dolor más frecuentes, motivos de rechazo y
-costo estimado de APIs (total y por lead, precios ajustables con `PRICE_<API>`).
+costo estimado de APIs (total y por lead, precios ajustables con `PRICE_<API>`), más % con señal municipal, % contacto con LCAM activa, % firma CAB licenciada, % con cluster multi-propiedad y la suma del ticket anual estimado del lote.
 
 ## Reglas que garantiza
 

@@ -40,6 +40,11 @@ def build(batch_id: str, strategy: str, leads: list[Lead], rejected: list[dict])
             "coastal_or_large": _pct(sum(bool((l.building or {}).get("coastal") or (l.building or {}).get("large"))
                                          for l in leads), n),
             "dbpr_match": _pct(sum(bool(l.public_records.get("dbpr")) for l in leads), n),
+            "municipal_signal": _pct(sum(bool(l.municipal) for l in leads), n),
+            "contact_cam_licensed": _pct(sum(bool((l.licenses.get("contact") or {}).get("active")) for l in leads), n),
+            "firm_cab_licensed": _pct(sum(bool((l.licenses.get("firm") or {}).get("active")) for l in leads), n),
+            "multi_property_cluster": _pct(sum(l.portfolio_cluster.get("count", 0) > 1 for l in leads), n),
+            "deal_estimated": _pct(sum(bool(l.estimated_deal) for l in leads), n),
             "ai_qualified": _pct(sum(l.ai_used for l in leads), n),
         },
         "lead_score": {
@@ -53,6 +58,14 @@ def build(batch_id: str, strategy: str, leads: list[Lead], rejected: list[dict])
                               for k in ("decision_maker", "onsite_or_pain", "email_mx", "exposure_size", "mgmt_phone")}
             if leads else {},
         },
+        "estimated_deal_usd": {
+            "sum_low": sum(l.estimated_deal.get("low", 0) for l in leads),
+            "sum_high": sum(l.estimated_deal.get("high", 0) for l in leads),
+            "median_high": median([l.estimated_deal["high"] for l in leads if l.estimated_deal]) if any(
+                l.estimated_deal for l in leads) else 0,
+        },
+        "municipal_categories": dict(Counter(m["category"] for l in leads for m in l.municipal)),
+        "sources": dict(Counter(l.source for l in leads)),
         "segments": dict(Counter(l.segment for l in leads)),
         "strategy_kinds": dict(Counter(l.strategy_kind for l in leads)),
         "top_pain_categories": dict(Counter(p["category"] for l in leads for p in l.pain).most_common(8)),
@@ -74,11 +87,17 @@ def print_report(r: dict[str, Any], out_dir) -> None:
         ("Email verificado (MX)", p["email_verified_mx"]), ("Señales de dolor", p["pain_signals"]),
         ("Dolor verificado (≥3)", p["pain_verified"]), ("Tel. de administración", p["management_office_phone"]),
         ("Perfil físico (OSM)", p["building_profile"]), ("Costero o grande", p["coastal_or_large"]),
-        ("Cruce DBPR", p["dbpr_match"]), ("Precalificado con IA", p["ai_qualified"]),
+        ("Cruce DBPR", p["dbpr_match"]), ("Señal municipal", p["municipal_signal"]),
+        ("Contacto con LCAM activa", p["contact_cam_licensed"]), ("Firma CAM licenciada", p["firm_cab_licensed"]),
+        ("Cluster multi-propiedad", p["multi_property_cluster"]), ("Ticket estimado", p["deal_estimated"]),
+        ("Precalificado con IA", p["ai_qualified"]),
     ]
     for label, v in rows:
         print(f"  {label:<30} {v:5.1f}%")
     print(f"  lead_score promedio {s['avg']} (mediana {s['median']}, rango {s['min']}–{s['max']})  bandas {s['bands']}")
+    d = r["estimated_deal_usd"]
+    if d["sum_high"]:
+        print(f"  Ticket anual estimado del lote: US${d['sum_low']:,}–{d['sum_high']:,}".replace(",", "."))
     if r["rejected_reasons"]:
         print("  Rechazos:", r["rejected_reasons"])
     c = r["cost_estimate_usd"]

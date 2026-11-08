@@ -33,7 +33,11 @@ def has_pain(lead: Lead) -> bool:
 
 
 def detect_pain(lead: Lead) -> None:
-    lead.pain, lead.pain_score = detect(lead.reviews, lead.web_text)
+    """Review/site pains plus municipal signals; municipal records always lead (highest priority)."""
+    signals, score = detect(lead.reviews, lead.web_text)
+    muni = sorted(lead.municipal, key=lambda s: -s["weight"])
+    lead.pain = muni + signals
+    lead.pain_score = min(10.0, round(score + sum(s["weight"] for s in muni), 2))
 
 
 def infer_management_type(lead: Lead) -> str:
@@ -75,21 +79,40 @@ def surfaces_phrase(lead: Lead, max_items: int = 3) -> str:
     return ", ".join(items[:-1]) + (" y " if len(items) > 1 else "") + items[-1]
 
 
+def cluster_phrase(lead: Lead) -> str:
+    cl = lead.portfolio_cluster or {}
+    sibs = [x["name"] for x in cl.get("siblings", [])[:2]]
+    if cl.get("count", 0) <= 1 or not sibs:
+        return ""
+    by = "misma administradora" if cl.get("by") == "company" else "mismo administrador"
+    return f" Proponer inspección combinada con {' y '.join(sibs)} ({by}, {cl['count']} condominios en la zona)."
+
+
 def default_hook(lead: Lead) -> str:
-    who = lead.contact_name or ("el/la Property Manager" if lead.strategy_kind != "portfolio" else "el director de operaciones")
+    if lead.source == "dbpr" and lead.management_company:
+        default_who = "el/la CAM asignado/a al edificio"
+    else:
+        default_who = "el/la Property Manager" if lead.strategy_kind != "portfolio" else "el director de operaciones"
+    who = lead.contact_name or default_who
     if lead.contact_name and lead.contact_title:
         who = f"{lead.contact_name} ({lead.contact_title})"
     surfaces = surfaces_phrase(lead)
+    multi = cluster_phrase(lead)
     if lead.pain:
         top = lead.pain[0]
+        quote = top["quote"] if len(top["quote"]) <= 130 else top["quote"][:127] + "…"
+        quote = quote.rstrip(" .")
+        if top["source"] == "municipal":
+            return (f"Registro municipal: {top['label']} — {quote}. Pedir por {who} y ofrecer inspección gratis "
+                    f"de {surfaces} antes del plazo.{multi}")
         when = f" ({top['date']})" if top.get("date") else ""
         src = "Reseña" if top["source"] == "review" else "Su web"
-        quote = top["quote"] if len(top["quote"]) <= 110 else top["quote"][:107] + "…"
-        quote = quote.rstrip(" .")
         return (f"{src}{when} menciona {top['label']}: «{quote}». Pedir por {who} y ofrecer "
-                f"inspección gratis de {surfaces}.")
+                f"inspección gratis de {surfaces}.{multi}")
+    if lead.source == "dbpr" and lead.management_company:
+        return f"Edificio administrado por {lead.management_company}: pedir por {who} y ofrecer inspección gratis de {surfaces}.{multi}"
     if lead.strategy_kind == "portfolio":
         n = f"{lead.properties_count} propiedades" if lead.properties_count else "varias comunidades"
         return (f"Administradora con {n}: pedir por {who} y proponer un proveedor único de softwash "
-                f"con precio por portafolio y una prueba en un edificio.")
-    return f"Pedir por {who} y ofrecer inspección gratis de {surfaces} para el próximo presupuesto de mantenimiento."
+                f"con precio por portafolio y una prueba en un edificio.{multi}")
+    return f"Pedir por {who} y ofrecer inspección gratis de {surfaces} para el próximo presupuesto de mantenimiento.{multi}"

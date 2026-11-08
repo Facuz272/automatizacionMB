@@ -1,5 +1,7 @@
 """lead_score 0–100: objective priority used to order each batch before import.
 
+Ties are broken by the estimated annual contract (valuation.py).
+
 The CRM appends imported leads in payload order and the 6 AM distribution hands
 them out by position, so sorting by score means setters get the best leads of
 the batch first.
@@ -80,5 +82,7 @@ def apply(lead: Lead) -> None:
 
 
 def rank(leads: list[Lead]) -> list[Lead]:
-    """Highest score first; ties by pain, then reviews (stable)."""
-    return sorted(leads, key=lambda l: (-l.lead_score, -l.pain_score, -(l.total_reviews or 0)))
+    """Highest score first; ties broken by the estimated annual contract (high end, then low end),
+    then pain and reviews — so among equally qualified leads the setter calls the biggest ticket first."""
+    return sorted(leads, key=lambda l: (-l.lead_score, -(l.estimated_deal or {}).get("high", 0),
+                                        -(l.estimated_deal or {}).get("low", 0), -l.pain_score, -(l.total_reviews or 0)))

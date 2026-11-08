@@ -53,6 +53,12 @@ def test_address_key(addr, key):
     ("C/O SoBe Management c/o Philippe Lamery", {"management_company": "Sobe Management", "contact_name": "Philippe Lamery",
                                                  "management_type": "third_party"}),
     ("ATTN: LOBBY", {"management_type": "onsite"}),
+    ("C/O ATTENTION MANAGEMENT OFFICE", {"management_type": "onsite"}),
+    ("C/O PROPERTY MANAGER", {"management_type": "onsite"}),
+    ("C/O GENERAL MANAGER, JOHN DOE", {"management_type": "onsite", "contact_name": "John Doe",
+                                        "contact_title": "Oficina de administración (DBPR)"}),
+    ("C/O PROPERTY MANAGERS INC", {"management_company": "Property Managers INC", "management_type": "third_party"}),
+    ("ATTN: MGMT. OFFICE", {"management_type": "onsite"}),
     ("C/O OFFICE-UNIT #203", {"management_type": "onsite"}),
     ("C/O BOARD OF DIRECTORS #105", {"management_type": "self_managed"}),
     ("C/O AKAM", {"management_company": "AKAM", "management_type": "third_party"}),
@@ -86,3 +92,34 @@ def test_match_by_name_when_registry_has_no_number(conn):
     m = dbpr.match("15500 Miami Lakeway N, Miami Lakes, FL 33014", "Celebration Point Condo Six", conn)
     assert m and m["condo_name"] == "CELEBRATION POINT CONDO # SIX" and m["matched_by"].startswith("name~")
     assert dbpr.match("1 Unknown St, Miami, FL 33014", "Totally Different Tower", conn) is None
+
+
+
+@pytest.mark.parametrize("raw,short", [
+    ("OCEANIA II, A CONDO", "Oceania II"),
+    ("TIDES ON HOLLYWOOD BEACH CONDO, THE", "The Tides On Hollywood Beach"),
+    ("RONEY PALACE, A CONDO, THE", "The Roney Palace"),
+    ("CLUB AT BRICKELL BAY PLAZA, A CONDO THE", "The Club At Brickell Bay Plaza"),
+    ("CONDO OF POINT EAST ONE, A CONDO", "Condo of Point East One"),
+    ("BRICKELL ON THE RIVER NORTH TOWER, A CONDO", "Brickell On the River North Tower"),
+])
+def test_short_condo_name(raw, short):
+    assert dbpr._short_condo_name(raw) == short
+
+
+def test_title_case_keeps_directionals():
+    assert dbpr._title_case("31 SE 5TH ST, MIAMI") == "31 SE 5th St, Miami"
+    assert dbpr._title_case("2156 N.E. 67TH STREET") == "2156 NE 67th Street"
+
+
+
+def test_old_database_is_migrated(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript(dbpr.SCHEMA.replace(", firm_id TEXT", ""))     # dbpr_routes without firm_id
+    old.close()
+    c = dbpr.connect(path)
+    assert "firm_id" in {r[1] for r in c.execute("PRAGMA table_info(dbpr_routes)")}
+    assert dbpr.load_csv(FIXTURE, c) == 9
+    assert c.execute("SELECT firm_id FROM dbpr_routes WHERE project_number = 'PR1S003305'").fetchone()[0] == "KEY:CASTLEMANAGEMENT"

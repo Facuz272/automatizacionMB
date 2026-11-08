@@ -105,6 +105,14 @@ class Lead:
     pain: list[dict[str, Any]] = field(default_factory=list)
     pain_score: float = 0.0
     public_records: dict[str, Any] = field(default_factory=dict)   # dbpr match etc.
+    # municipal open data hits (also merged into `pain`): recert pending, unsafe structure, code case, permits
+    municipal: list[dict[str, Any]] = field(default_factory=list)
+    # DBPR CAM licences: {"contact": {...CAM...}, "firm": {...CAB...}}
+    licenses: dict[str, Any] = field(default_factory=dict)
+    # other condos in the area under the same management firm / person (dbpr.cluster)
+    portfolio_cluster: dict[str, Any] = field(default_factory=dict)
+    # valuation.estimate: {"low", "high", "components", "basis"} USD/year
+    estimated_deal: dict[str, Any] = field(default_factory=dict)
     search_hits: list[dict[str, Any]] = field(default_factory=list)
     lead_score: int = 0
     score_breakdown: dict[str, int] = field(default_factory=dict)
@@ -146,6 +154,21 @@ class Lead:
         if b.get("coastal"):
             dist = b.get("coast_distance_m")
             parts.append("frente costero (salitre)" if dist is not None and dist <= 300 else "zona costera (salitre)")
+        if self.estimated_deal:
+            from .valuation import label as deal_label
+            parts.append(deal_label(self.estimated_deal))
+        cl = self.portfolio_cluster
+        if cl and cl.get("count", 0) > 1:
+            who = self.management_company if cl.get("by") == "company" and self.management_company else (
+                self.contact_name if cl.get("by") == "person" and self.contact_name else "la misma administración")
+            names = ", ".join(x["name"] for x in cl.get("siblings", [])[:2])
+            parts.append(f"{who} administra {cl['count']} condominios en la zona" + (f" (incl. {names})" if names else ""))
+        lic = self.licenses or {}
+        if lic.get("contact", {}).get("active"):
+            parts.append(f"LCAM activa {lic['contact']['license_id']}")
+        if lic.get("firm", {}).get("active"):
+            approx = "" if lic["firm"].get("matched_by") == "exact" else "≈"
+            parts.append(f"firma CAM licenciada {approx}{lic['firm']['license_id']}")
         primary = next((p for p in self.phones if p["number"] == self.phone), None)
         if primary and primary["label"] in ("management", "hoa"):
             parts.append(f"tel. principal = {PHONE_LABEL[primary['label']]}")

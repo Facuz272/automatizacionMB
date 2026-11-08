@@ -27,8 +27,9 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
-from . import ai_enrich, apollo, costs, crm_importer, dbpr, email_verify, geo, quality, render, scoring, search
-from .collectors import google_places, osm, seed_csv
+from . import (ai_enrich, apollo, cam, costs, crm_importer, dbpr, email_verify, geo, municipal_signals, quality, render,
+               scoring, search, valuation)
+from .collectors import dbpr_seed, google_places, osm, seed_csv
 from .config import settings
 from .models import Lead
 from .normalize import address_problem, clean_email, phone_key, rank_email
@@ -50,6 +51,8 @@ def _candidates(strategy: str, sources: list[str], max_candidates: int, seed: st
             logger.warning("Fuente 'places' omitida: falta GOOGLE_PLACES_API_KEY")
         elif src == "osm":
             yield from osm.collect(strategy, max_candidates)
+        elif src == "dbpr":
+            yield from dbpr_seed.collect(strategy, max_candidates)
         elif src == "csv":
             if not seed:
                 raise SystemExit("--source csv requiere --seed archivo.csv")
@@ -96,7 +99,72 @@ def _fill_from_site(lead: Lead, facts: SiteFacts) -> None:
     lead.web_text = facts.text
 
 
+# ── DBPR seed: find the contact channel for a known building ───────────────
+
+def resolve_seed(lead: Lead, use_search: bool) -> None:
+    """Phone / website / coordinates / reviews for a DBPR seed lead.
+
+    Places by name + address (when the key exists) → OpenStreetMap address tags → web search
+    for the official site. The website crawl in the gate then fills a missing phone.
+    """
+    if settings.google_places_api_key:
+        found = google_places.find_place(lead.company_name, lead.address or "", lead.strategy_kind)
+        if found:
+            for attr in ("phone", "website_url", "domain", "maps_url", "google_rating", "total_reviews", "place_types",
+                         "reviews", "lat", "lng", "phones"):
+                if getattr(found, attr) and not getattr(lead, attr):
+                    setattr(lead, attr, getattr(found, attr))
+            lead.evidence["places_match"] = found.evidence.get("places_match")
+            lead.evidence["place_id"] = found.source_id
+            lead.evidence["phone_raw"] = found.evidence.get("phone_raw")
+    if lead.lat is None or not lead.phone:
+        hit = osm.lookup_address(lead.address, lead.company_name) if settings.geo_enabled else None
+        if hit:
+            lead.lat = lead.lat if lead.lat is not None else hit["lat"]
+            lead.lng = lead.lng if lead.lng is not None else hit["lng"]
+            if hit["phone"] and not lead.phone:
+                lead.phone = hit["phone"]
+                lead.phones.append({"number": hit["phone"], "label": "unlabeled", "source": "osm", "context": ""})
+            if hit["website"] and not lead.website_url:
+                lead.website_url = hit["website"]
+            lead.evidence["osm_address_match"] = hit["osm_id"]
+    if not lead.website_url and use_search:
+        url = search.find_website(lead.company_name, search.city_of(lead.address))
+        if url:
+            lead.website_url = url
+            lead.evidence["website_from"] = "search"
+    if lead.website_url and not lead.domain:
+        from .normalize import extract_domain
+        lead.domain = extract_domain(lead.website_url)
+
+
 # ── enrichment steps ────────────────────────────────────────────────────────
+
+def apply_licenses(lead: Lead) -> None:
+    """Verify the contact (CAM) and the management firm (CAB) against the DBPR licence registry."""
+    try:
+        person = cam.verify_person(lead.contact_name) if lead.contact_name else None
+        firm = cam.verify_firm(lead.management_company) if lead.management_company else None
+    except Exception as exc:  # noqa: BLE001 - registry missing/corrupt must not stop the run
+        logger.debug("CAM registry: {}", exc)
+        return
+    if person:
+        lead.licenses["contact"] = person
+        if person["active"] and (not lead.contact_title or "DBPR" in lead.contact_title or "Contacto" in lead.contact_title):
+            lead.contact_title = "LCAM (licencia activa)"
+    if firm:
+        lead.licenses["firm"] = firm
+
+
+def apply_cluster(lead: Lead) -> None:
+    rec = lead.public_records.get("dbpr") or {}
+    cl = dbpr.cluster(company=lead.management_company, person=lead.contact_name,
+                      exclude_project=rec.get("project_number"), near_zip=dbpr.zip5(lead.address),
+                      near_city=dbpr.city_of(lead.address))
+    if cl:
+        lead.portfolio_cluster = cl
+
+
 
 def apply_dbpr(lead: Lead, rec: dict | None) -> None:
     if not rec:
@@ -168,9 +236,12 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
         lead.management_company = facts.managed_by[0]
         lead.management_type = "third_party"
 
-    # Official registry.
+    # Official registry (seed leads already carry their record).
     if use_dbpr:
-        apply_dbpr(lead, dbpr.match(lead.address, lead.company_name))
+        if lead.public_records.get("dbpr"):
+            apply_dbpr(lead, {**lead.public_records["dbpr"]})
+        else:
+            apply_dbpr(lead, dbpr.match(lead.address, lead.company_name))
 
     # External search when the site and registry left gaps.
     emails: dict[str, str] = dict(facts.emails)
@@ -190,12 +261,20 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
         if ap and ap.get("email") and not lead.email:
             lead.email, lead.email_source = ap["email"], "apollo"
 
-    # Physical profile.
+    # Licences (CAM person / CAB firm) and the firm's other buildings in the area.
+    if use_dbpr:
+        apply_licenses(lead)
+        apply_cluster(lead)
+
+    # Physical profile + annual contract estimate.
     osm_profile = geo.fetch_profile(lead.lat, lead.lng) if use_geo else {}
     units = (lead.public_records.get("dbpr") or {}).get("units")
     lead.building = geo.merge_profile(osm_profile, lead.web_text, lead.address, units)
+    lead.estimated_deal = valuation.estimate(lead.building) or {}
 
-    # Pain + email.
+    # Municipal urgency (open data), then pain + email.
+    lead.municipal = municipal_signals.lookup(lead.address, lat=lead.lat, lng=lead.lng,
+                                              dbpr_county=(lead.public_records.get("dbpr") or {}).get("county"))
     detect_pain(lead)
     pick_email(lead, emails, check_mx)
 
@@ -218,12 +297,32 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
         lead.evidence["rendered_pages"] = facts.rendered[:4]
 
 
+def write_needs_phone(path: Path, leads: list[Lead]) -> None:
+    """DBPR buildings that passed every filter but no source gave a phone: a ready list for manual lookup."""
+    import csv
+
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["condo", "address", "units", "association", "management", "dbpr_project", "website"])
+        for l in leads:
+            rec = l.public_records.get("dbpr") or {}
+            w.writerow([l.company_name, l.address, rec.get("units"), rec.get("association"),
+                        rec.get("management_company") or rec.get("management_type") or "", rec.get("project_number"),
+                        l.website_url or ""])
+
+
+def default_sources() -> list[str]:
+    """Google Places when its key exists; otherwise the DBPR seed (zero Places cost)."""
+    return ["places"] if settings.google_places_api_key else ["dbpr"]
+
+
 # ── run ─────────────────────────────────────────────────────────────────────
 
-def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] = ("places",), seed: str | None = None,
+def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None = None, seed: str | None = None,
         use_ai: bool = True, use_apollo: bool = True, precheck: bool = True, send: bool = False,
         commit: bool = False, max_candidates: int | None = None, out_dir: Path | None = None,
         use_search: bool = True, use_geo: bool = True, use_dbpr: bool = True, check_mx: bool | None = None) -> Path:
+    sources = list(sources) if sources else default_sources()
     batch_id = new_batch_id(strategy)
     out = Path(out_dir or settings.out_dir) / batch_id
     out.mkdir(parents=True, exist_ok=True)
@@ -236,6 +335,8 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] = ("pl
                 settings.render_js if render.available() else "off")
 
     rejected: list[dict] = []
+    needs_phone: list[Lead] = []
+    municipal_signals.reset()
     gated: list[tuple[Lead, SiteFacts | None]] = []
     seen_keys: set[str] = set()
 
@@ -249,6 +350,8 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] = ("pl
     for lead in _candidates(strategy, list(sources), max_candidates, seed):
         if ledger.outcome(lead.source_id) in ("accepted", "imported", "in_crm"):
             continue
+        if lead.source == "dbpr":
+            resolve_seed(lead, use_search)
         facts: SiteFacts | None = None
         needs_site = not lead.phone or address_problem(lead.address, settings.target_state)
         if needs_site and lead.website_url:
@@ -256,6 +359,9 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] = ("pl
             _fill_from_site(lead, facts)
         problem = contactability_problem(lead, settings.target_state)
         if problem:
+            if lead.source == "dbpr" and not lead.phone:
+                needs_phone.append(lead)
+                problem = "sin teléfono (semilla DBPR: sin Places/OSM/web con teléfono)"
             reject(lead, problem)
             continue
         if strategy == "pain" and not has_pain(lead):
@@ -316,6 +422,8 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] = ("pl
     with open(out / "rejected.jsonl", "w", encoding="utf-8") as fh:
         for r in rejected:
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    if needs_phone:
+        write_needs_phone(out / "needs_phone.csv", needs_phone)
     (out / "crm_payload.json").write_text(json.dumps(
         {"import_batch_id": batch_id, "source": "lead-engine-v2", "dry_run": True, "leads": payloads},
         ensure_ascii=False, indent=2), encoding="utf-8")

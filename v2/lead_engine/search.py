@@ -163,3 +163,14 @@ def discover(name: str, city: str | None, crawl_pages: int = 2) -> dict[str, Any
 def city_of(address: str | None) -> str | None:
     parts = [p.strip() for p in (address or "").split(",")]
     return parts[1] if len(parts) >= 3 else None
+
+
+def find_website(name: str, city: str | None) -> str | None:
+    """Official site of a building (seed mode without Places): first non-social result naming it."""
+    if not provider():
+        return None
+    for r in web_search(f'"{name}"' + (f' "{city}"' if city else "") + " condominium", n=6):
+        url = r.get("url", "")
+        if is_company_site(url) and mentions_building(f"{r.get('title', '')} {r.get('snippet', '')}", name):
+            return url
+    return None

@@ -4,7 +4,8 @@
   python -m lead_engine run --strategy portfolio --limit 50 --commit
   python -m lead_engine run --source csv --seed dbpr_condos.csv --strategy onsite --limit 20 --dry-run
   python -m lead_engine import out/<lote>/crm_payload.json [--commit]
-  python -m lead_engine dbpr-sync [--groups MD,PB]         # padrón oficial de condominios (DBPR)
+  python -m lead_engine run --seed dbpr --strategy onsite --limit 20 --dry-run   # semilla desde el padrón DBPR
+  python -m lead_engine dbpr-sync [--groups MD,PB]         # padrón de condominios + licencias CAM (DBPR)
   python -m lead_engine dbpr-load Condo_MD.csv [...]       # o cargar CSVs ya descargados
 """
 
@@ -15,7 +16,7 @@ import sys
 
 from loguru import logger
 
-from . import crm_importer, dbpr, pipeline
+from . import cam, crm_importer, dbpr, pipeline
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -25,9 +26,10 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run", help="recolectar, validar, enriquecer y (opcional) enviar al CRM")
     r.add_argument("--strategy", choices=["onsite", "pain", "portfolio"], default="onsite")
     r.add_argument("--limit", type=int, default=20, help="leads enriquecidos a producir")
-    r.add_argument("--source", action="append", choices=["places", "osm", "csv"],
-                   help="repetible; por defecto places")
-    r.add_argument("--seed", help="CSV para --source csv")
+    r.add_argument("--source", action="append", choices=["places", "osm", "csv", "dbpr"],
+                   help="repetible; por defecto places si hay GOOGLE_PLACES_API_KEY, si no dbpr")
+    r.add_argument("--seed", help="'dbpr' = semilla desde el padrón DBPR; o un CSV para --source csv")
+    r.add_argument("--min-units", type=int, help="semilla DBPR: mínimo de unidades (default MIN_UNITS=50)")
     r.add_argument("--max-candidates", type=int, default=None, help="tope de candidatos crudos (default 6×limit)")
     r.add_argument("--no-ai", action="store_true", help="solo reglas, sin Claude")
     r.add_argument("--no-apollo", action="store_true")
@@ -46,8 +48,11 @@ def main(argv: list[str] | None = None) -> int:
     i = sub.add_parser("import", help="enviar un crm_payload.json ya generado")
     i.add_argument("rest", nargs=argparse.REMAINDER)
 
-    ds = sub.add_parser("dbpr-sync", help="descargar y cargar el padrón oficial de condominios del DBPR")
+    ds = sub.add_parser("dbpr-sync", help="descargar padrón de condominios + licencias CAM del DBPR")
     ds.add_argument("--groups", help="MD,PB,NF,CE,CW (default DBPR_GROUPS o MD,PB)")
+    ds.add_argument("--no-cam", action="store_true", help="no descargar el padrón de licencias CAM")
+    cl = sub.add_parser("cam-load", help="cargar lic38cam.csv ya descargado")
+    cl.add_argument("file")
     dl = sub.add_parser("dbpr-load", help="cargar CSVs del DBPR ya descargados")
     dl.add_argument("files", nargs="+")
 
@@ -57,25 +62,38 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "dbpr-sync":
         groups = [g.strip() for g in args.groups.split(",")] if args.groups else None
         print(dbpr.sync(groups))
+        if not args.no_cam:
+            print({"cam_licenses": cam.load_and_reindex(cam.sync)})
+        return 0
+    if args.cmd == "cam-load":
+        print({"cam_licenses": cam.load_and_reindex(lambda c: cam.load_csv(args.file, c))})
         return 0
     if args.cmd == "dbpr-load":
         conn = dbpr.connect()
         for f in args.files:
             print(f, dbpr.load_csv(f, conn))
         return 0
-    if args.render:
+    sources = args.source
+    seed_file = args.seed
+    if args.seed and args.seed.lower() == "dbpr":
+        sources, seed_file = (sources or []) + ["dbpr"], None
+    if args.min_units is not None or args.render:
         import dataclasses
 
         from . import config
 
-        config.settings = dataclasses.replace(config.settings, render_js=args.render)
-        for mod in ("render", "web_extract", "pipeline"):
+        changes = {}
+        if args.min_units is not None:
+            changes["min_units"] = args.min_units
+        if args.render:
+            changes["render_js"] = args.render
+        config.settings = dataclasses.replace(config.settings, **changes)
+        for mod in ("render", "web_extract", "pipeline", "collectors.dbpr_seed"):
             setattr(__import__(f"lead_engine.{mod}", fromlist=["settings"]), "settings", config.settings)
-
     logger.remove()
     logger.add(sys.stderr, level="DEBUG" if args.verbose else "INFO")
     pipeline.run(
-        strategy=args.strategy, limit=args.limit, sources=args.source or ["places"], seed=args.seed,
+        strategy=args.strategy, limit=args.limit, sources=sources, seed=seed_file,
         use_ai=not args.no_ai, use_apollo=not args.no_apollo, precheck=not args.no_precheck,
         send=args.dry_run or args.commit, commit=args.commit, max_candidates=args.max_candidates,
         use_search=not args.no_search, use_geo=not args.no_geo, use_dbpr=not args.no_dbpr,
