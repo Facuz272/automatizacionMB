@@ -5,3 +5,6 @@ __pycache__/
 *.db
 .DS_Store
 .git/
+v2/.venv/
+v2/out/
+v2/data/

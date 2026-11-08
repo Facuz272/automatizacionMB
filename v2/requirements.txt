@@ -1,0 +1,6 @@
+anthropic>=2.6
+beautifulsoup4>=4.12
+loguru>=0.7
+pydantic>=2.7
+python-dotenv>=1.0
+requests>=2.31
