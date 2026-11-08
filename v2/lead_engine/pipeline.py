@@ -28,7 +28,8 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 
 from . import (ai_enrich, apollo, appraiser, cam, competitor_intel, costs, crm_importer, dbpr, email_verify, geo,
-               geocode, lodging, mgmt_domains, municipal_signals, npi, quality, render, scoring, search, valuation,
+               geocode, lodging, mgmt_domains, municipal_signals, npi, portfolio_consolidation, quality, render,
+               scoring, search, valuation,
                verticals)
 from .roles import pick_primary
 from .collectors import dbpr_seed, google_places, osm, seed_csv
@@ -61,6 +62,9 @@ def _candidates(strategy: str, sources: list[str], max_candidates: int, seed: st
         elif src == "pa":
             from .collectors import appraiser_seed
             yield from appraiser_seed.collect(strategy, max_candidates, vertical=settings.seed_vertical)
+        elif src == "needs_phone":
+            from .collectors import needs_phone
+            yield from needs_phone.collect(seed, strategy, max_candidates)
         elif src == "csv":
             if not seed:
                 raise SystemExit("--source csv requiere --seed archivo.csv")
@@ -141,7 +145,7 @@ def resolve_seed(lead: Lead, use_search: bool) -> None:
             lead.evidence["osm_address_match"] = hit["osm_id"]
     if not lead.phone:
         from . import phone_resolver
-        step = phone_resolver.resolve(lead)
+        step = phone_resolver.resolve(lead, steps=("lodging",))
         if step:
             lead.evidence["phone_cascade"] = step
     if not lead.website_url and use_search:
@@ -251,9 +255,9 @@ def apply_cluster(lead: Lead) -> None:
 def apply_dbpr(lead: Lead, rec: dict | None) -> None:
     if not rec:
         return
-    lead.public_records["dbpr"] = {k: rec[k] for k in (
+    lead.public_records["dbpr"] = {**rec, **{k: rec.get(k) for k in (
         "project_number", "condo_name", "association", "units", "projects_at_address", "status", "route_raw",
-        "management_company", "contact_name", "contact_title", "management_type", "registered_agent", "matched_by")}
+        "management_company", "contact_name", "contact_title", "management_type", "registered_agent", "matched_by")}}
     lead.association_name = lead.association_name or rec.get("association")
     if rec.get("management_company") and not lead.management_company:
         lead.management_company = rec["management_company"]
@@ -444,12 +448,15 @@ def write_needs_phone(path: Path, leads: list[Lead]) -> None:
 
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["condo", "address", "units", "association", "management", "dbpr_project", "website"])
+        w.writerow(["condo", "address", "units", "association", "management", "dbpr_project", "website",
+                    "source", "source_id", "strategy", "consolidated_into", "firm_phone"])
         for l in leads:
             rec = l.public_records.get("dbpr") or {}
             w.writerow([l.company_name, l.address, rec.get("units"), rec.get("association"),
-                        rec.get("management_company") or rec.get("management_type") or "", rec.get("project_number"),
-                        l.website_url or ""])
+                        rec.get("management_company") or l.management_company or rec.get("management_type") or "",
+                        rec.get("project_number"), l.website_url or "", l.source, l.source_id, l.strategy_kind,
+                        l.evidence.get("consolidated_into") or "",
+                        l.phone if l.evidence.get("phone_from") == "firm_central" else ""])
 
 
 def default_sources() -> list[str]:
@@ -482,6 +489,7 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
     needs_phone: list[Lead] = []
     municipal_signals.reset()
     gated: list[tuple[Lead, SiteFacts | None]] = []
+    held: list[Lead] = []                 # same firm central phone as a gated lead
     seen_keys: set[str] = set()
 
     def reject(lead: Lead, reason: str) -> None:
@@ -511,6 +519,10 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
         if needs_site and lead.website_url:
             facts = crawl(lead.website_url)
             _fill_from_site(lead, facts)
+        if not lead.phone and lead.source in ("dbpr", "pa"):
+            from . import phone_resolver
+            if phone_resolver.resolve(lead, steps=("firm_central",)):
+                lead.evidence["phone_cascade"] = "firm_central"
         problem = contactability_problem(lead, settings.target_state)
         if problem:
             if lead.source in ("dbpr", "pa") and not lead.phone:
@@ -524,9 +536,9 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
         key = phone_key(lead.phone or "")
         if key in seen_keys or ledger.is_imported(lead.phone):
             if lead.evidence.get("phone_from") == "firm_central":
-                # The CRM keeps one lead per phone: the firm's line can only enter once.
-                needs_phone.append(lead)
-                reject(lead, "teléfono central de la administradora ya usado (el CRM no acepta teléfonos repetidos)")
+                # The CRM keeps one lead per phone: the firm's line enters once, on the strongest building,
+                # and the others are listed on it (portfolio_consolidation).
+                held.append(lead)
             else:
                 reject(lead, "teléfono repetido")
             continue
@@ -534,6 +546,14 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
         gated.append((lead, facts))
         if len(gated) >= limit * 2:  # margin for CRM duplicates
             break
+
+    # ── 2b: one firm central phone → the strongest building carries it, the rest are listed on it ──
+    gated, leftovers = portfolio_consolidation.consolidate(gated, held)
+    for lead in leftovers:
+        needs_phone.append(lead)
+        into = lead.evidence.get("consolidated_into")
+        reject(lead, f"teléfono central de la administradora: consolidado en {into}" if into else
+               "teléfono central de la administradora ya usado (el CRM no acepta teléfonos repetidos)")
 
     # ── 3: CRM precheck (drop what the CRM already has) ───────────────────────
     client = crm_importer.CrmClient()
@@ -562,6 +582,7 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
                 _fill_from_site(lead, facts)
             enrich(lead, facts, use_apollo=use_apollo, use_ai=use_ai, use_search=use_search,
                    use_geo=use_geo, use_dbpr=use_dbpr, check_mx=check_mx)
+            portfolio_consolidation.apply(lead)
             accepted.append(lead)
             ledger.mark(lead.source_id, lead.source, lead.phone, "accepted", None, batch_id)
             ledger.mark_seen(lead, "processed", batch_id)
@@ -612,8 +633,13 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
         pdfs = pdf_generator.generate_batch(
             [{**l.internal_record(), "import_batch_id": batch_id} for l in accepted], out / "pdf", lang=pdf_lang)
 
+    if accepted:
+        from . import outreach_pack
+        outreach_pack.build([{**l.internal_record(), "import_batch_id": batch_id} for l in accepted], out, pdfs)
+
     qr = quality.build(batch_id, strategy, accepted, rejected)
     qr["pdfs"] = len(pdfs)
+    qr["consolidated_siblings"] = sum(len(l.portfolio_siblings) for l in accepted)
     qr["skipped_seen_in_earlier_runs"] = skipped_seen
     if skipped_seen:
         logger.info("{} edificios ya trabajados en corridas anteriores fueron salteados (--ignore-seen para incluirlos)",

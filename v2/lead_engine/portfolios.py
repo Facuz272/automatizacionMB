@@ -55,7 +55,9 @@ def display(name: str) -> str:
         for k in range(1, len(words) + 1):
             if re.sub(r"\W", "", "".join(words[:k])).lower() == target:
                 return " ".join([hit[0]] + words[k:])         # keeps the legal suffix (LLC, INC)
-    return " ".join(w.upper() if not re.search(r"[aeiouy]", w, re.I) else w for w in words)
+    abbrev = {"MGMT", "MGT", "ASSN", "SVCS", "SVC", "CTR", "MNGMT"}
+    return " ".join(w.upper() if not re.search(r"[aeiouy]", w, re.I) and re.sub(r"\W", "", w).upper() not in abbrev
+                    else w for w in words)
 
 
 def firm_name(firm_id: str, names: Counter, conn: sqlite3.Connection) -> tuple[str, str | None]:
@@ -72,8 +74,16 @@ def firm_name(firm_id: str, names: Counter, conn: sqlite3.Connection) -> tuple[s
     return names.most_common(1)[0][0], None
 
 
-def rank(conn: sqlite3.Connection | None = None, counties: list[str] | None = None) -> list[dict[str, Any]]:
+def rank(conn: sqlite3.Connection | None = None, counties: list[str] | None = None,
+         cities: list[str] | None = None) -> list[dict[str, Any]]:
+    """Firms ranked by the buildings they manage *inside the service area* (tenant / TARGET_CITIES, with the
+    neighbourhood ZIP aliases: Brickell → 33129-33131, Sunny Isles → 33160…). Buildings outside it are
+    not counted in buildings, units, estimate or dossier."""
+    from .collectors.dbpr_seed import area_filter, in_area
+    from .config import service_area
+
     conn = conn or connect()
+    area = area_filter(cities or service_area())
     counties = [c.upper() for c in (counties or settings.cluster_counties)]
     marks = ",".join("?" * len(counties))
     rows = conn.execute(
@@ -83,6 +93,8 @@ def rank(conn: sqlite3.Connection | None = None, counties: list[str] | None = No
         counties).fetchall()
     firms: dict[str, dict[str, Any]] = {}
     for r in rows:
+        if not in_area(r["city"], r["zip"], area):
+            continue
         f = firms.setdefault(r["firm_id"], {"names": Counter(), "buildings": {}})
         f["names"][r["company"]] += 1
         key = address_key(r["address"]) or r["project_number"]

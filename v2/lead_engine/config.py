@@ -166,6 +166,20 @@ def cities_for(strategy: str) -> list[str]:
             or _list("TARGET_CITIES") or _DEFAULT_CITIES[strategy])
 
 
+def service_area() -> list[str]:
+    """Every city the company serves: union of the per-strategy target lists (tenant profile, then .env,
+    then the defaults), in order, without repeats."""
+    seen, out = set(), []
+    tenant = settings.target_cities or {}
+    lists = list(tenant.values()) if tenant else [cities_for(s) for s in ("onsite", "portfolio", "pain")]
+    for cities in lists:
+        for c in cities:
+            if c.upper() not in seen:
+                seen.add(c.upper())
+                out.append(c)
+    return out
+
+
 def _bbox() -> tuple[float, float, float, float]:
     raw = _list("OSM_BBOX")
     if raw and len(raw) == 4:

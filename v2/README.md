@@ -55,6 +55,9 @@ v2/
 │   ├── portfolio_pdf.py   dossier ejecutivo de 2 páginas por firma (Preferred Vendor Program)
 │   ├── phone_resolver.py  cascada gratuita de teléfonos (DBPR Lodging, central de la firma)
 │   ├── tenant.py          perfiles de empresa white-label (tenants/<slug>.json)
+│   ├── portfolio_consolidation.py  un teléfono central, varios edificios: se cotizan en la misma llamada
+│   ├── outreach_pack.py   email + WhatsApp/SMS en inglés y guion telefónico en español por lote
+│   ├── daily.py           rutina diaria: Pool del CRM → corrida → PDFs + outreach → CRM → Slack
 │   ├── competitor_intel.py  debilidades de la competencia en reseñas de edificios vecinos
 │   ├── route_optimizer.py rutas de inspección por zonas e inspector
 │   ├── geocode.py         geocodificación gratuita (US Census) para leads sin coordenadas
@@ -157,7 +160,10 @@ python -m lead_engine portfolios --top 15 --pdf            # ranking + dossier p
 python -m lead_engine portfolios --top 30 --offline        # solo el padrón, sin consultas en vivo
 ```
 
-Agrupa todo el padrón DBPR de `CLUSTER_COUNTIES` por firma (licencia CAB cuando el padrón de CAM la
+Cuenta **solo los edificios dentro de la zona de servicio**: la unión de `target_cities` del perfil
+(o `TARGET_CITIES*` del `.env`), con los alias por código postal (Brickell → 33129-33131, Sunny
+Isles → 33160…). Edificios, unidades, valor del portafolio y dossier quedan acotados a esa zona.
+Agrupa el padrón DBPR de `CLUSTER_COUNTIES` por firma (licencia CAB cuando el padrón de CAM la
 conoce; si no, el nombre normalizado; y une variantes que el catálogo de dominios identifica como
 la misma empresa, p. ej. «Castle Group» + «Castle Management LLC»). Por firma: edificios, unidades
 y contrato anual combinado estimado; ordena por el extremo alto. Para el top consulta en vivo los
@@ -166,8 +172,61 @@ cuántos están en ventana Milestone/recertificación y cuántos tienen registro
 Deja `out/portfolios/<fecha>/ranking.csv`, `ranking.json` (con los edificios) y, con `--pdf`, un
 dossier ejecutivo de 2 páginas por firma: KPIs del portafolio, propiedades más urgentes, propuesta
 de *Preferred Vendor Program* con las escalas del perfil (`pvp_tiers`), piloto sugerido, próximos
-pasos y QR. Corrida de nov-2026: FirstService Residential 82 edificios / 16.380 unidades; Castle 33
-edificios, 2 de 6 analizados en ventana Milestone.
+pasos y QR. Corrida de nov-2026 con el perfil `mb_softwash` (solo su zona): FirstService
+Residential 38 edificios / 5.777 unidades (82 / 16.380 en todo el padrón); Castle Management 8
+edificios, 2 de 5 analizados en ventana Milestone. Seacrest y Campbell, casi todo Palm Beach, salen
+del top 15.
+
+Las capas oficiales en vivo (catastro y municipio) cubren Miami-Dade. Para Hollywood y Hallandale
+Beach se probó la capa estatal de parcelas FDOR (Florida Statewide Cadastral): en nov-2026 tarda
+~55 s por consulta y responde con error, así que no se usa; esos edificios entran al ranking sin
+señales en vivo.
+
+### Un teléfono central, varios edificios (`portfolio_consolidation`)
+
+Con `ALLOW_MGMT_FIRM_PHONE=true`, varios edificios de una misma administradora pueden resolver al
+mismo teléfono central, y el CRM acepta cada teléfono una sola vez. Antes de enriquecer, a todos
+los que comparten esa central se les hace un chequeo oficial liviano (catastro, Milestone,
+registros municipales, ticket estimado); el más fuerte (señales urgentes, luego ticket, luego
+unidades) se queda con el teléfono y los demás se listan en él: en el `sales_strategy` de la
+setter («Teléfono = central de X: al llamar, cotizar también en el mismo llamado [Edificio 2 – 240
+un., permiso de obra exterior] y […]»), en una tabla del PDF y en el outreach pack. Siguen en
+`needs_phone.csv` con `consolidated_into` y `firm_phone`. La central de la firma es siempre el
+último recurso: antes se buscan Places, DBPR Lodging, OSM y el sitio propio del edificio.
+
+```bash
+python -m lead_engine enrich-phones out/<lote>/needs_phone.csv --dry-run --pdf
+```
+
+Reintenta los pendientes con lo que haya configurado ahora (`GOOGLE_PLACES_API_KEY`, búsqueda
+externa…), con su fuente e id originales, y arma el lote completo (`crm_payload.json`, PDFs,
+outreach pack) listo para `--commit` o `import`.
+
+### Outreach Pack
+
+Cada lote deja `out/<lote>/outreach_pack.md` y `.json`: por edificio, email de primer contacto y
+WhatsApp/SMS (≤320 caracteres) en inglés comercial de EE. UU., y el guion telefónico en español
+para la setter (apertura, motivo con el dato real, oferta, PDF, edificios hermanos, dos objeciones
+y cierre). El gancho es el dato verificable más fuerte: ventana Milestone (año de construcción),
+recertificación o caso abierto, permiso de obra exterior, reseña, y después ft²/unidades. Sin
+nombre de contacto dice "Hi there,"; agenda, teléfono, email y documentos solo si están en el perfil.
+
+### Rutina diaria (`daily`)
+
+```bash
+python -m lead_engine daily --target-pool 40            # dry-run contra el CRM
+python -m lead_engine daily --target-pool 40 --commit   # importa
+```
+
+1. Consulta `GET /api/public/health` del CRM. Si la respuesta trae la cantidad de leads
+   disponibles en el Pool (`pool_available`), el lote es `--target-pool` menos esa cantidad. **El
+   CRM hoy solo devuelve `pool_low` (sí/no)**: con Pool bajo el lote es el objetivo completo; si no,
+   `--fallback-limit` (10). `--limit` fuerza el tamaño.
+2. Corre con el perfil `mb_softwash` (o `--tenant`/`TENANT`), salteando lo ya trabajado, con PDFs en
+   inglés con QR y outreach pack.
+3. `--commit` importa los aceptados; si no, dry-run.
+4. Con `SLACK_WEBHOOK_URL`, resumen: leads inyectados, valor anual del lote, top 3 con su señal y la
+   carpeta de PDFs. También queda en `out/<lote>/daily_summary.json`.
 
 ### Perfiles de empresa (`--tenant`)
 

@@ -26,6 +26,8 @@ T: dict[str, dict[str, str]] = {
         "s3": "3. Estimated annual contract range", "s4": "4. Next step",
         "component": "Component", "range": "Estimated range / year", "total": "Total estimated annual",
         "no_range": "The range is set during the on-site inspection (surface data missing).",
+        "siblings": "Other {firm} buildings to quote in the same visit",
+        "sib_cols": ["Property", "Address", "Units", "Signal", "Est. / year"],
         "next": "Free on-site inspection (approx. 60 minutes) to measure surfaces, sample the staining and deliver a fixed quote.",
         "disclaimer": ("Preliminary estimate based on public records (Miami-Dade Property Appraiser, Florida DBPR, municipal "
                        "records) and public reviews. It is not a structural inspection, an engineering opinion or a binding "
@@ -59,6 +61,8 @@ T: dict[str, dict[str, str]] = {
         "s3": "3. Rango estimado del contrato anual", "s4": "4. Próximo paso",
         "component": "Componente", "range": "Rango estimado / año", "total": "Total anual estimado",
         "no_range": "El rango se define en la inspección en sitio (faltan datos de superficie).",
+        "siblings": "Otros edificios de {firm} para cotizar en la misma visita",
+        "sib_cols": ["Propiedad", "Dirección", "Unidades", "Señal", "Est. / año"],
         "next": "Inspección gratuita en sitio (aprox. 60 minutos) para medir superficies, tomar muestras de manchas y "
                 "entregar una cotización cerrada.",
         "disclaimer": ("Estimación preliminar basada en registros públicos (Miami-Dade Property Appraiser, DBPR, registros "

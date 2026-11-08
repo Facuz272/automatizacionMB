@@ -48,6 +48,26 @@ CITY_ZIPS: dict[str, set[str]] = {
 }
 
 
+# Postal-city spellings a ZIP alias may match: the umbrella postal cities and the alias neighbourhoods
+# themselves. A record filed under another municipality (Davie or Pembroke Pines inside a Hollywood ZIP,
+# North Miami inside 33181, Sweetwater inside a Doral ZIP) only counts when that municipality is
+# configured by name.
+ZIP_POSTAL_OK = {
+    "MIAMI", "MIAMI BEACH", "NORTH MIAMI BEACH", "HOLLYWOOD", "FORT LAUDERDALE", "FT LAUDERDALE", "FT. LAUDERDALE",
+    "HALLANDALE", "HALLANDALE BEACH", "SUNNY ISLES", "SUNNY ISLES BEACH", "BAY HARBOR ISLANDS", "BAY HARBOR ISLAND",
+    "TOWN OF BAY HARBOR", "BAL HARBOUR", "SURFSIDE", "KEY BISCAYNE", "FISHER ISLAND", "CORAL GABLES", "DORAL",
+    "AVENTURA", "COCONUT GROVE", "NORTH BAY VILLAGE", "BRICKELL", "EDGEWATER",
+}
+
+
+def in_area(postal_city: str | None, zip_code: str | None, area: tuple[set[str], set[str]]) -> bool:
+    names, zips = area
+    city = _norm_city(postal_city or "")
+    if city in names:
+        return True
+    return (zip_code or "")[:5] in zips and (not city or city in ZIP_POSTAL_OK)
+
+
 def _norm_city(c: str) -> str:
     c = re.sub(r"\s+(?:FL|FLORIDA)$", "", c.upper().strip())
     return re.sub(r"\s+", " ", c)
@@ -80,7 +100,7 @@ def candidates(strategy: str, conn: sqlite3.Connection | None = None, cities: li
                min_units: int | None = None) -> list[dict]:
     """Ranked DBPR rows for the strategy (dicts with condo + route fields)."""
     conn = conn or connect()
-    names, zips = area_filter(cities or cities_for(strategy))
+    area = area_filter(cities or cities_for(strategy))
     min_units = settings.min_units if min_units is None else min_units
     rows = conn.execute(
         "SELECT c.*, r.route_type, r.company, r.person, r.person_title, r.city AS postal_city "
@@ -88,7 +108,7 @@ def candidates(strategy: str, conn: sqlite3.Connection | None = None, cities: li
         "WHERE c.primary_status = 'Approved' AND c.address_key IS NOT NULL").fetchall()
     by_addr: dict[str, dict] = {}
     for r in rows:
-        if (r["postal_city"] or "") not in names and (r["zip"] or "") not in zips:
+        if not in_area(r["postal_city"], r["zip"], area):
             continue
         kind = classify(r["route_type"])
         if strategy in ("onsite", "portfolio") and kind != strategy:

@@ -140,6 +140,12 @@ def documents_line(lang: str) -> str | None:
     return i18n.T[lang]["docs"].format(docs=joined)
 
 
+def _sibling_signal(p: dict[str, Any], lang: str) -> str:
+    if not p.get("signals"):
+        return "—"
+    return i18n.municipal_line(p["signals"][0], lang)[0]
+
+
 # ── build ───────────────────────────────────────────────────────────────────
 
 def build(lead: dict[str, Any], path: str | Path, lang: str | None = None) -> Path:
@@ -183,6 +189,15 @@ def build(lead: dict[str, Any], path: str | Path, lang: str | None = None) -> Pa
     body.append(Paragraph(t["s3"], st["h2"]))
     rows = deal_rows(lead, lang)
     body.append(table(rows, [fw * 0.58, fw * 0.42], st, header=True) if rows else Paragraph(t["no_range"], st["base"]))
+    sib = lead.get("portfolio_siblings") or []
+    if sib:
+        firm = lead.get("management_company") or ""
+        body.append(Paragraph(txt(t["siblings"].format(firm=firm)), st["h2"]))
+        srows = [t["sib_cols"]] + [[p["name"], (p.get("address") or "").split(",")[0], num(p.get("units"), lang),
+                                    _sibling_signal(p, lang), usd(p.get("est_high"), lang) if p.get("est_high") else "—"]
+                                   for p in sib[:8]]
+        body.append(table(srows, [fw * 0.26, fw * 0.24, fw * 0.1, fw * 0.24, fw * 0.16], st, header=True,
+                          bold_first_col=False))
     body.append(Paragraph(t["s4"], st["h2"]))
     body.append(Paragraph(t["next"], st["base"]))
     docs = documents_line(lang)

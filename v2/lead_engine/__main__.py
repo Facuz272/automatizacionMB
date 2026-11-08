@@ -9,16 +9,21 @@
   python -m lead_engine dbpr-load Condo_MD.csv [...]       # o cargar CSVs ya descargados
   python -m lead_engine --tenant mb_softwash run --seed dbpr --limit 20 --pdf --pdf-lang en
   python -m lead_engine portfolios --top 15 --pdf          # ranking de administradoras + dossiers PDF
+  python -m lead_engine enrich-phones out/<lote>/needs_phone.csv --dry-run   # reintentar teléfonos pendientes
+  python -m lead_engine daily --target-pool 40 [--commit]  # rutina diaria completa
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 
 from loguru import logger
 
-from . import cam, crm_importer, dbpr, lodging, pipeline
+from . import cam, crm_importer, dbpr, lodging, pipeline, search
+from .config import settings
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,6 +79,24 @@ def main(argv: list[str] | None = None) -> int:
     pf.add_argument("--pdf", action="store_true", help="dossier ejecutivo de 2 páginas por firma")
     pf.add_argument("--lang", choices=["en", "es"], help="idioma del PDF (default PDF_LANG o en)")
     pf.add_argument("--out", help="carpeta base (default OUT_DIR)")
+    ep = sub.add_parser("enrich-phones", help="reintentar los teléfonos de un needs_phone.csv y armar el lote")
+    ep.add_argument("csv", help="out/<lote>/needs_phone.csv")
+    ep_mode = ep.add_mutually_exclusive_group()
+    ep_mode.add_argument("--dry-run", action="store_true", help="enviar al CRM con dry_run=true")
+    ep_mode.add_argument("--commit", action="store_true", help="importar al CRM")
+    ep.add_argument("--pdf", action="store_true")
+    ep.add_argument("--pdf-lang", choices=["en", "es"])
+    ep.add_argument("--no-ai", action="store_true")
+    dy = sub.add_parser("daily", help="rutina diaria: Pool del CRM → corrida → PDFs + outreach → CRM → Slack")
+    dy.add_argument("--target-pool", type=int, default=40, help="leads disponibles que debe tener el Pool")
+    dy.add_argument("--fallback-limit", type=int, default=10,
+                    help="tamaño del lote cuando el CRM no informa cuántos quedan y el Pool no está bajo")
+    dy.add_argument("--limit", type=int, help="forzar el tamaño del lote (no consulta el Pool)")
+    dy.add_argument("--strategy", choices=["onsite", "pain", "portfolio"], default="onsite")
+    dy.add_argument("--seed", choices=["dbpr", "pa", "npi"], help="fuente (default: places si hay clave, si no dbpr)")
+    dy.add_argument("--commit", action="store_true", help="importar los aceptados al CRM (si no, dry-run)")
+    dy.add_argument("--no-slack", action="store_true")
+    dy.add_argument("--no-ai", action="store_true")
     rt = sub.add_parser("route", help="ruta de inspecciones optimizada por zonas")
     rt.add_argument("input", help="leads.jsonl del lote o export del CRM (.csv/.json) con address e inspection_at")
     rt.add_argument("--date", help="día (YYYY-MM-DD, default hoy en Miami)")
@@ -87,16 +110,33 @@ def main(argv: list[str] | None = None) -> int:
 
     args = ap.parse_args(argv)
     from . import tenant
-    prof = tenant.use(args.tenant)
+    prof = tenant.use(args.tenant or (None if os.getenv("TENANT") or args.cmd != "daily" else "mb_softwash"))
     if prof:
         logger.info("Perfil de empresa: {}", prof.get("company", {}).get("name") or args.tenant)
+    if args.cmd == "enrich-phones":
+        from .collectors import needs_phone
+        rows = needs_phone.read(args.csv)
+        if not settings.google_places_api_key and not search.provider():
+            logger.warning("Sin GOOGLE_PLACES_API_KEY ni búsqueda externa: solo la cascada gratuita (OSM, Lodging, web)")
+        out = pipeline.run(strategy=needs_phone.main_strategy(rows), limit=len(rows), sources=["needs_phone"],
+                           seed=args.csv, use_ai=not args.no_ai, send=args.dry_run or args.commit, commit=args.commit,
+                           max_candidates=len(rows), make_pdfs=args.pdf, pdf_lang=args.pdf_lang,
+                           retry_needs_phone=True)
+        print(f"Lote: {out}/crm_payload.json")
+        return 0
+    if args.cmd == "daily":
+        from . import daily
+        s = daily.run(target_pool=args.target_pool, fallback_limit=args.fallback_limit, limit=args.limit,
+                      strategy=args.strategy, sources=[args.seed] if args.seed else None, commit=args.commit,
+                      use_ai=not args.no_ai, slack=not args.no_slack)
+        print(json.dumps(s, ensure_ascii=False, indent=2))
+        return 0
     if args.cmd == "portfolios":
         from pathlib import Path
 
         from . import portfolios
         out = portfolios.run(top=args.top, depth=args.depth, live=not args.offline, pdf=args.pdf, lang=args.lang,
                              out_dir=Path(args.out) if args.out else None)
-        import json
         portfolios.print_table(json.loads((out / "ranking.json").read_text(encoding="utf-8")))
         print(f"Archivos: {out}/ranking.csv · ranking.json" + (" · pdf/" if args.pdf else ""))
         return 0

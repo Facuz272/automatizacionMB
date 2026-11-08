@@ -112,6 +112,9 @@ class Lead:
     licenses: dict[str, Any] = field(default_factory=dict)
     # other condos in the area under the same management firm / person (dbpr.cluster)
     portfolio_cluster: dict[str, Any] = field(default_factory=dict)
+    # buildings of the same firm in this batch that share its central phone (portfolio_consolidation):
+    # {"name","address","units","signals":[{"category","label"}],"est_high"}
+    portfolio_siblings: list[dict[str, Any]] = field(default_factory=list)
     # valuation.estimate: {"low", "high", "components", "basis"} USD/year
     estimated_deal: dict[str, Any] = field(default_factory=dict)
     # business vertical: community | plaza | commercial | clinic (verticals.LABEL has the CRM-facing names)

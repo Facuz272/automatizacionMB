@@ -99,19 +99,25 @@ def firm_phone(firm: str | None) -> dict[str, Any] | None:
             "context": site.get("context")}
 
 
-def resolve(lead: Lead) -> str | None:
-    """Fill lead.phone from the cascade; returns the step that found it (lodging | firm_central) or None."""
+def resolve(lead: Lead, steps: tuple[str, ...] = ("lodging", "firm_central")) -> str | None:
+    """Fill lead.phone from the cascade; returns the step that found it (lodging | firm_central) or None.
+
+    The pipeline asks for "lodging" before the building's own website is searched and crawled, and for
+    "firm_central" only after that, so the shared firm line is the last resort."""
     if lead.phone:
         return None
     dbpr_rec = lead.public_records.get("dbpr") or {}
-    hit = lodging.building_phone(lead.address, [lead.company_name, dbpr_rec.get("association"), dbpr_rec.get("condo_name")])
+    hit = None
+    if "lodging" in steps:
+        hit = lodging.building_phone(lead.address, [lead.company_name, dbpr_rec.get("association"),
+                                                    dbpr_rec.get("condo_name")])
     if hit:
         lead.phone = hit["phone"]
         lead.phones.append({"number": hit["phone"], "label": hit["label"], "source": "dbpr_lodging",
                             "context": f"{hit['why']} ({hit['licensee']}, {hit['license_number']})"})
         lead.evidence["phone_from"] = "dbpr_lodging"
         return "lodging"
-    if settings.allow_mgmt_firm_phone and lead.management_company:
+    if "firm_central" in steps and settings.allow_mgmt_firm_phone and lead.management_company:
         fp = firm_phone(lead.management_company)
         if fp:
             lead.phone = fp["number"]
