@@ -93,6 +93,12 @@ def main(argv: list[str] | None = None) -> int:
     ea.add_argument("source", nargs="?", help="out/<lote>/leads.jsonl (sin argumento: padrón DBPR de la zona)")
     ea.add_argument("--out", help="archivo CSV (default: junto al lote o out/ads/ads_audience.csv)")
     ea.add_argument("--min-units", type=int, help="padrón: mínimo de unidades (default MIN_UNITS)")
+    ea.add_argument("--include-npi", action=argparse.BooleanOptionalAction, default=True,
+                    help="padrón: clínicas/hospitales del NPI Registry de la zona (default sí)")
+    ea.add_argument("--include-lodging", action=argparse.BooleanOptionalAction, default=True,
+                    help="padrón: hoteles/edificios de apartamentos con licencia DBPR y teléfono (default sí)")
+    ea.add_argument("--include-firms", action=argparse.BooleanOptionalAction, default=True,
+                    help="padrón: administradoras y operadores comerciales con su teléfono y sitio (default sí)")
     dy = sub.add_parser("daily", help="rutina diaria: Pool del CRM → corrida → PDFs + outreach → CRM → Slack")
     dy.add_argument("--target-pool", type=int, default=None,
                     help="leads disponibles que debe tener el Pool (default: pool_target del CRM, si no 40)")
@@ -135,7 +141,8 @@ def main(argv: list[str] | None = None) -> int:
             rows = ads_export.from_records(json.loads(l) for l in src.read_text(encoding="utf-8").splitlines() if l.strip())
             out = Path(args.out) if args.out else src.parent / "ads_audience.csv"
         else:
-            rows = ads_export.from_registry(min_units=args.min_units)
+            rows = ads_export.from_registry(min_units=args.min_units, include_npi=args.include_npi,
+                                            include_lodging=args.include_lodging, include_firms=args.include_firms)
             out = Path(args.out) if args.out else Path(settings.out_dir) / "ads" / "ads_audience.csv"
         stats = ads_export.write_csv(rows, out)
         print(json.dumps({"file": str(out), **stats}, ensure_ascii=False, indent=2))

@@ -675,6 +675,12 @@ def finalize(out: Path, batch_id: str, strategy: str, accepted: list[Lead], reje
     if crm_summary:
         qr["crm"] = crm_summary
     (out / "quality_report.json").write_text(json.dumps(qr, ensure_ascii=False, indent=2), encoding="utf-8")
+    if make_pdfs and accepted:
+        from . import batch_report
+        packs = json.loads((out / "outreach_pack.json").read_text(encoding="utf-8"))
+        page = batch_report.build(out, [{**l.internal_record(), "import_batch_id": batch_id} for l in accepted],
+                                  quality={**qr, "rejected": len(rejected)}, outreach=packs)
+        logger.info("Panel del lote: {}", page)
     quality.print_report(qr, out)
     if crm_summary:
         c = crm_summary

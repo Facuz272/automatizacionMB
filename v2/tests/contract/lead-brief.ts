@@ -7,8 +7,7 @@
  *   Ficha: <vertical> · <fact> · … · Plan B: <title> <name> [phone] · oficina <hours>
  *          · otros tel.: <label> <number>; <label> <number> · est. US$ 4.5k–7.2k/año · score 72/100
  *
- * "Zona:" is appended to the hook on the same line; "Ficha:" is its own line (leads imported before
- * 2026-11 have it after a space on the same line, which is also accepted). Older leads
+ * "Zona:" is appended to the hook on the same line; "Ficha:" is its own line. Older leads
  * have neither, so they come back as a plain hook. Pure and total: it never throws.
  */
 
@@ -127,21 +126,19 @@ function parseConsolidation(text: string): { found: BriefConsolidation; rest: st
 }
 
 export function parseLeadBrief(text: string | null | undefined): LeadBrief {
-  const lines = (text ?? "").split(/\r?\n/);
+  // "Ficha:" also when a text lost its line breaks (" … Zona: …. Ficha: Gran Comunidad · …"):
+  // it is split onto its own line so it never ends up inside the hook or the Zona argument.
+  const lines = (text ?? "").split(/\r?\n/).flatMap((line) => {
+    const at = line.search(/\sFicha:\s+\S/);
+    return at > 0 && line.slice(0, at).trim() ? [line.slice(0, at), line.slice(at + 1)] : [line];
+  });
   let ficha: LeadBrief["ficha"] = null;
   let zona: LeadBrief["zona"] = null;
   const hook: string[] = [];
   for (const rawLine of lines) {
-    let line = rawLine.trim();
+    const line = rawLine.trim();
     if (!line) continue;
     if (!ficha && /^Ficha:\s*\S/.test(line)) { ficha = parseFicha(line); continue; }
-    // Leads imported before the engine kept the line break carry " … Ficha: …" at the end of the hook line.
-    const mid = ficha ? -1 : line.search(/\sFicha:\s*\S/);
-    if (mid >= 0) {
-      ficha = parseFicha(line.slice(mid + 1));
-      line = line.slice(0, mid).trim();
-      if (!line) continue;
-    }
     // "Zona:" may start its own line or follow the hook on the same line (" … Zona: …").
     const at = zona ? -1 : line.search(/(^|\s)Zona:\s+\S/);
     if (at >= 0) {

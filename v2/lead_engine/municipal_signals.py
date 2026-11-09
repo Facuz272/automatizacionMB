@@ -176,6 +176,42 @@ def classify_permit(a: dict, today: date | None = None) -> dict | None:
                   {"permit": a.get("PermitNumber"), "issued": when, "work": what})
 
 
+# City of Fort Lauderdale permits (east-Broward corridor). BSIP = Broward's Building Safety Inspection
+# Program, the 40/50-year recertification; an application not yet complete is the same pain as Miami's
+# pending 40-year recertification. Unit-level permits ("#1803") are ignored except BSIP.
+FTL_BSIP_OPEN = {"Open", "In Process", "Awaiting Client Reply", "Awaiting Initial Fee Payment", "Corrections Required",
+                 "Plan Set Submitted"}
+FTL_EXTERIOR = {"Walk-Thru - Re-Roof": "re-roof", "Walk-Thru - Window and Door": "ventanas y puertas",
+                "Walk-Thru - Shutters": "shutters", "Structural Permit": "obra estructural"}
+FTL_DEAD = {"Void", "Withdrawn", "Expired", "Cancelled"}
+FTL_NOT_EXTERIOR = re.compile(r"-(TENT|SIGN|DEMO|FENC|POOL|ELEV|TEMP|INT)")      # "Structural Permit" also covers these
+BSIP_MONTHS = 36
+
+
+def classify_ftl_permit(a: dict, today: date | None = None) -> dict | None:
+    desc = (a.get("PERMITDESC") or "").strip()
+    status = (a.get("PERMITSTAT") or "").strip()
+    addr = " ".join((a.get("FULLADDR") or "").split())
+    when = _date(a.get("SUBMITDT"))
+    today = today or date.today()
+    if not when or status in FTL_DEAD:
+        return None
+    if desc.startswith("Building Safety Inspection Program"):
+        if status not in FTL_BSIP_OPEN or when < (today - timedelta(days=BSIP_MONTHS * 30)).isoformat():
+            return None
+        return signal("municipal_recert", "inspección de seguridad 40/50 años (BSIP) en trámite", 6.0,
+                      f"City of Fort Lauderdale: {addr} — solicitud del Building Safety Inspection Program (40/50 años) "
+                      f"del {when}, estado «{status}»", when, "ftl_permits", a.get("PERMITID"),
+                      {"address": addr, "year": when[:4], "detail": status, "plan": None, "program": "bsip",
+                       "city": "Fort Lauderdale", "submitted": when})
+    work = FTL_EXTERIOR.get(desc)
+    if not work or "#" in addr or FTL_NOT_EXTERIOR.search(a.get("PERMITID") or "") or when < (today - timedelta(days=PERMIT_MONTHS * 30)).isoformat():
+        return None
+    return signal("municipal_permit", "obra exterior con permiso reciente", 2.5,
+                  f"City of Fort Lauderdale: permiso {a.get('PERMITID') or ''} ({when}): {desc}".strip(), when,
+                  "ftl_permits", a.get("PERMITID"), {"permit": a.get("PERMITID"), "issued": when, "work": desc})
+
+
 # ── sources ─────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -190,6 +226,7 @@ class Layer:
     order_by: str | None = None
     city: str | None = None          # postal city filter when the layer covers one municipality
     coords: tuple[str, str] | None = None  # (lon, lat) attribute names for a distance check
+    timeout: float = 25.0
 
 
 LAYERS = [
@@ -205,6 +242,11 @@ LAYERS = [
           "miami-dade", classify_permit,
           extra_where="(" + " OR ".join(f"DetailDescriptionComments LIKE '%{k}%'" for k in PERMIT_KEYWORDS) + ")",
           order_by="PermitIssuedDate DESC"),
+    Layer("ftl_permits", "https://gis.fortlauderdale.gov/server/rest/services/BuildingPermits/FeatureServer/0/query",
+          "FULLADDR", "PERMITID,PERMITDESC,PERMITSTAT,SUBMITDT,FULLADDR", "broward", classify_ftl_permit,
+          extra_where="(PERMITDESC LIKE 'Building Safety Inspection%' OR PERMITDESC IN ("
+                      + ",".join(f"'{k}'" for k in FTL_EXTERIOR) + "))",
+          order_by="SUBMITDT DESC", city="FORT LAUDERDALE", timeout=5.0),
 ]
 
 _disabled: set[str] = set()
@@ -221,7 +263,7 @@ def _query(layer: Layer, pattern: str) -> list[dict]:
     params = {"where": where, "outFields": layer.fields, "returnGeometry": "false", "resultRecordCount": 25, "f": "json"}
     if layer.order_by:
         params["orderByFields"] = layer.order_by
-    r = requests.get(layer.url, params=params, timeout=25, headers={"User-Agent": settings.user_agent})
+    r = requests.get(layer.url, params=params, timeout=layer.timeout, headers={"User-Agent": settings.user_agent})
     costs.tracker.add("arcgis")
     r.raise_for_status()
     data = r.json()

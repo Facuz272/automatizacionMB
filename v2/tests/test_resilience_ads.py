@@ -197,13 +197,14 @@ def test_pa_seed_merges_miami_dade_and_the_broward_corridor(monkeypatch):
               "DOR_DESC": "COMMUNITY SHOPPING CENTER", "CONDO_FLAG": "N"}
     urls = []
 
-    def get(url, params, timeout, headers):
+    def get(url, params=None, timeout=None, headers=None, data=None):
+        params = params or data
         urls.append(url)
         if url == appraiser.URL:
             return _Resp({"features": [{"attributes": md_row}]})
         assert "SITUS_ZIP_CODE IN (" in params["where"] and "33326" not in params["where"]
         return _Resp({"features": [{"attributes": BCPA[0]}, {"attributes": BCPA[0]}]})   # one folio, two polygons
-    monkeypatch.setattr(appraiser_seed.requests, "get", get)
+    monkeypatch.setattr(appraiser_seed.requests, "post", get)
     monkeypatch.setattr(broward.requests, "get", get)
     leads = list(appraiser_seed.collect("onsite", 5, vertical="plaza", cities=["Miami", "Hollywood FL"]))
     assert [(l.source_id, l.cadastre.get("building_sqft")) for l in leads] == [("bcpa:514206084890", 291551),
@@ -212,18 +213,18 @@ def test_pa_seed_merges_miami_dade_and_the_broward_corridor(monkeypatch):
     assert b.vertical == "plaza" and b.address == "4901 Sheridan St, Hollywood, FL 33021"
     assert b.cadastre["source"] == "broward_property_appraiser" and b.company_name.startswith("Equity One")
 
-    def md_down(url, params, timeout, headers):
+    def md_down(url, params=None, timeout=None, headers=None, data=None):
         if url == appraiser.URL:
             raise requests.ConnectionError("down")
-        return get(url, params, timeout, headers)
-    monkeypatch.setattr(appraiser_seed.requests, "get", md_down)
+        return get(url, params=params or data, timeout=timeout, headers=headers)
+    monkeypatch.setattr(appraiser_seed.requests, "post", md_down)
     assert [l.source_id for l in appraiser_seed.collect("onsite", 5, vertical="plaza", cities=["Hollywood FL"])] == [
         "bcpa:514206084890"]                                             # Broward still seeds
 
 
 def test_no_broward_query_without_corridor_cities(monkeypatch):
     tenant.use("mb_softwash")
-    monkeypatch.setattr(appraiser_seed.requests, "get", lambda *a, **k: _Resp({"features": []}))
+    monkeypatch.setattr(appraiser_seed.requests, "post", lambda *a, **k: _Resp({"features": []}))
     monkeypatch.setattr(broward, "seed", lambda *a, **k: pytest.fail("no corridor city requested"))
     assert list(appraiser_seed.collect("onsite", 5, vertical="plaza", cities=["Doral"])) == []
 
@@ -301,13 +302,14 @@ def test_audience_csv_keeps_only_the_service_area_with_identifiers(tmp_path):
     assert list(rows[0]) == ads_export.COLUMNS
     assert [(r["email"], r["fn"]) for r in rows] == [("manager@oceansideplaza.org", "ana"), ("", "carlos")]
     assert stats == {"rows": 2, "outside_area": 2, "no_identifier": 1, "duplicates": 1, "with_email": 1,
-                     "with_phone": 2}
+                     "with_phone": 2, "by_source": {"batch": 2}}
 
 
 def test_audience_from_the_registry_uses_contact_names_and_building_zip(tmp_path):
     object.__setattr__(settings, "target_cities", {"onsite": ["Miami", "Miami Beach"]})
     conn = dbpr.connect(tmp_path / "dbpr.db")
     dbpr.load_csv(FIXTURE, conn)
-    rows = ads_export.from_registry(min_units=10, conn=conn)
+    rows = ads_export.from_registry(min_units=10, conn=conn, include_lodging=False, include_npi=False,
+                                    include_firms=False)
     assert rows and all(r["fn"] and r["ln"] and r["zip"] and not r["email"] and not r["phone"] for r in rows)
     assert all(r["value"] for r in rows)

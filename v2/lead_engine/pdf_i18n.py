@@ -212,6 +212,10 @@ def municipal_line(sig: dict[str, Any], lang: str) -> tuple[str, str]:
         return ("County building recertification window",
                 f"Built in {d['year_built']} ({d['age']} yrs). {verb} {d['milestone']} years in {d['milestone_year']}: "
                 f"county structural recertification cycle.")
+    if c == "municipal_recert" and d.get("program") == "bsip":
+        return (f"{d.get('city', 'Fort Lauderdale')} Building Safety Inspection (40/50-year) in progress",
+                f"{d.get('address')}: Building Safety Inspection Program application filed {d.get('submitted')} "
+                f"(status: {d.get('detail')}).")
     if c == "municipal_recert":
         plan = f", plan {d['plan']}" if d.get("plan") else ""
         return ("City of Miami 40-Year Recertification pending",

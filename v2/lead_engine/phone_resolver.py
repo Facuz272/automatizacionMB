@@ -117,6 +117,22 @@ def resolve(lead: Lead, steps: tuple[str, ...] = ("lodging", "firm_central")) ->
                             "context": f"{hit['why']} ({hit['licensee']}, {hit['license_number']})"})
         lead.evidence["phone_from"] = "dbpr_lodging"
         return "lodging"
+    if "firm_central" in steps and settings.allow_mgmt_firm_phone:
+        from . import commercial_mgmt
+        op = commercial_mgmt.match(lead)                 # plazas / commercial: operator from the cadastre
+        if op:
+            lead.evidence["commercial_operator"] = commercial_mgmt.public(op)
+            if not lead.management_company:
+                lead.management_company = op["name"]
+                lead.management_type = "third_party"
+                lead.evidence["management_from"] = "commercial_operator"
+            number = commercial_mgmt.dial_phone(op)
+            if number:
+                lead.phone = number
+                lead.phones.append({"number": number, "label": op.get("phone_label") or "firm_central",
+                                    "source": f"operator_site:{op['domain']}", "context": op.get("phone_context") or ""})
+                lead.evidence["phone_from"] = "firm_central"
+                return "firm_central"
     if "firm_central" in steps and settings.allow_mgmt_firm_phone and lead.management_company:
         fp = firm_phone(lead.management_company)
         if fp:

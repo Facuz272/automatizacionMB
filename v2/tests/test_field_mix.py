@@ -40,7 +40,8 @@ def test_without_restrictions_the_city_name_still_matches():
 def test_appraiser_seed_where_clause_uses_the_restricted_zips():
     tenant.use("mb_softwash")
     w = appraiser_seed.where_clause("plaza", ["Fort Lauderdale", "Doral"], 20000)
-    assert "TRUE_SITE_CITY = 'Doral'" in w and "Fort Lauderdale'" not in w and "33316" in w and "33326" not in w
+    # Miami-Dade query: Doral by name; the east-Broward corridor is seeded from the Broward tax roll instead
+    assert "TRUE_SITE_CITY = 'Doral'" in w and "Fort Lauderdale'" not in w and "33316" not in w and "33326" not in w
 
 
 BROWARD_ROWS = [{"USE_CODE": "04", "BLDG_YEAR_BUILT": 1983, "SITUS_UNIT_NUMBER": u, "BLDG_TOT_SQ_FOOTAGE": 1100,

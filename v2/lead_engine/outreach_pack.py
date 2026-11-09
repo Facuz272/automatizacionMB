@@ -46,6 +46,12 @@ def hook(lead: dict[str, Any]) -> dict[str, str] | None:
     rc = _signal(lead, "municipal_recert", "municipal_unsafe", "municipal_violation", "municipal_code")
     if rc:
         d = rc.get("data") or {}
+        if rc["category"] == "municipal_recert" and d.get("program") == "bsip":
+            return {"kind": "recert", "short": "has a 40/50-year Building Safety Inspection application open",
+                    "en": f"the City of {d.get('city', 'Fort Lauderdale')} shows an open Building Safety Inspection "
+                          f"Program (40/50-year) application for the building",
+                    "es": f"tiene abierta la inspección de seguridad 40/50 años (BSIP) en "
+                          f"{d.get('city', 'Fort Lauderdale')}"}
         if rc["category"] == "municipal_recert":
             return {"kind": "recert", "short": "has its 40-Year Recertification still pending", "en": f"the city lists its {d.get('year') or ''} 40-Year Recertification as "
                                              f"still pending".replace("its  ", "its "),

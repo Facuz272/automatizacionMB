@@ -43,14 +43,21 @@ def light_profile(lead: Lead) -> dict[str, Any]:
     if lead.evidence.get("light_profile"):
         return lead.evidence["light_profile"]
     rec = lead.public_records.get("dbpr") or {}
-    cad = appraiser.lookup(lead.address) or {}
+    cad = (lead.cadastre if lead.source == "pa" and lead.cadastre else None) or appraiser.lookup(lead.address) or {}
     units = rec.get("units") or cad.get("units") or 0
     coastal = _coastal(lead)
     sigs = list(municipal_signals.lookup(lead.address, dbpr_county=rec.get("county")) or [])
-    ms = appraiser.milestone_signal(cad.get("year_built"), cad.get("floors"), coastal, units=units, condo=True)
+    ms = appraiser.milestone_signal(cad.get("year_built"), cad.get("floors"), coastal, units=units,
+                                    condo=lead.vertical == "community")
     if ms:
         sigs.insert(0, ms)
-    est = valuation.estimate({"units": units, "levels": cad.get("floors"), "coastal": coastal}) if units else None
+    if units:
+        est = valuation.estimate({"units": units, "levels": cad.get("floors"), "coastal": coastal})
+    elif cad.get("building_sqft"):                   # plazas / commercial: built area and lot
+        est = valuation.estimate({"vertical": lead.vertical, "building_sqft": cad["building_sqft"],
+                                  "lot_sqft": cad.get("lot_sqft"), "levels": cad.get("floors"), "coastal": coastal})
+    else:
+        est = None
     prof = {"name": lead.company_name, "address": lead.address, "units": units, "year_built": cad.get("year_built"),
             "floors": cad.get("floors"), "building_sqft": cad.get("building_sqft"),
             "signals": [{"category": s["category"], "label": s["label"], "weight": s.get("weight", 0),

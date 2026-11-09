@@ -91,7 +91,7 @@ def summary(out: Path, committed: bool) -> dict[str, Any]:
         "batch": out.name, "accepted": len(leads), "committed": committed,
         "injected": injected,
         "would_insert": crm.get("would_insert"), "annual_usd_low": low, "annual_usd_high": high,
-        "needs_phone": sum(1 for _ in open(out / "needs_phone.csv", encoding="utf-8")) - 1
+        "needs_phone": len((out / "needs_phone.csv").read_text(encoding="utf-8").splitlines()) - 1
         if (out / "needs_phone.csv").exists() else 0,
         "consolidated_siblings": qr.get("consolidated_siblings", 0),
         "top": [{"name": l.get("company_name"), "address": l.get("address"), "score": l.get("lead_score"),

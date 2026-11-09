@@ -203,6 +203,8 @@ def run(top: int = 15, depth: int = 10, live: bool = True, pdf: bool = False, la
         from .pdf_common import safe_filename
         for f in firms:
             build(f, out / "pdf" / f"{safe_filename(f['firm'])}.pdf", lang=lang)
+        from .batch_report import build_portfolios
+        build_portfolios(out, firms)
     return out
 
 

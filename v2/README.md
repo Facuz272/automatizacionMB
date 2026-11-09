@@ -63,6 +63,8 @@ v2/
 │   ├── overpass.py        Overpass (OSM) con mirrors, endpoint preferido y corte por corrida
 │   ├── preflight.py       diagnóstico OK / PENDIENTE / ERROR de claves, perfil, padrones y red
 │   ├── ads_export.py      audiencias B2B (Meta / Google / LinkedIn) en CSV
+│   ├── commercial_mgmt.py operadores de plazas / edificios comerciales (catálogo verificado en data/)
+│   ├── batch_report.py    panel HTML autocontenido del lote (out/<lote>/index.html)
 │   ├── competitor_intel.py  debilidades de la competencia en reseñas de edificios vecinos
 │   ├── route_optimizer.py rutas de inspección por zonas e inspector
 │   ├── geocode.py         geocodificación gratuita (US Census) para leads sin coordenadas
@@ -187,6 +189,14 @@ Hallandale Beach a sus códigos postales costeros/este (Fort Lauderdale: 33301, 
 33309, 33311, 33312, 33315, 33316, 33334; Hollywood: 33019-33021; Hallandale: 33009) y
 `exclude_zips` saca siempre el oeste lejano (33325-33327, 33330-33332: Bonaventure, Weston). Vale
 para el ranking de portafolios, la semilla DBPR y la semilla del catastro.
+
+**Permisos y 40/50 años en Fort Lauderdale.** La capa pública de permisos de la ciudad
+(gis.fortlauderdale.gov, ~0,5 s, 200 mil permisos; datos hasta mar-2026) se consulta con 5 s de tope:
+una solicitud abierta del *Building Safety Inspection Program* (BSIP, la recertificación 40/50 años de
+Broward) es una señal de recertificación pendiente (peso 6, como la de Miami) y los permisos de techo,
+ventanas/puertas, shutters y estructurales del edificio (no de una unidad, sin carpas ni carteles) son
+obra exterior reciente. Hollywood, Hallandale Beach y el condado no publican una capa equivalente
+(búsqueda en ArcGIS Online y en sus servidores, nov-2026).
 
 **Catastro en vivo.** Miami-Dade: Property Appraiser + capas municipales. Este de Broward: tax roll
 del Broward County Property Appraiser (capa pública de Broward County GIS con todos los folios,
@@ -387,6 +397,26 @@ ranking por superficie. Nov-2026: 209 plazas de 20.000+ ft² en el corredor en ~
 Sheridan Plaza, Village at Gulfstream Park, Beach Place…). Sin Google Places, OSM ni búsqueda
 externa no hay teléfono para casi ninguna: quedan en `needs_phone.csv` para `enrich-phones`.
 
+### Operadores de plazas comerciales (`commercial_mgmt`)
+
+Las plazas están a nombre de sociedades de un solo inmueble («SFA ATLANTIS ASSOC LP»), así que el
+operador se reconoce en el propio catastro: nombre del propietario, «%»/C/O y, sobre todo, la
+dirección postal del propietario, porque todo el portafolio de un operador recibe la boleta en la
+misma oficina (500 N Broadway, Jericho → Kimco; 17100 Collins Ave → RK Centers; 7978 Cooper Creek
+Blvd → Benderson). `lead_engine/data/commercial_operators.json` se armó y verificó en vivo el
+9-nov-2026 sobre las 1.753 plazas y edificios comerciales de la zona: 16 operadores cubren 107
+inmuebles; dominio y teléfono leídos del sitio oficial de cada uno con el mismo rastreador del motor
+(los sitios que responden 403 a clientes automáticos —Kimco, Hines— no se forzaron y quedan sin
+teléfono). Solo se marcan los números de oficinas de Florida (`phone_scope: florida`: RK Centers,
+Dacra, Regency Boca Raton, Benderson, Stiles, Aventura Mall —esta es la línea de concierge—): 54
+inmuebles. Las sedes fuera del estado (Thor, Federal Realty, Procacci, Continental) solo nombran a
+la administradora.
+
+Con `ALLOW_MGMT_FIRM_PHONE=true` la cascada usa ese teléfono como «central administradora» (último
+recurso, como en condominios) y `portfolio_consolidation` deja un lead por operador con las demás
+plazas listadas para cotizar en el mismo llamado; el ticket de cada hermana sale de la superficie
+construida y del lote.
+
 ### Hoteles (DBPR Lodging) y clínicas (NPI Registry)
 
 `dbpr-sync` también carga `hrlodge1.csv` / `hrlodge2.csv` (~44.000 licencias de alojamiento): para
@@ -517,6 +547,15 @@ costo estimado de APIs (total y por lead, precios ajustables con `PRICE_<API>`),
 - **Duplicados**: por `phone_key` (últimos 10 dígitos, igual que el CRM) dentro del lote,
   contra el ledger local y contra el CRM (precheck en dry-run antes de enriquecer).
 
+## Panel del lote (`index.html`)
+
+Cada lote con PDFs (`run --pdf`, `daily`, `enrich-phones --pdf`) deja `out/<lote>/index.html`, una
+página autocontenida (sin CDN ni red) con las métricas del lote y una tabla que se filtra y ordena:
+score, ticket anual, vertical, señales, teléfono, edificios consolidados, enlaces al PDF en inglés y
+a la hoja de campo, y botones para copiar el email y el WhatsApp del outreach pack. `portfolios
+--pdf` deja el suyo con el ranking y el dossier de cada administradora. Los enlaces son relativos:
+la carpeta se puede comprimir y compartir tal cual.
+
 ## Pre-vuelo (`preflight`)
 
 ```bash
@@ -536,7 +575,8 @@ del CRM (estado y Pool). No escribe nada; sale con código 1 solo si algo config
 
 ```bash
 python -m lead_engine export-ads out/<lote>/leads.jsonl   # → out/<lote>/ads_audience.csv
-python -m lead_engine export-ads                          # padrón DBPR de la zona → out/ads/ads_audience.csv
+python -m lead_engine export-ads                          # padrones de la zona → out/ads/ads_audience.csv
+python -m lead_engine export-ads --no-include-npi         # sin consultar el NPI Registry
 ```
 
 Columnas `email, phone, fn, ln, ct, st, zip, country, company, value`, normalizadas como pide Meta
@@ -545,8 +585,20 @@ ZIP de 5 dígitos, teléfono E.164); Meta, Google y LinkedIn hashean el archivo 
 `value` es el punto medio del ticket anual estimado. Solo registros dentro de la zona de servicio
 del perfil; se descartan los que no tienen ningún identificador y se unen duplicados (mismo email,
 teléfono o nombre + ZIP). Desde un lote salen el contacto principal (email verificado y teléfono) y
-los demás contactos con nombre; desde el padrón, la persona registrada en el «C/O» con el ZIP del
-edificio (coincidencia solo por nombre + ubicación, menor tasa de match).
+los demás contactos con nombre. Desde los padrones locales de la zona se suman:
+
+- condominios: la persona registrada en el «C/O» con el ZIP del edificio (solo nombre + ubicación);
+- DBPR Lodging: hoteles, moteles, edificios de apartamentos y apart-hoteles con licencia activa y
+  teléfono, y las licencias de condominio a nombre de la propia asociación (nunca las de un
+  propietario particular, ni viviendas `DWEL` o B&B);
+- NPI Registry (`--include-npi`, por defecto): clínicas y hospitales de las ciudades y ZIPs de la
+  zona con el *authorized official* (nombre, apellido y teléfono directo);
+- una fila por administradora / operador comercial con su teléfono publicado y `company_website`
+  (columna extra para LinkedIn). El conmutador de la firma no se copia en las filas de personas.
+
+Se deduplica por email, teléfono, nombre + ZIP y empresa + dirección. Nov-2026, sin Google Places:
+4.423 filas, 4.355 con teléfono E.164 (NPI 2.121, Lodging 2.224, firmas y operadores 12, contactos
+de condominio 66).
 
 ## Contrato con la tarjeta del CRM
 

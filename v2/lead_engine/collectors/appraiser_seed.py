@@ -38,7 +38,8 @@ NAME = {"plaza": "Shopping/Plaza", "commercial": "Edificio comercial", "clinic":
 def where_clause(vertical: str, cities: list[str], min_sqft: int) -> str:
     area = area_filter(cities)
     names = {n.title().replace("'", "''") for n in area.names}
-    zips = set(area.zips) - area.exclude
+    corridor = {z for zs in area.restricted.values() for z in zs}       # east Broward: seeded from its own roll
+    zips = set(area.zips) - area.exclude - corridor
     area = " OR ".join([f"TRUE_SITE_CITY = '{n}'" for n in sorted(names)] +
                        [f"TRUE_SITE_ZIP_CODE LIKE '{z}%'" for z in sorted(zips)])
     return (f"{DOR_WHERE[vertical]} AND CONDO_FLAG <> 'Y' AND BUILDING_ACTUAL_AREA >= {int(min_sqft)}"
@@ -81,7 +82,8 @@ def collect(strategy: str, max_candidates: int, *, vertical: str = "plaza", citi
               # extra rows so buildings seen in earlier runs can be skipped and the ranking still fills the batch
               "resultRecordCount": max(1, min(max_candidates * 5 + 200, 2000)), "f": "json"}
     try:
-        r = requests.get(appraiser.URL, params=params, timeout=60, headers={"User-Agent": settings.user_agent})
+        # POST: a long city/ZIP list makes the GET URL too long for ArcGIS (404).
+        r = requests.post(appraiser.URL, data=params, timeout=60, headers={"User-Agent": settings.user_agent})
         costs.tracker.add("arcgis")
         r.raise_for_status()
         rows = [f.get("attributes", {}) for f in r.json().get("features", [])]
