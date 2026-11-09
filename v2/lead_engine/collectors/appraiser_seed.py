@@ -7,6 +7,10 @@ filtered by TARGET_CITIES (cadastre city name or the ZIP aliases of the DBPR see
 built area (SEED_MIN_SQFT, default 20,000 ft²), largest first. Each lead carries the cadastre
 record (owner, mailing/care-of, floors, area, year, assessed value); the phone comes from Google
 Places by address when the key exists, or from the property's website.
+
+The east-Broward corridor (tenant `zip_restrictions`: Hallandale, Hollywood, Fort Lauderdale) is seeded
+from the Broward County Property Appraiser tax roll with the same DOR use codes (broward.SEED_USE); both
+counties are merged into one ranking by built area.
 """
 
 from __future__ import annotations
@@ -57,6 +61,16 @@ def to_lead(a: dict, vertical: str, strategy: str) -> Lead | None:
     return lead
 
 
+def broward_lead(rec: dict, vertical: str, strategy: str) -> Lead:
+    owner = rec.get("owner_name")
+    lead = Lead(source="pa", source_id=f"bcpa:{rec['folio']}", strategy_kind=strategy,  # type: ignore[arg-type]
+                company_name=_title_case(owner) if owner else f"{NAME[vertical]} {rec['address'].split(',')[0]}",
+                address=rec["address"], evidence={"seed": "broward_appraiser", "folio": rec["folio"]})
+    lead.vertical = vertical
+    lead.cadastre = {k: v for k, v in rec.items() if k != "address"}
+    return lead
+
+
 def collect(strategy: str, max_candidates: int, *, vertical: str = "plaza", cities: list[str] | None = None,
             min_sqft: int | None = None) -> Iterator[Lead]:
     if vertical not in DOR_WHERE:
@@ -72,9 +86,17 @@ def collect(strategy: str, max_candidates: int, *, vertical: str = "plaza", citi
         r.raise_for_status()
         rows = [f.get("attributes", {}) for f in r.json().get("features", [])]
     except (requests.RequestException, ValueError) as exc:
-        logger.warning("Semilla del Property Appraiser falló: {}", exc)
-        return
-    for a in rows:
-        lead = to_lead(a, vertical, strategy)
-        if lead:
-            yield lead
+        logger.warning("Semilla del Property Appraiser (Miami-Dade) falló: {}", exc)
+        rows = []
+    leads = [l for l in (to_lead(a, vertical, strategy) for a in rows) if l]
+    # East-Broward corridor: same verticals from the Broward tax roll, for the restricted cities in the area.
+    area = area_filter(cities or cities_for(strategy))
+    restricted = {z for zs in area.restricted.values() for z in zs}
+    corridor = sorted((area.zips & restricted) - area.exclude)      # only the corridor cities that were asked for
+    if corridor:
+        from .. import broward
+        for rec in broward.seed(vertical, corridor, min_sqft, params["resultRecordCount"]):
+            leads.append(broward_lead(rec, vertical, strategy))
+    # One ranking for both counties: largest built area first.
+    leads.sort(key=lambda l: -(l.cadastre.get("building_sqft") or 0))
+    yield from leads

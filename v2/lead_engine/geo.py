@@ -233,12 +233,10 @@ out tags geom;
 def fetch_profile(lat: float | None, lon: float | None) -> dict[str, Any]:
     if lat is None or lon is None or not settings.geo_enabled:
         return {}
+    from .overpass import OverpassUnavailable, query
+
     try:
-        r = requests.post(settings.overpass_url, data={"data": overpass_query(lat, lon)},
-                          headers={"User-Agent": settings.user_agent}, timeout=45)
-        costs.tracker.add("overpass")
-        r.raise_for_status()
-        return profile_from_overpass(r.json().get("elements", []), lat, lon)
-    except (requests.RequestException, ValueError) as exc:
+        return profile_from_overpass(query(overpass_query(lat, lon)), lat, lon)
+    except OverpassUnavailable as exc:
         logger.warning("Overpass falló para ({}, {}): {}", lat, lon, exc)
         return {}

@@ -19,7 +19,6 @@ from ..config import OSM_BBOX, settings
 from ..models import Lead
 from ..normalize import extract_domain, is_company_site, to_e164
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 
 def _query(limit: int) -> str:
@@ -49,14 +48,11 @@ def _address(t: dict) -> str:
 
 
 def collect(strategy: str, max_candidates: int) -> Iterator[Lead]:
+    from ..overpass import OverpassUnavailable, query
+
     try:
-        r = requests.post(
-            OVERPASS_URL, data={"data": _query(max_candidates * 4)},
-            headers={"User-Agent": settings.user_agent}, timeout=90,
-        )
-        r.raise_for_status()
-        elements = r.json().get("elements", [])
-    except (requests.RequestException, ValueError) as exc:
+        elements = query(_query(max_candidates * 4), timeout=90)
+    except OverpassUnavailable as exc:
         logger.warning("Overpass falló: {}", exc)
         return
     emitted = 0
@@ -130,11 +126,10 @@ def lookup_address(address: str | None, name: str | None = None) -> dict | None:
     parts = street_parts(address)
     if not parts:
         return None
+    from ..overpass import OverpassUnavailable, query
+
     try:
-        r = requests.post(OVERPASS_URL, data={"data": address_query(parts[0], parts[1], OSM_BBOX)},
-                          headers={"User-Agent": settings.user_agent}, timeout=45)
-        r.raise_for_status()
-        return pick_address_match(r.json().get("elements", []), name)
-    except (requests.RequestException, ValueError) as exc:
+        return pick_address_match(query(address_query(parts[0], parts[1], OSM_BBOX)), name)
+    except OverpassUnavailable as exc:
         logger.warning("Overpass (dirección) falló para {}: {}", address, exc)
         return None

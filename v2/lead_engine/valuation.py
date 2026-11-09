@@ -64,6 +64,53 @@ def _geometry(building: dict[str, Any]) -> tuple[int | None, float | None]:
     return levels, footprint
 
 
+# ── surface inference when OSM is unavailable (pure) ───────────────────────
+
+PARKING_FT2_PER_UNIT = 250          # one parking space with its share of aisles and ramps
+PARKING_LOT_FRACTION = 0.5          # conservative share of the open lot that is parking / hardscape
+LOT_TO_FOOTPRINT_MIN = 1.3
+SCALE_LEVELS, SCALE_UNITS = 6, 75
+LOT_SOURCE = "estimado por lote catastral"
+SCALE_SOURCE = "est. por escala catastral — validar en sitio"
+
+
+def footprint_ft2(building: dict[str, Any], cadastre: dict[str, Any] | None = None) -> float | None:
+    cad = cadastre or {}
+    if building.get("footprint_m2"):
+        return building["footprint_m2"] * M2_TO_FT2
+    sqft = building.get("building_sqft") or cad.get("building_sqft")
+    levels = building.get("levels") or cad.get("floors")
+    if sqft:
+        return sqft / (levels or 1)
+    return None
+
+
+def infer_surfaces(building: dict[str, Any], cadastre: dict[str, Any] | None = None, vertical: str | None = None,
+                   hotel: bool = False) -> dict[str, dict[str, Any]]:
+    """Surfaces OSM would normally confirm, inferred from the cadastre / DBPR scale:
+
+      plaza / commercial   parking_lot = 50% of (lot − footprint) when the lot is ≥1.3× the footprint
+      condo / hotel        parking_garage (units × 250 ft²) and pool_deck when ≥6 floors, ≥75 units
+                           or on the coast
+    Each item carries its ft² and the label that says it is an estimate."""
+    cad = cadastre or {}
+    vertical = vertical or building.get("vertical") or "community"
+    levels = building.get("levels") or cad.get("floors") or 0
+    units = building.get("units") or cad.get("units") or 0
+    out: dict[str, dict[str, Any]] = {}
+    if vertical == "community" or hotel:
+        if levels >= SCALE_LEVELS or units >= SCALE_UNITS or building.get("coastal"):
+            if units:
+                out["parking_garage"] = {"ft2": units * PARKING_FT2_PER_UNIT, "source": SCALE_SOURCE}
+            out["pool_deck"] = {"ft2": 6000 if units >= 150 or levels >= 15 else 3000, "source": SCALE_SOURCE}
+    elif vertical in ("plaza", "commercial", "clinic"):
+        lot = building.get("lot_sqft") or cad.get("lot_sqft")
+        fp = footprint_ft2(building, cad)
+        if lot and fp and lot > fp * LOT_TO_FOOTPRINT_MIN:
+            out["parking_lot"] = {"ft2": int(round((lot - fp) * PARKING_LOT_FRACTION, -1)), "source": LOT_SOURCE}
+    return out
+
+
 def estimate(building: dict[str, Any]) -> dict[str, Any] | None:
     """{"low", "high", "components": {...}, "basis": {...}} in USD per year, or None."""
     levels, footprint = _geometry(building or {})
@@ -85,11 +132,12 @@ def estimate(building: dict[str, Any]) -> dict[str, Any] | None:
     lo, hi, freq = RATES["walkways"]
     comps["walkways"] = (walk_ft2 * lo * freq, walk_ft2 * hi * freq)
 
-    if "parking_garage" in amenities:
-        g_ft2 = 250 * (units or max(20, footprint * M2_TO_FT2 / 400))
+    inferred = (building or {}).get("inferred") or {}
+    if "parking_garage" in amenities or "parking_garage" in inferred:
+        g_ft2 = PARKING_FT2_PER_UNIT * (units or max(20, footprint * M2_TO_FT2 / 400))
         lo, hi, freq = RATES["garage"]
         comps["garage"] = (g_ft2 * lo * freq, g_ft2 * hi * freq)
-    if "pool_deck" in amenities:
+    if "pool_deck" in amenities or "pool_deck" in inferred:
         p_ft2 = 6000 if units >= 150 or levels >= 15 else 3000
         lo, hi, freq = RATES["pool_deck"]
         comps["pool_deck"] = (p_ft2 * lo * freq, p_ft2 * hi * freq)
@@ -98,10 +146,12 @@ def estimate(building: dict[str, Any]) -> dict[str, Any] | None:
         comps["courts"] = (7200 * lo * freq, 7200 * hi * freq)
     lot = (building or {}).get("lot_sqft")
     if lot and (building or {}).get("vertical") in ("plaza", "commercial", "clinic"):
-        # Parking lots, sidewalks and service areas: ~60% of the lot not under the building.
-        hard = max(0.0, lot - footprint * M2_TO_FT2) * 0.6
-        lo, hi, freq = RATES["lot_hardscape"]
-        comps["lot_hardscape"] = (hard * lo * freq, hard * hi * freq)
+        # Parking lots, sidewalks and service areas: the conservative share of the lot outside the building.
+        lot_inf = infer_surfaces({**building, "footprint_m2": building.get("footprint_m2") or footprint})
+        if "parking_lot" in lot_inf:
+            hard = lot_inf["parking_lot"]["ft2"]
+            lo, hi, freq = RATES["lot_hardscape"]
+            comps["lot_hardscape"] = (hard * lo * freq, hard * hi * freq)
     if "gatehouse" in amenities:
         lo, hi, freq = GATEHOUSE_FLAT
         comps["gatehouse"] = (lo * freq, hi * freq)
@@ -114,7 +164,8 @@ def estimate(building: dict[str, Any]) -> dict[str, Any] | None:
         "components": {k: [int(round(v[0], -1)), int(round(v[1], -1))] for k, v in comps.items()},
         "basis": {"levels": levels, "footprint_m2": round(footprint), "units": units or None, "coastal": coastal,
                   "facade_ft2": round(facade_ft2), "rope_access": rope > 1,
-                  "footprint_source": "osm" if (building or {}).get("footprint_m2") else "units"},
+                  "footprint_source": "osm" if (building or {}).get("footprint_m2") else "units",
+                  "inferred": sorted(inferred)},
     }
 
 

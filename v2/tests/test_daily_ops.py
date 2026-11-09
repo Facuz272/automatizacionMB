@@ -201,6 +201,15 @@ def test_outreach_pack_files(tmp_path, shared):
 
 # ── 4. daily ────────────────────────────────────────────────────────────────
 
+def test_batch_size_uses_the_crm_target_when_none_is_given():
+    # Shape of /api/public/health since mbguiaclientes 1d3e176 (poolSummary at the top level).
+    h = {"ok": True, "problems": [], "pool_available_count": 12, "pool_available": 12, "pool_target": 30,
+         "pool_missing": 18, "facts": {"pool_low": False}}
+    assert daily.batch_size(h, None, 10) == (18, "Pool con 12 disponibles (objetivo 30)")
+    assert daily.batch_size({**h, "pool_target": 0}, None, 10)[0] == 28          # falls back to 40
+    assert daily.batch_size(h, 50, 10)[0] == 38                                 # explicit target wins
+
+
 def test_batch_size_from_health_answers():
     assert daily.batch_size({"ok": True, "facts": {"pool_available": 31}}, 40, 10) == (9, "Pool con 31 disponibles (objetivo 40)")
     assert daily.batch_size({"pool_restante": 55}, 40, 10)[0] == 0

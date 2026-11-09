@@ -35,6 +35,7 @@ from .pdf_common import draw_footer, num, safe_filename, styles, table, txt, usd
 FIELD_DEFAULTS: dict[str, Any] = {
     # production, ft² per crew-hour
     "facade_ft2_h": 1200, "facade_rope_ft2_h": 700, "flat_ft2_h": 1000, "garage_ft2_h": 1500,
+    "lot_ft2_h": 4000,                       # open parking lots: surface cleaner / truck unit
     # gallons of mixed solution per 100 ft² and target SH % in the mix
     "facade_mix_gal_100": 1.0, "flat_mix_gal_100": 0.5, "facade_sh_pct": 1.5, "flat_sh_pct": 0.75,
     "sh_concentrate_pct": 12.5, "surfactant_oz_per_gal": 1.0,
@@ -59,6 +60,13 @@ def surfaces(rec: dict[str, Any]) -> dict[str, dict[str, Any]]:
     levels, footprint = valuation._geometry(b)
     units = b.get("units") or 0
     amen = b.get("amenities") or {}
+    # Surfaces OSM/site did not confirm: inferred from the cadastre / DBPR scale (stored by the pipeline when
+    # OSM was down, or computed here for records without them) so the quote is never missing a row.
+    inferred = dict(b.get("inferred") or {})
+    for k, v in valuation.infer_surfaces(b, cad, rec.get("vertical") or b.get("vertical"),
+                                         hotel=bool(rec.get("lodging"))).items():
+        if k not in amen:
+            inferred.setdefault(k, v)
     r = rates()
     out: dict[str, dict[str, Any]] = {}
     R = valuation.RATES
@@ -74,18 +82,26 @@ def surfaces(rec: dict[str, Any]) -> dict[str, dict[str, Any]]:
     if "pool_deck" in amen:
         out["pool_deck"] = {"label": "Pool deck", "ft2": 6000 if units >= 150 or (levels or 0) >= 15 else 3000,
                             "rate": R["pool_deck"][:2], "kind": "flat", "group": "entry"}
+    elif "pool_deck" in inferred:
+        out["pool_deck"] = {"label": f"Pool deck / áreas recreativas ({inferred['pool_deck']['source']})",
+                            "ft2": inferred["pool_deck"]["ft2"], "rate": R["pool_deck"][:2], "kind": "flat",
+                            "group": "entry", "inferred": True}
     out["dumpster"] = {"label": f"Dumpster pads ({r['dumpster_pads']})", "ft2": r["dumpster_pads"] * r["dumpster_pad_ft2"],
                        "rate": R["walkways"][:2], "kind": "flat", "group": "entry"}
     if "parking_garage" in amen:
         g = 250 * (units or max(20, (footprint or 0) * valuation.M2_TO_FT2 / 400))
         out["garage"] = {"label": "Garaje (losas y rampas)", "ft2": g, "rate": R["garage"][:2], "kind": "garage",
                          "group": "full"}
+    elif "parking_garage" in inferred:
+        out["garage"] = {"label": f"Garaje / estacionamiento ({inferred['parking_garage']['source']})",
+                         "ft2": inferred["parking_garage"]["ft2"], "rate": R["garage"][:2], "kind": "garage",
+                         "group": "full", "inferred": True}
     if "tennis_court" in amen:
         out["courts"] = {"label": "Canchas", "ft2": 7200, "rate": R["courts"][:2], "kind": "flat", "group": "full"}
-    lot = b.get("lot_sqft") or cad.get("lot_sqft")
-    if lot and vertical in ("plaza", "commercial", "clinic") and footprint:
-        out["lot"] = {"label": "Estacionamiento y veredas del lote", "ft2": max(0.0, lot - footprint *
-                      valuation.M2_TO_FT2) * 0.6, "rate": R["lot_hardscape"][:2], "kind": "flat", "group": "entry"}
+    if "parking_lot" in inferred:
+        out["lot"] = {"label": f"Estacionamiento y hardscape del lote ({inferred['parking_lot']['source']})",
+                      "ft2": inferred["parking_lot"]["ft2"], "rate": R["lot_hardscape"][:2], "kind": "lot",
+                      "group": "entry", "inferred": True}
     for v in out.values():
         v["ft2"] = int(round(v["ft2"], -1))
     return out
@@ -107,7 +123,7 @@ def operation(surf: dict[str, dict[str, Any]], keys: Iterable[str] | None = None
             mix = s["ft2"] / 100 * r["facade_mix_gal_100"]
             mix_v += mix
         else:
-            prod = r["garage_ft2_h"] if s["kind"] == "garage" else r["flat_ft2_h"]
+            prod = {"garage": r["garage_ft2_h"], "lot": r["lot_ft2_h"]}.get(s["kind"], r["flat_ft2_h"])
             mix = s["ft2"] / 100 * r["flat_mix_gal_100"]
             mix_f += mix
         h = s["ft2"] / prod
@@ -185,7 +201,7 @@ def _story(rec: dict[str, Any], st: dict, fw: float, inspector: str | None, when
     cad, b = rec.get("cadastre") or {}, rec.get("building") or {}
     sig = next((m for m in rec.get("municipal") or []), None)
     head = " · ".join(x for x in (
-        f"{b.get('levels') or cad.get('floors')} pisos" if (b.get("levels") or cad.get("floors")) else None,
+        f"{b.get('levels') or cad.get('floors')} piso(s)" if (b.get("levels") or cad.get("floors")) else None,
         f"{b.get('units') or cad.get('units')} unidades" if (b.get("units") or cad.get("units")) else None,
         f"construido {cad.get('year_built')}" if cad.get("year_built") else None,
         "costero (salitre)" if b.get("coastal") else None) if x)
@@ -216,7 +232,8 @@ def _story(rec: dict[str, Any], st: dict, fw: float, inspector: str | None, when
         f"{_h(r['setup_hours_per_day'])} h de armado/día) · Hipoclorito (SH {_h(r['sh_concentrate_pct'])}%): "
         f"~{_h(ops['sh_gal'])} gal · surfactante ~{_h(ops['surfactant_oz'] / 128)} gal" + (" · requiere acceso por cuerdas / equipo certificado" if ops["rope"] else "")),
         st["base"]))
-    missing = [x for k, x in (("garage", "garaje"), ("pool_deck", "pool deck")) if k not in surf]
+    missing = [x for k, x in (("garage", "garaje"), ("pool_deck", "pool deck")) if k not in surf
+               and (rec.get("vertical") or "community") == "community"]
     if missing:
         out.append(Paragraph(txt(f"No detectado en registros: {', '.join(missing)} — confirmar en sitio y sumar a "
                                  f"la opción que corresponda."), st["small"]))

@@ -134,13 +134,22 @@ def test_every_engine_output_is_parsed_whole_by_the_crm(case):
         assert parsed["zona"]["finding"] == ("reseñas de 2 edificio(s) vecino(s) dicen que "
                                              + ZONA_SUMMARY["top_weakness_es"])
         assert parsed["zona"]["argument"] == ZONA_SUMMARY["argument"]
-        assert parsed["hook"] == hook_line[: hook_line.index("Zona:")].strip()
+        if "consolidated" not in case:
+            assert parsed["hook"] == hook_line[: hook_line.index("Zona:")].strip()
         assert zona.removeprefix("Zona: ") == parsed["zona"]["text"]
     else:
-        assert parsed["zona"] is None and parsed["hook"] == hook_line
+        assert parsed["zona"] is None
+        if "consolidated" not in case:
+            assert parsed["hook"] == hook_line
     if "consolidated" in case:
-        assert parsed["hook"].startswith("Teléfono = central de Castle Management LLC: al llamar, cotizar también")
-        assert "Tower 4" in parsed["hook"]
+        c = parsed["consolidation"]
+        assert c["firm"] == "Castle Management LLC" and c["moreInPdf"] == 0
+        assert [(x["name"], x["units"]) for x in c["siblings"]] == [(p["name"], p["units"]) for p in lead.portfolio_siblings]
+        assert all(x["signals"] == ["permiso de obra exterior"] for x in c["siblings"])
+        assert c["extraEstimateUsd"] == sum(p["est_high"] for p in lead.portfolio_siblings)
+        assert parsed["hook"] == lead.sales_strategy.split(" Zona: ")[0].replace(c["text"], "").strip()
+    else:
+        assert parsed["consolidation"] is None
     if case in ("full", "zona"):
         assert f["planB"] == "Chief Engineer Carlos Ruiz" and f["planBPhone"] == "+13055550133"
         assert [p["label"] for p in f["otherPhones"]] == ["front desk", "mantenimiento"]
@@ -156,25 +165,39 @@ def test_long_hooks_are_clipped_before_the_ficha_and_the_ficha_survives():
     assert len(text) <= SALES_STRATEGY_MAX
     parsed = parse([text])[0]
     assert parsed["ficha"]["score"] == 92 and parsed["ficha"]["raw"] == lead.brief().removeprefix("Ficha: ")
-    assert parsed["hook"].endswith("…") and parsed["hook"].startswith("Teléfono = central")
+    assert parsed["hook"].endswith("…")
+    assert parsed["consolidation"]["firm"] == "Castle Management LLC" and parsed["consolidation"]["moreInPdf"] == 12 - pc.MAX_LISTED
     assert parsed["zona"]["argument"] == ZONA_SUMMARY["argument"]          # the Zona sentence survives whole
 
 
-def test_old_single_line_payloads_would_have_lost_the_ficha():
-    """Regression: clip() used to join hook and Ficha into one line; the CRM then saw no Ficha."""
+def test_old_single_line_payloads_are_read_the_same_as_the_new_two_line_ones():
+    """Leads imported before the line break fix ("… Zona: … Ficha: …") parse to the same Zona and Ficha."""
     lead = with_zona(full_lead())
     old = " ".join(f"{lead.sales_strategy}\n{lead.brief()}".split())
-    assert parse([old])[0]["ficha"] is None
-    assert parse([lead.crm_payload("x")["sales_strategy"]])[0]["ficha"] is not None
+    new = lead.crm_payload("x")["sales_strategy"]
+    a, b = parse([old, new])
+    assert a["ficha"] == b["ficha"] and a["zona"] == b["zona"] and a["hook"] == b["hook"]
+    assert "\nFicha: " in new                                          # the engine keeps the clean line break
 
 
 def test_vendored_parser_matches_the_crm_when_its_checkout_is_available():
+    """The copy is exactly the commit named in tests/contract/SOURCE; a different CRM main is reported."""
+    import warnings
+
     crm = Path(__file__).resolve().parents[3] / "mbguiaclientes"
     if not (crm / ".git").exists():
         pytest.skip("CRM checkout not next to this repo")
-    r = subprocess.run(["git", "-C", str(crm), "show", "origin/main:src/lib/lead-brief.ts"], capture_output=True,
-                       text=True)
-    if r.returncode:
-        pytest.skip("origin/main of the CRM not fetched")
-    assert r.stdout == (CONTRACT / "lead-brief.ts").read_text(encoding="utf-8"), \
-        "lead-brief.ts changed in the CRM: copy it to tests/contract/ and re-run this contract"
+    commit = (CONTRACT / "SOURCE").read_text().split("@")[1].split()[0]
+    vendored = (CONTRACT / "lead-brief.ts").read_text(encoding="utf-8")
+
+    def show(ref):
+        r = subprocess.run(["git", "-C", str(crm), "show", f"{ref}:src/lib/lead-brief.ts"], capture_output=True,
+                           text=True)
+        return None if r.returncode else r.stdout
+    pinned = show(commit)
+    if pinned is None:
+        pytest.skip(f"CRM commit {commit} not fetched")
+    assert pinned == vendored, "tests/contract/lead-brief.ts differs from the commit in tests/contract/SOURCE"
+    main = show("origin/main")
+    if main is not None and main != vendored:
+        warnings.warn("CRM origin/main has another lead-brief.ts: copy it to tests/contract/ and update SOURCE")

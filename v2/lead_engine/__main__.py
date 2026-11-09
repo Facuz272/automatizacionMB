@@ -87,8 +87,15 @@ def main(argv: list[str] | None = None) -> int:
     ep.add_argument("--pdf", action="store_true")
     ep.add_argument("--pdf-lang", choices=["en", "es"])
     ep.add_argument("--no-ai", action="store_true")
+    pf2 = sub.add_parser("preflight", help="diagnóstico de claves, perfil, padrones y conectividad (OK/PENDIENTE/ERROR)")
+    pf2.add_argument("--offline", action="store_true", help="solo configuración, sin probar la red")
+    ea = sub.add_parser("export-ads", help="audiencia B2B (Meta / Google / LinkedIn) en CSV desde un lote o el padrón")
+    ea.add_argument("source", nargs="?", help="out/<lote>/leads.jsonl (sin argumento: padrón DBPR de la zona)")
+    ea.add_argument("--out", help="archivo CSV (default: junto al lote o out/ads/ads_audience.csv)")
+    ea.add_argument("--min-units", type=int, help="padrón: mínimo de unidades (default MIN_UNITS)")
     dy = sub.add_parser("daily", help="rutina diaria: Pool del CRM → corrida → PDFs + outreach → CRM → Slack")
-    dy.add_argument("--target-pool", type=int, default=40, help="leads disponibles que debe tener el Pool")
+    dy.add_argument("--target-pool", type=int, default=None,
+                    help="leads disponibles que debe tener el Pool (default: pool_target del CRM, si no 40)")
     dy.add_argument("--fallback-limit", type=int, default=10,
                     help="tamaño del lote cuando el CRM no informa cuántos quedan y el Pool no está bajo")
     dy.add_argument("--limit", type=int, help="forzar el tamaño del lote (no consulta el Pool)")
@@ -114,6 +121,25 @@ def main(argv: list[str] | None = None) -> int:
     prof = tenant.use(args.tenant or (None if os.getenv("TENANT") or args.cmd != "daily" else "mb_softwash"))
     if prof:
         logger.info("Perfil de empresa: {}", prof.get("company", {}).get("name") or args.tenant)
+    if args.cmd == "preflight":
+        from . import preflight
+        checks = preflight.run(network=not args.offline)
+        print(preflight.table(checks))
+        return 1 if any(c.status == preflight.ERROR for c in checks) else 0
+    if args.cmd == "export-ads":
+        from pathlib import Path
+
+        from . import ads_export
+        if args.source:
+            src = Path(args.source)
+            rows = ads_export.from_records(json.loads(l) for l in src.read_text(encoding="utf-8").splitlines() if l.strip())
+            out = Path(args.out) if args.out else src.parent / "ads_audience.csv"
+        else:
+            rows = ads_export.from_registry(min_units=args.min_units)
+            out = Path(args.out) if args.out else Path(settings.out_dir) / "ads" / "ads_audience.csv"
+        stats = ads_export.write_csv(rows, out)
+        print(json.dumps({"file": str(out), **stats}, ensure_ascii=False, indent=2))
+        return 0
     if args.cmd == "enrich-phones":
         from .collectors import needs_phone
         rows = needs_phone.read(args.csv)

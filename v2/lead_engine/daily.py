@@ -54,8 +54,14 @@ def fetch_health(timeout: float = 20) -> dict[str, Any] | None:
         return None
 
 
-def batch_size(health: dict[str, Any] | None, target: int, fallback: int) -> tuple[int, str]:
-    """(leads to produce, why)."""
+DEFAULT_TARGET = 40
+
+
+def batch_size(health: dict[str, Any] | None, target: int | None, fallback: int) -> tuple[int, str]:
+    """(leads to produce, why). Without an explicit target the CRM's own `pool_target` is used (else 40)."""
+    if target is None:
+        crm_target = (health or {}).get("pool_target")
+        target = int(crm_target) if isinstance(crm_target, (int, float)) and crm_target > 0 else DEFAULT_TARGET
     if health is None:
         return fallback, "sin lectura del CRM"
     n = pool_count(health)
@@ -226,7 +232,7 @@ def run_mix(total: int, slices: list[dict[str, Any]], *, send: bool, commit: boo
                              pdf_lang="en", extra={"mix": breakdown})
 
 
-def run(*, target_pool: int = 40, fallback_limit: int = 10, limit: int | None = None, strategy: str = "onsite",
+def run(*, target_pool: int | None = None, fallback_limit: int = 10, limit: int | None = None, strategy: str = "onsite",
         sources: list[str] | None = None, commit: bool = False, use_ai: bool = True, out_dir: Path | None = None,
         slack: bool = True, mix: bool | None = None) -> dict[str, Any]:
     from . import pipeline

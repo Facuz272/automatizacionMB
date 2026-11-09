@@ -353,8 +353,8 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
             lead.email, lead.email_source = ap["email"], "apollo"
 
     # Official cadastre + lodging licence, then the business vertical.
-    if lead.source != "pa":                      # cadastre seeds already carry their exact folio
-        lead.cadastre = appraiser.lookup(lead.address) or lead.cadastre
+    if lead.source != "pa" or not lead.cadastre:  # cadastre seeds carry their exact folio (unless re-seeded
+        lead.cadastre = appraiser.lookup(lead.address) or lead.cadastre   # from needs_phone.csv by enrich-phones)
     if use_dbpr:
         lead.lodging = lodging.match(lead.address) or {}
     lead.vertical = verticals.classify(appraiser=lead.cadastre.get("vertical"), source=lead.source,
@@ -388,6 +388,14 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
     lead.building = geo.merge_profile(osm_profile, lead.web_text, lead.address, units)
     lead.building["vertical"] = lead.vertical
     apply_official_building(lead)
+    if not osm_profile:
+        # OSM unavailable (or geo off): garage / pool deck / parking lot inferred from the cadastre & DBPR scale,
+        # labelled as estimates (never listed as observed amenities).
+        inferred = {k: v for k, v in valuation.infer_surfaces(lead.building, lead.cadastre, lead.vertical,
+                                                              hotel=bool(lead.lodging)).items()
+                    if k not in (lead.building.get("amenities") or {})}     # site text already confirmed those
+        if inferred:
+            lead.building["inferred"] = inferred
     lead.estimated_deal = valuation.estimate(lead.building) or {}
 
     # Municipal urgency (open data) + milestone window, then pain + email.
@@ -488,6 +496,8 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
     review_pool: list[dict] = []          # every building seen in this run with reviews (zone competitor intel)
     needs_phone: list[Lead] = []
     municipal_signals.reset()
+    from . import overpass
+    overpass.reset()
     gated: list[tuple[Lead, SiteFacts | None]] = []
     held: list[Lead] = []                 # same firm central phone as a gated lead
     seen_keys: set[str] = set()
@@ -527,7 +537,8 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
         if problem:
             if lead.source in ("dbpr", "pa") and not lead.phone:
                 needs_phone.append(lead)
-                problem = "sin teléfono (semilla DBPR: sin Places/OSM/web con teléfono)"
+                problem = (f"sin teléfono (semilla {'DBPR' if lead.source == 'dbpr' else 'catastral'}: "
+                           f"sin Places/OSM/web con teléfono)")
             reject(lead, problem)
             continue
         if strategy == "pain" and not has_pain(lead):

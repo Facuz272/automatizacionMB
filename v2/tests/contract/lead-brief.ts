@@ -7,14 +7,20 @@
  *   Ficha: <vertical> · <fact> · … · Plan B: <title> <name> [phone] · oficina <hours>
  *          · otros tel.: <label> <number>; <label> <number> · est. US$ 4.5k–7.2k/año · score 72/100
  *
- * "Zona:" is appended to the hook on the same line; "Ficha:" is its own line. Older leads
+ * "Zona:" is appended to the hook on the same line; "Ficha:" is its own line (leads imported before
+ * 2026-11 have it after a space on the same line, which is also accepted). Older leads
  * have neither, so they come back as a plain hook. Pure and total: it never throws.
  */
 
 export type BriefPhone = { label: string; number: string };
+export type BriefSibling = { name: string; street: string | null; units: number | null; signals: string[]; raw: string };
+/** Lead Engine portfolio consolidation (portfolio_consolidation.hook_line): buildings of the same firm
+ *  without their own phone, listed on the lead that carries the firm's central line. */
+export type BriefConsolidation = { firm: string; siblings: BriefSibling[]; moreInPdf: number; extraEstimateUsd: number | null; text: string };
 export type LeadBrief = {
-  /** The hook without the Zona/Ficha metadata. */
+  /** The hook without the Zona/Ficha/consolidation metadata. */
   hook: string;
+  consolidation: BriefConsolidation | null;
   zona: { text: string; finding: string; argument: string | null } | null;
   ficha: {
     raw: string;
@@ -94,15 +100,48 @@ function parseFicha(line: string): NonNullable<LeadBrief["ficha"]> {
   return out;
 }
 
+// "Teléfono = central de <firm>: al llamar, cotizar también en el mismo llamado [a · b – c], … y [x · y – z]
+//  (+N más en el PDF). Potencial extra estimado: hasta US$ 45.000/año."  (items always end with "]")
+const CONSOLIDATION = /Teléfono = central de (.+?): al llamar, cotizar también en el mismo llamado ((?:\[[^\]]*\](?:, | y )?)+)(?: \(\+(\d+) más en el PDF\))?\.(?: Potencial extra estimado: hasta US\$ ([\d.,]+)\/año\.)?/;
+
+function parseSibling(raw: string): BriefSibling {
+  const inner = raw.slice(1, -1);
+  const dot = inner.indexOf(" · ");
+  const name = (dot >= 0 ? inner.slice(0, dot) : inner).trim();
+  const rest = dot >= 0 ? inner.slice(dot + 3) : "";
+  const dash = rest.indexOf(" – ");
+  const street = (dash >= 0 ? rest.slice(0, dash) : rest).trim() || null;
+  const bits = (dash >= 0 ? rest.slice(dash + 3) : "").split(",").map((b) => b.trim()).filter(Boolean);
+  const unitBit = bits.find((b) => /^\d+ un\.$/.test(b));
+  return { name, street, units: unitBit ? Number(unitBit.split(" ")[0]) : null, signals: bits.filter((b) => b !== unitBit), raw };
+}
+
+function parseConsolidation(text: string): { found: BriefConsolidation; rest: string } | null {
+  const m = CONSOLIDATION.exec(text);
+  if (!m) return null;
+  const siblings = (m[2]!.match(/\[[^\]]*\]/g) ?? []).map(parseSibling).filter((x) => x.name);
+  if (!siblings.length) return null;
+  const usd = m[4] ? Number(m[4].replace(/[.,]/g, "")) : null;
+  const rest = (text.slice(0, m.index) + text.slice(m.index + m[0].length)).replace(/\s{2,}/g, " ").trim();
+  return { found: { firm: m[1]!.trim(), siblings, moreInPdf: m[3] ? Number(m[3]) : 0, extraEstimateUsd: usd && Number.isFinite(usd) ? usd : null, text: m[0] }, rest };
+}
+
 export function parseLeadBrief(text: string | null | undefined): LeadBrief {
   const lines = (text ?? "").split(/\r?\n/);
   let ficha: LeadBrief["ficha"] = null;
   let zona: LeadBrief["zona"] = null;
   const hook: string[] = [];
   for (const rawLine of lines) {
-    const line = rawLine.trim();
+    let line = rawLine.trim();
     if (!line) continue;
     if (!ficha && /^Ficha:\s*\S/.test(line)) { ficha = parseFicha(line); continue; }
+    // Leads imported before the engine kept the line break carry " … Ficha: …" at the end of the hook line.
+    const mid = ficha ? -1 : line.search(/\sFicha:\s*\S/);
+    if (mid >= 0) {
+      ficha = parseFicha(line.slice(mid + 1));
+      line = line.slice(0, mid).trim();
+      if (!line) continue;
+    }
     // "Zona:" may start its own line or follow the hook on the same line (" … Zona: …").
     const at = zona ? -1 : line.search(/(^|\s)Zona:\s+\S/);
     if (at >= 0) {
@@ -114,7 +153,11 @@ export function parseLeadBrief(text: string | null | undefined): LeadBrief {
     }
     hook.push(line);
   }
-  return { hook: hook.join("\n"), zona, ficha };
+  let joined = hook.join("\n");
+  let consolidation: BriefConsolidation | null = null;
+  const c = parseConsolidation(joined);
+  if (c) { consolidation = c.found; joined = c.rest; }
+  return { hook: joined, consolidation, zona, ficha };
 }
 
 /** tel: href for a Ficha phone (US numbers get +1). */

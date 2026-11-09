@@ -124,8 +124,11 @@ def deal_rows(lead: dict[str, Any], lang: str = "en") -> list[list[str]] | None:
     if not d:
         return None
     rows = [[t["component"], t["range"]]]
+    inferred = set((d.get("basis") or {}).get("inferred") or [])
+    mark = " (est., to be confirmed on site)" if lang == "en" else " (est., a confirmar en sitio)"
     for k, (lo, hi) in (d.get("components") or {}).items():
-        rows.append([i18n.COMPONENT[lang].get(k, k), f"{usd(lo, lang)} – {usd(hi, lang)}"])
+        label = i18n.COMPONENT[lang].get(k, k) + (mark if {"garage": "parking_garage"}.get(k, k) in inferred else "")
+        rows.append([label, f"{usd(lo, lang)} – {usd(hi, lang)}"])
     rows.append([t["total"], f"{usd(d['low'], lang)} – {usd(d['high'], lang)}"])
     return rows
 

@@ -59,7 +59,10 @@ v2/
 │   ├── outreach_pack.py   email + WhatsApp/SMS en inglés y guion telefónico en español por lote
 │   ├── daily.py           rutina diaria: Pool del CRM → mix de verticales → PDFs + outreach → CRM → Slack
 │   ├── inspector_sheet.py hoja de campo y cotización interna (español) para los inspectores
-│   ├── broward.py         catastro de Broward (tax roll del condado) para el corredor este
+│   ├── broward.py         catastro de Broward (tax roll del condado): lookup y semilla del corredor este
+│   ├── overpass.py        Overpass (OSM) con mirrors, endpoint preferido y corte por corrida
+│   ├── preflight.py       diagnóstico OK / PENDIENTE / ERROR de claves, perfil, padrones y red
+│   ├── ads_export.py      audiencias B2B (Meta / Google / LinkedIn) en CSV
 │   ├── competitor_intel.py  debilidades de la competencia en reseñas de edificios vecinos
 │   ├── route_optimizer.py rutas de inspección por zonas e inspector
 │   ├── geocode.py         geocodificación gratuita (US Census) para leads sin coordenadas
@@ -221,6 +224,25 @@ y cierre). El gancho es el dato verificable más fuerte: ventana Milestone (año
 recertificación o caso abierto, permiso de obra exterior, reseña, y después ft²/unidades. Sin
 nombre de contacto dice "Hi there,"; agenda, teléfono, email y documentos solo si están en el perfil.
 
+### Sin OpenStreetMap: mirrors e inferencia catastral
+
+Overpass se consulta en orden: `OVERPASS_URL`, después `OVERPASS_MIRRORS` (por defecto
+overpass.kumi.systems y lz4.overpass-api.de). Un reset, timeout, 429 o 5xx pasa al siguiente al
+instante (6 s para conectar, 15 s de lectura en los mirrors); el que respondió se usa primero el
+resto de la corrida, y si todos fallan dos veces seguidas Overpass se apaga para esa corrida.
+
+Cuando OSM no da perfil, las superficies se infieren de datos oficiales y quedan marcadas como
+estimación (nunca como amenity observada):
+
+- plazas y comerciales: si el lote catastral es ≥ 1,3× la huella, estacionamiento/hardscape =
+  50 % de (lote − huella), «estimado por lote catastral»;
+- condominios y hoteles con ≥ 6 pisos, ≥ 75 unidades o en la costa: garaje (unidades × 250 ft²) y
+  pool deck / áreas recreativas, «est. por escala catastral — validar en sitio».
+
+Entran en el ticket estimado (`basis.inferred`), el PDF del Property Manager los muestra como «est.,
+to be confirmed on site», y la hoja de campo siempre tiene esas filas, aunque el registro venga de
+un lote viejo o de un export del CRM.
+
 ### Hoja de campo para inspectores (`inspector_sheet`)
 
 Con `--pdf` (y en `pdf` y `route`) se genera, además del brief en inglés para el Property Manager,
@@ -246,10 +268,10 @@ python -m lead_engine daily --target-pool 40            # dry-run contra el CRM
 python -m lead_engine daily --target-pool 40 --commit   # importa
 ```
 
-1. Consulta `GET /api/public/health` del CRM. Si la respuesta trae la cantidad de leads
-   disponibles en el Pool (`pool_available`), el lote es `--target-pool` menos esa cantidad. **El
-   CRM hoy solo devuelve `pool_low` (sí/no)**: con Pool bajo el lote es el objetivo completo; si no,
-   `--fallback-limit` (10). `--limit` fuerza el tamaño.
+1. Consulta `GET /api/public/health` del CRM, que devuelve `pool_available` y `pool_target`: el lote
+   es el objetivo menos los disponibles (objetivo = `--target-pool`, si no el `pool_target` del CRM,
+   si no 40). Con una versión del CRM que solo informe `pool_low`, el lote es el objetivo completo
+   cuando el Pool está bajo y `--fallback-limit` (10) cuando no. `--limit` fuerza el tamaño.
 2. Corre con el perfil `mb_softwash` (o `--tenant`/`TENANT`), salteando lo ya trabajado. Si el
    perfil tiene `daily_mix`, reparte el lote entre verticales (MB Softwash: 35 % condominios
    onsite, 25 % condominios con administradora, 25 % plazas, 10 % edificios comerciales, 5 %
@@ -353,6 +375,17 @@ python -m lead_engine run --seed pa --vertical plaza --limit 20 --dry-run       
 python -m lead_engine run --seed pa --vertical commercial --limit 20 --dry-run   # torres de oficinas, hoteles
 python -m lead_engine run --seed pa --vertical clinic --limit 20 --dry-run       # hospitales
 ```
+
+### Semilla catastral en el este de Broward
+
+`--seed pa --vertical plaza|commercial|clinic` (y las porciones `pa` del mix de `daily`) siembra
+Miami-Dade desde su Property Appraiser y, para las ciudades del corredor que estén en la zona
+(Hallandale, Hollywood, Fort Lauderdale), el tax roll de Broward con los mismos códigos de uso del
+DOR (plazas 11-16, comerciales 17-19 y hoteles 39, hospitales 73/85), un registro por folio, con
+propietario, «%» (administradora), año, ft² construidos y lote. Los dos condados se unen en un solo
+ranking por superficie. Nov-2026: 209 plazas de 20.000+ ft² en el corredor en ~1 s (Galleria Mall,
+Sheridan Plaza, Village at Gulfstream Park, Beach Place…). Sin Google Places, OSM ni búsqueda
+externa no hay teléfono para casi ninguna: quedan en `needs_phone.csv` para `enrich-phones`.
 
 ### Hoteles (DBPR Lodging) y clínicas (NPI Registry)
 
@@ -484,6 +517,37 @@ costo estimado de APIs (total y por lead, precios ajustables con `PRICE_<API>`),
 - **Duplicados**: por `phone_key` (últimos 10 dígitos, igual que el CRM) dentro del lote,
   contra el ledger local y contra el CRM (precheck en dry-run antes de enriquecer).
 
+## Pre-vuelo (`preflight`)
+
+```bash
+python -m lead_engine --tenant mb_softwash preflight            # con red
+python -m lead_engine --tenant mb_softwash preflight --offline  # solo configuración
+```
+
+Tabla OK / PENDIENTE / ERROR de: claves (`GOOGLE_PLACES_API_KEY`, `ANTHROPIC_API_KEY`,
+`CRM_WEBHOOK_SECRET`, búsqueda externa, `SLACK_WEBHOOK_URL`), perfil (agenda, documentos, teléfono,
+email, web), padrones locales (`data/dbpr.db`: condominios, CAM, alojamiento) y conectividad en
+paralelo con timeouts cortos (catastros de Miami-Dade y Broward, recertificación de Miami, permisos,
+Census, NPI, Overpass y sus mirrors). Con las claves cargadas hace un ping liviano a Google Places
+(Text Search pidiendo solo el id), Anthropic (lista de modelos, sin tokens) y `/api/public/health`
+del CRM (estado y Pool). No escribe nada; sale con código 1 solo si algo configurado falla.
+
+## Audiencias para Ads (`export-ads`)
+
+```bash
+python -m lead_engine export-ads out/<lote>/leads.jsonl   # → out/<lote>/ads_audience.csv
+python -m lead_engine export-ads                          # padrón DBPR de la zona → out/ads/ads_audience.csv
+```
+
+Columnas `email, phone, fn, ln, ct, st, zip, country, company, value`, normalizadas como pide Meta
+antes de hashear (minúsculas, nombres sin signos, ciudad sin espacios, estado y país de 2 letras,
+ZIP de 5 dígitos, teléfono E.164); Meta, Google y LinkedIn hashean el archivo en su propia carga.
+`value` es el punto medio del ticket anual estimado. Solo registros dentro de la zona de servicio
+del perfil; se descartan los que no tienen ningún identificador y se unen duplicados (mismo email,
+teléfono o nombre + ZIP). Desde un lote salen el contacto principal (email verificado y teléfono) y
+los demás contactos con nombre; desde el padrón, la persona registrada en el «C/O» con el ZIP del
+edificio (coincidencia solo por nombre + ubicación, menor tasa de match).
+
 ## Contrato con la tarjeta del CRM
 
 `sales_strategy` va en dos líneas, como lo lee `src/lib/lead-brief.ts` del CRM: el gancho (con
@@ -494,8 +558,8 @@ frase de Zona). `tests/test_crm_brief_contract.py` corre el parser del CRM (copi
 tel., consolidación de central de administradora, plazas— y verifica que vuelva cada dato. Si el
 CRM está clonado al lado, el test también avisa cuando su `lead-brief.ts` cambió.
 
-Hasta este cambio el motor mandaba todo en una sola línea, así que los leads ya importados no
-muestran la Ficha en la tarjeta.
+Hasta nov-2026 el motor mandaba todo en una sola línea; el parser del CRM también acepta ese formato
+(«… Ficha: …» después de un espacio), así que los leads viejos muestran la Ficha sin backfill.
 
 ## Qué recibe el CRM
 

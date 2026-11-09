@@ -235,8 +235,8 @@ def test_mb_softwash_profile_carries_the_mix_and_corridor():
 
 
 def test_option_scopes_only_name_detected_surfaces():
-    bare = {"company_name": "Olympus", "address": "500 Three Islands Blvd, Hallandale Beach, FL 33009",
-            "building": {"units": 151, "levels": 12}}
+    bare = {"company_name": "Small Villas", "address": "9280 SW 150th Ave, Miami, FL 33196",
+            "building": {"units": 40, "levels": 3}}                     # below the scale thresholds: nothing inferred
     o1, o2, _ = sheet.options(sheet.surfaces(bare))
     assert o1["scope"].startswith("Aceras y entradas, dumpster pads") and "pool" not in o1["scope"]
     assert o2["scope"] == "Fachada completa + áreas comunes"
