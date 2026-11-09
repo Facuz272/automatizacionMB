@@ -96,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     dy.add_argument("--seed", choices=["dbpr", "pa", "npi"], help="fuente (default: places si hay clave, si no dbpr)")
     dy.add_argument("--commit", action="store_true", help="importar los aceptados al CRM (si no, dry-run)")
     dy.add_argument("--no-slack", action="store_true")
+    dy.add_argument("--no-mix", action="store_true", help="una sola fuente en vez del mix de verticales del perfil")
     dy.add_argument("--no-ai", action="store_true")
     rt = sub.add_parser("route", help="ruta de inspecciones optimizada por zonas")
     rt.add_argument("input", help="leads.jsonl del lote o export del CRM (.csv/.json) con address e inspection_at")
@@ -128,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         from . import daily
         s = daily.run(target_pool=args.target_pool, fallback_limit=args.fallback_limit, limit=args.limit,
                       strategy=args.strategy, sources=[args.seed] if args.seed else None, commit=args.commit,
-                      use_ai=not args.no_ai, slack=not args.no_slack)
+                      use_ai=not args.no_ai, slack=not args.no_slack, mix=False if args.no_mix else None)
         print(json.dumps(s, ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "portfolios":
@@ -157,7 +158,13 @@ def main(argv: list[str] | None = None) -> int:
         out = Path(args.out) if args.out else src.parent / "pdf"
         files = pdf_generator.generate_batch(pdf_generator.load_jsonl(src), out, top=args.top, min_score=args.min_score,
                                               lang=args.lang)
-        print(f"{len(files)} PDF en {out}/")
+        from . import inspector_sheet
+        recs = pdf_generator.load_jsonl(src)
+        if args.top:
+            recs = sorted(recs, key=lambda r: -(r.get("lead_score") or 0))[:args.top]
+        sheets = inspector_sheet.generate_batch([r for r in recs if (r.get("lead_score") or 0) >= args.min_score],
+                                                out.parent / "campo")
+        print(f"{len(files)} PDF en {out}/ · {len(sheets)} hojas de campo en {out.parent / 'campo'}/")
         return 0
     if args.cmd == "route":
         return _route(args)
@@ -230,9 +237,10 @@ def _route(args) -> int:
     stem = f"ruta_{plan.day.isoformat()}"
     (out / f"{stem}.md").write_text(ro.to_markdown(plan), encoding="utf-8")
     ro.to_csv(plan, out / f"{stem}.csv")
+    sheets = ro.field_sheets(plan, out, stem)
     (out / f"{stem}.json").write_text(json.dumps(ro.to_json(plan), ensure_ascii=False, indent=2), encoding="utf-8")
     print(ro.to_markdown(plan))
-    print(f"Archivos: {out}/{stem}.md · .csv · .json")
+    print(f"Archivos: {out}/{stem}.md · .csv · .json" + (f" · {len(sheets)} hoja(s) de campo" if sheets else ""))
     return 0
 
 

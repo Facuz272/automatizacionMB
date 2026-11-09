@@ -93,6 +93,13 @@ class Settings:
     allow_mgmt_firm_phone: bool = field(default_factory=lambda: _bool("ALLOW_MGMT_FIRM_PHONE", False))
     # Phones the tenant verified itself: {"Firm name": "+1…"} (override the website lookup)
     mgmt_phones: dict = field(default_factory=dict)
+    # city -> allowed ZIPs (east/coastal corridor); records of that city outside them are out of the area
+    zip_restrictions: dict = field(default_factory=dict)
+    # inspector_sheet.FIELD_DEFAULTS overrides (production rates, mixes, crew, floor price, annual discount)
+    field_rates: dict = field(default_factory=dict)
+    # `daily` multi-vertical mix: [{"name", "share", "seed": dbpr|pa|npi, "strategy", "vertical"?}, …]
+    daily_mix: list = field(default_factory=list)
+    exclude_zips: list = field(default_factory=list)
     # Per-strategy city lists from a tenant profile (wins over TARGET_CITIES env)
     target_cities: dict = field(default_factory=dict)
     tenant: str | None = field(default_factory=lambda: os.getenv("TENANT") or None)

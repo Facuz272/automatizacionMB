@@ -317,7 +317,9 @@ def stop_from_record(r: dict[str, Any]) -> Stop | None:
                 when=_parse_when(r.get("inspection_at") or r.get("when")), inspector=r.get("inspector") or None,
                 phone=r.get("phone") or None, contact=r.get("contact_name") or None,
                 ref=r.get("source_id") or r.get("id") or None,
-                extra={k: r.get(k) for k in ("lead_score", "estimated_deal") if r.get(k)})
+                extra={**{k: r.get(k) for k in ("lead_score", "estimated_deal") if r.get(k)},
+                       # full engine record (leads.jsonl) → the inspector's field sheet has the building facts
+                       **({"record": r} if r.get("building") or r.get("cadastre") else {})})
 
 
 def load(path: str | Path) -> list[Stop]:
@@ -331,6 +333,23 @@ def load(path: str | Path) -> list[Stop]:
     else:
         rows = list(csv.DictReader(text.splitlines()))
     return [s for s in (stop_from_record(r) for r in rows) if s]
+
+
+def field_sheets(plan: Plan, out_dir: str | Path, stem: str) -> list[Path]:
+    """One PDF per inspector with the field & costing sheet of each visit, in route order."""
+    from . import inspector_sheet
+
+    files = []
+    for insp, legs in plan.routes.items():
+        if not legs:
+            continue
+        recs = [l.stop.extra.get("record") or {"company_name": l.stop.name, "address": l.stop.address,
+                                                "phone": l.stop.phone, "contact_name": l.stop.contact} for l in legs]
+        whens = [l.arrive.strftime("%d/%m %H:%M") + ("" if l.scheduled else " (sugerida)") for l in legs]
+        from .pdf_common import safe_filename
+        files.append(inspector_sheet.build(recs, Path(out_dir) / f"{stem}_{safe_filename(insp)}_campo.pdf",
+                                           inspector=insp, whens=whens))
+    return files
 
 
 def to_markdown(plan: Plan) -> str:

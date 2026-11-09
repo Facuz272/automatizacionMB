@@ -15,7 +15,7 @@ exposure, labelled phones, lead_score). The full record stays in leads.jsonl.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 
 from .normalize import clip
@@ -62,6 +62,34 @@ def roof_es(roof: str) -> str:
 def fmt_int(n: float | int) -> str:
     """12345 -> '12.345' (es-AR style thousands)."""
     return f"{int(round(n)):,}".replace(",", ".")
+
+
+SALES_STRATEGY_MAX = 2000      # optText(2000) in the CRM import schema
+MIN_HOOK = 600
+
+
+def fit_hook(hook: str | None, limit: int) -> str:
+    """One line within `limit`; a trailing "Zona: …" sentence is kept whole and the text before it is clipped."""
+    text = " ".join((hook or "").split())
+    if len(text) <= limit:
+        return text
+    at = text.rfind(" Zona: ")
+    if at > 0 and len(text) - at < limit // 2:
+        zona = text[at + 1:]
+        return f"{clip(text[:at], limit - len(zona) - 1)} {zona}"
+    return clip(text, limit) or ""
+
+
+def fit_brief(brief: str, limit: int) -> str:
+    """Drop whole facts (from the end, keeping the score) until the Ficha line fits."""
+    if len(brief) <= limit:
+        return brief
+    head, _, body = brief.partition(": ")
+    facts = body.split(" · ")
+    score = facts.pop() if facts and facts[-1].startswith("score ") else None
+    while facts and len(f"{head}: " + " · ".join(facts + ([score] if score else []))) > limit:
+        facts.pop()
+    return f"{head}: " + " · ".join(facts + ([score] if score else [])) if facts or score else ""
 
 
 @dataclass
@@ -243,6 +271,12 @@ class Lead:
             parts.append(f"score {self.lead_score}/100")
         return "Ficha: " + " · ".join(parts) if parts else ""
 
+    @classmethod
+    def from_record(cls, d: dict[str, Any]) -> "Lead":
+        """Inverse of internal_record() (leads.jsonl row → Lead); unknown keys are ignored."""
+        names = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in names})
+
     def internal_record(self) -> dict[str, Any]:
         d = asdict(self)
         d.pop("web_text", None)
@@ -254,8 +288,11 @@ class Lead:
         management = self.management_company
         if not management and self.management_type in ("onsite", "self_managed"):
             management = MANAGEMENT_LABEL[self.management_type].capitalize()
-        hook = (self.sales_strategy or "").strip()
-        brief = self.brief() if include_brief else ""
+        # Contract with the CRM card (mbguiaclientes src/lib/lead-brief.ts): the hook (with an inline
+        # "Zona: …") on the first line, "Ficha: …" alone on the second. The Ficha is never cut mid-fact:
+        # it gets its room first and the hook is clipped to what is left of the 2000 characters.
+        brief = fit_brief(self.brief() if include_brief else "", SALES_STRATEGY_MAX - MIN_HOOK - 1)
+        hook = fit_hook(self.sales_strategy, SALES_STRATEGY_MAX - (len(brief) + 1 if brief else 0))
         text = "\n".join(p for p in (hook, brief) if p)
         from .config import settings as _settings
         from .verticals import label as vertical_label
@@ -276,7 +313,7 @@ class Lead:
             "maps_url": clip(self.maps_url, 500),
             "google_rating": self.google_rating,
             "total_reviews": self.total_reviews,
-            "sales_strategy": clip(text, 2000),
+            "sales_strategy": text or None,
             "properties_count": self.properties_count if self.properties_count and self.properties_count > 0 else None,
             "source": clip(f"{source}:{self.source}", 60),
             "import_batch_id": batch_id,

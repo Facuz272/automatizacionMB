@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from typing import Iterator
+from typing import Iterator, NamedTuple
 
 from ..config import cities_for, settings
 from ..dbpr import _short_condo_name, _title_case, address_key, connect, match
@@ -56,16 +56,37 @@ ZIP_POSTAL_OK = {
     "MIAMI", "MIAMI BEACH", "NORTH MIAMI BEACH", "HOLLYWOOD", "FORT LAUDERDALE", "FT LAUDERDALE", "FT. LAUDERDALE",
     "HALLANDALE", "HALLANDALE BEACH", "SUNNY ISLES", "SUNNY ISLES BEACH", "BAY HARBOR ISLANDS", "BAY HARBOR ISLAND",
     "TOWN OF BAY HARBOR", "BAL HARBOUR", "SURFSIDE", "KEY BISCAYNE", "FISHER ISLAND", "CORAL GABLES", "DORAL",
-    "AVENTURA", "COCONUT GROVE", "NORTH BAY VILLAGE", "BRICKELL", "EDGEWATER",
+    "AVENTURA", "COCONUT GROVE", "NORTH BAY VILLAGE", "BRICKELL", "EDGEWATER", "HOLLYWOOD BEACH",
 }
 
 
-def in_area(postal_city: str | None, zip_code: str | None, area: tuple[set[str], set[str]]) -> bool:
-    names, zips = area
+class Area(NamedTuple):
+    names: set[str]                    # postal cities matched by name
+    zips: set[str]                     # ZIP aliases (neighbourhoods, restricted cities)
+    restricted: dict[str, set[str]]    # canonical city -> the only ZIPs it may use
+    exclude: set[str]                  # never in the area
+
+
+_CANON = {"FT LAUDERDALE": "FORT LAUDERDALE", "FT. LAUDERDALE": "FORT LAUDERDALE", "HALLANDALE": "HALLANDALE BEACH",
+          "HOLLYWOOD BEACH": "HOLLYWOOD", "HOLLYWOOD FL": "HOLLYWOOD"}
+
+
+def canon_city(c: str | None) -> str:
+    n = _norm_city(c or "")
+    return _CANON.get(n, n)
+
+
+def in_area(postal_city: str | None, zip_code: str | None, area: Area) -> bool:
+    z = (zip_code or "")[:5]
+    if z in area.exclude:
+        return False
     city = _norm_city(postal_city or "")
-    if city in names:
+    canon = _CANON.get(city, city)
+    if canon in area.restricted:                     # e.g. Fort Lauderdale: only its east-corridor ZIPs
+        return z in area.restricted[canon]
+    if city in area.names:
         return True
-    return (zip_code or "")[:5] in zips and (not city or city in ZIP_POSTAL_OK)
+    return z in area.zips and (not city or city in ZIP_POSTAL_OK)
 
 
 def _norm_city(c: str) -> str:
@@ -73,14 +94,21 @@ def _norm_city(c: str) -> str:
     return re.sub(r"\s+", " ", c)
 
 
-def area_filter(cities: list[str]) -> tuple[set[str], set[str]]:
-    """(DBPR postal cities, ZIPs) that cover the target names."""
+def area_filter(cities: list[str], restrictions: dict | None = None, exclude: list | None = None) -> Area:
+    """Postal cities, ZIP aliases and ZIP restrictions that cover the target names (tenant
+    `zip_restrictions` / `exclude_zips` by default)."""
+    restrictions = settings.zip_restrictions if restrictions is None else restrictions
+    exclude = settings.exclude_zips if exclude is None else exclude
+    restricted = {canon_city(k): {str(z)[:5] for z in v} for k, v in (restrictions or {}).items()}
     names, zips = set(), set()
     for c in cities:
         n = _norm_city(c)
+        if _CANON.get(n, n) in restricted:
+            zips |= restricted[_CANON.get(n, n)]
+            continue
         names.add(n)
         zips |= CITY_ZIPS.get(n, set())
-    return names, zips
+    return Area(names, zips, restricted, {str(z)[:5] for z in exclude or []})
 
 
 def classify(route_type: str) -> str | None:

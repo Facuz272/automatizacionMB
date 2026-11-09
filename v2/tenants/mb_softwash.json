@@ -12,21 +12,150 @@
   "brand_color": "#0E5A8A",
   "pdf_lang": "en",
   "target_cities": {
-    "onsite": ["Miami Beach", "Sunny Isles Beach", "Aventura", "Brickell Miami", "Key Biscayne", "Bal Harbour",
-               "North Miami Beach", "Hallandale Beach", "Hollywood FL", "Fort Lauderdale"],
-    "portfolio": ["Miami", "Doral", "Coral Gables", "Aventura", "Fort Lauderdale", "Hialeah"]
+    "onsite": [
+      "Miami Beach",
+      "Sunny Isles Beach",
+      "Aventura",
+      "Brickell Miami",
+      "Key Biscayne",
+      "Bal Harbour",
+      "North Miami Beach",
+      "Hallandale Beach",
+      "Hollywood FL",
+      "Fort Lauderdale"
+    ],
+    "portfolio": [
+      "Miami",
+      "Doral",
+      "Coral Gables",
+      "Aventura",
+      "Fort Lauderdale",
+      "Hialeah"
+    ]
   },
+  "zip_restrictions": {
+    "Fort Lauderdale": [
+      "33301",
+      "33304",
+      "33305",
+      "33306",
+      "33308",
+      "33309",
+      "33311",
+      "33312",
+      "33315",
+      "33316",
+      "33334"
+    ],
+    "Hollywood FL": [
+      "33019",
+      "33020",
+      "33021"
+    ],
+    "Hallandale Beach": [
+      "33009"
+    ]
+  },
+  "exclude_zips": [
+    "33325",
+    "33326",
+    "33327",
+    "33330",
+    "33331",
+    "33332"
+  ],
   "min_units": 50,
   "valuation_rates": {
-    "facade": [0.12, 0.22, 1.0],
-    "walkways": [0.10, 0.18, 4.0],
-    "garage": [0.08, 0.15, 2.0],
-    "pool_deck": [0.15, 0.25, 4.0],
-    "courts": [0.10, 0.18, 2.0],
-    "lot_hardscape": [0.04, 0.08, 4.0]
+    "facade": [
+      0.12,
+      0.22,
+      1.0
+    ],
+    "walkways": [
+      0.1,
+      0.18,
+      4.0
+    ],
+    "garage": [
+      0.08,
+      0.15,
+      2.0
+    ],
+    "pool_deck": [
+      0.15,
+      0.25,
+      4.0
+    ],
+    "courts": [
+      0.1,
+      0.18,
+      2.0
+    ],
+    "lot_hardscape": [
+      0.04,
+      0.08,
+      4.0
+    ]
   },
-  "pvp_tiers": [[3, 5], [10, 8], [25, 12]],
+  "pvp_tiers": [
+    [
+      3,
+      5
+    ],
+    [
+      10,
+      8
+    ],
+    [
+      25,
+      12
+    ]
+  ],
   "allow_mgmt_firm_phone": false,
   "mgmt_phones": {},
-  "inspectors": ["Tomás", "Mateo"]
+  "inspectors": [
+    "Tomás",
+    "Mateo"
+  ],
+  "daily_mix": [
+    {
+      "name": "condos_onsite",
+      "share": 0.35,
+      "seed": "dbpr",
+      "strategy": "onsite"
+    },
+    {
+      "name": "condos_portfolio",
+      "share": 0.25,
+      "seed": "dbpr",
+      "strategy": "portfolio"
+    },
+    {
+      "name": "plazas",
+      "share": 0.25,
+      "seed": "pa",
+      "vertical": "plaza",
+      "strategy": "onsite"
+    },
+    {
+      "name": "comerciales",
+      "share": 0.1,
+      "seed": "pa",
+      "vertical": "commercial",
+      "strategy": "onsite"
+    },
+    {
+      "name": "clinicas",
+      "share": 0.05,
+      "seed": "npi",
+      "strategy": "onsite"
+    }
+  ],
+  "field_rates": {
+    "crew_size": 3,
+    "hours_per_day": 8,
+    "min_job_usd": 1500,
+    "annual_discount_pct": 10,
+    "maintenance_visits_per_year": 2
+  }
 }

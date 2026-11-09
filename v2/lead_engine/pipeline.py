@@ -596,6 +596,21 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
     apply_competitor_intel(accepted, review_pool)
     accepted = scoring.rank(accepted)
 
+    return finalize(out, batch_id, strategy, accepted, rejected, needs_phone=needs_phone, send=send, commit=commit,
+                    make_pdfs=make_pdfs, pdf_lang=pdf_lang, ledger=ledger, client=client,
+                    extra={"skipped_seen_in_earlier_runs": skipped_seen})
+
+
+def finalize(out: Path, batch_id: str, strategy: str, accepted: list[Lead], rejected: list[dict], *,
+             needs_phone: list[Lead] | None = None, send: bool = False, commit: bool = False, make_pdfs: bool = False,
+             pdf_lang: str | None = None, ledger: Ledger | None = None, client: crm_importer.CrmClient | None = None,
+             extra: dict | None = None) -> Path:
+    """Steps 6-7 of a batch (shared by run() and the daily multi-vertical mix): leads.jsonl, rejected.jsonl,
+    needs_phone.csv, crm_payload.json, CRM send, PDFs + field sheets, outreach pack, quality report."""
+    ledger = ledger or Ledger()
+    client = client or crm_importer.CrmClient()
+    extra = extra or {}
+    skipped_seen = extra.get("skipped_seen_in_earlier_runs", 0)
     # ── 6: output ─────────────────────────────────────────────────────────────
     payloads = [l.crm_payload(batch_id, include_brief=settings.crm_include_brief) for l in accepted]
     with open(out / "leads.jsonl", "w", encoding="utf-8") as fh:
@@ -630,8 +645,10 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
     pdfs: list[Path] = []
     if make_pdfs and accepted:
         from . import pdf_generator
-        pdfs = pdf_generator.generate_batch(
-            [{**l.internal_record(), "import_batch_id": batch_id} for l in accepted], out / "pdf", lang=pdf_lang)
+        recs = [{**l.internal_record(), "import_batch_id": batch_id} for l in accepted]
+        pdfs = pdf_generator.generate_batch(recs, out / "pdf", lang=pdf_lang)
+        from . import inspector_sheet
+        inspector_sheet.generate_batch(recs, out / "campo")      # internal Spanish field & costing sheets
 
     if accepted:
         from . import outreach_pack
@@ -640,7 +657,7 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
     qr = quality.build(batch_id, strategy, accepted, rejected)
     qr["pdfs"] = len(pdfs)
     qr["consolidated_siblings"] = sum(len(l.portfolio_siblings) for l in accepted)
-    qr["skipped_seen_in_earlier_runs"] = skipped_seen
+    qr.update(extra)
     if skipped_seen:
         logger.info("{} edificios ya trabajados en corridas anteriores fueron salteados (--ignore-seen para incluirlos)",
                     skipped_seen)

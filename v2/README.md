@@ -57,7 +57,9 @@ v2/
 │   ├── tenant.py          perfiles de empresa white-label (tenants/<slug>.json)
 │   ├── portfolio_consolidation.py  un teléfono central, varios edificios: se cotizan en la misma llamada
 │   ├── outreach_pack.py   email + WhatsApp/SMS en inglés y guion telefónico en español por lote
-│   ├── daily.py           rutina diaria: Pool del CRM → corrida → PDFs + outreach → CRM → Slack
+│   ├── daily.py           rutina diaria: Pool del CRM → mix de verticales → PDFs + outreach → CRM → Slack
+│   ├── inspector_sheet.py hoja de campo y cotización interna (español) para los inspectores
+│   ├── broward.py         catastro de Broward (tax roll del condado) para el corredor este
 │   ├── competitor_intel.py  debilidades de la competencia en reseñas de edificios vecinos
 │   ├── route_optimizer.py rutas de inspección por zonas e inspector
 │   ├── geocode.py         geocodificación gratuita (US Census) para leads sin coordenadas
@@ -173,14 +175,22 @@ Deja `out/portfolios/<fecha>/ranking.csv`, `ranking.json` (con los edificios) y,
 dossier ejecutivo de 2 páginas por firma: KPIs del portafolio, propiedades más urgentes, propuesta
 de *Preferred Vendor Program* con las escalas del perfil (`pvp_tiers`), piloto sugerido, próximos
 pasos y QR. Corrida de nov-2026 con el perfil `mb_softwash` (solo su zona): FirstService
-Residential 38 edificios / 5.777 unidades (82 / 16.380 en todo el padrón); Castle Management 8
-edificios, 2 de 5 analizados en ventana Milestone. Seacrest y Campbell, casi todo Palm Beach, salen
+Residential 37 edificios / 5.728 unidades (82 / 16.380 en todo el padrón); Castle Management 6
+edificios (sin Bonaventure ni el oeste de Broward), 2 de 5 analizados en ventana Milestone. Seacrest y Campbell, casi todo Palm Beach, salen
 del top 15.
 
-Las capas oficiales en vivo (catastro y municipio) cubren Miami-Dade. Para Hollywood y Hallandale
-Beach se probó la capa estatal de parcelas FDOR (Florida Statewide Cadastral): en nov-2026 tarda
-~55 s por consulta y responde con error, así que no se usa; esos edificios entran al ranking sin
-señales en vivo.
+**Corredor este de Broward.** En el perfil, `zip_restrictions` limita Fort Lauderdale, Hollywood y
+Hallandale Beach a sus códigos postales costeros/este (Fort Lauderdale: 33301, 33304-33306, 33308,
+33309, 33311, 33312, 33315, 33316, 33334; Hollywood: 33019-33021; Hallandale: 33009) y
+`exclude_zips` saca siempre el oeste lejano (33325-33327, 33330-33332: Bonaventure, Weston). Vale
+para el ranking de portafolios, la semilla DBPR y la semilla del catastro.
+
+**Catastro en vivo.** Miami-Dade: Property Appraiser + capas municipales. Este de Broward: tax roll
+del Broward County Property Appraiser (capa pública de Broward County GIS con todos los folios,
+unidades de condominio incluidas; ~0,5 s por consulta en nov-2026): año de construcción, unidades
+y pisos por números de unidad, así que la ventana Milestone también se calcula ahí. Cada consulta
+tiene 5 s de tope y el primer error o demora la desactiva por el resto de la corrida. La capa
+estatal FDOR se descartó (~55 s por consulta).
 
 ### Un teléfono central, varios edificios (`portfolio_consolidation`)
 
@@ -211,6 +221,24 @@ y cierre). El gancho es el dato verificable más fuerte: ventana Milestone (año
 recertificación o caso abierto, permiso de obra exterior, reseña, y después ft²/unidades. Sin
 nombre de contacto dice "Hi there,"; agenda, teléfono, email y documentos solo si están en el perfil.
 
+### Hoja de campo para inspectores (`inspector_sheet`)
+
+Con `--pdf` (y en `pdf` y `route`) se genera, además del brief en inglés para el Property Manager,
+una hoja interna en español por edificio (`out/<lote>/campo/<edificio>_campo.pdf`; en `route`, un
+PDF por inspector con sus visitas en orden: `ruta_<fecha>_<inspector>_campo.pdf`):
+
+- superficies (ft²) con la misma geometría de `valuation.py`: fachada, aceras/entradas, garaje,
+  pool deck, dumpster pads, canchas, estacionamiento del lote; las no detectadas se marcan para
+  confirmar en sitio;
+- operación: horas de cuadrilla por superficie, jornadas, galones de mezcla, hipoclorito al 12,5 %
+  y surfactante, acceso por cuerdas desde 8 pisos;
+- tres opciones para cerrar en el lugar: 1) Entrada/Horizontal (con precio piso), 2) Completa /
+  Milestone, 3) Contrato Anual Preferente (opción 2 + mantenimientos semestrales de alto tránsito
+  con descuento; nunca más barato que la opción 2), con equivalente mensual.
+
+Rendimientos, mezclas, cuadrilla, precio piso y descuento son valores de referencia
+(`inspector_sheet.FIELD_DEFAULTS`) que el perfil ajusta con `field_rates`.
+
 ### Rutina diaria (`daily`)
 
 ```bash
@@ -222,8 +250,13 @@ python -m lead_engine daily --target-pool 40 --commit   # importa
    disponibles en el Pool (`pool_available`), el lote es `--target-pool` menos esa cantidad. **El
    CRM hoy solo devuelve `pool_low` (sí/no)**: con Pool bajo el lote es el objetivo completo; si no,
    `--fallback-limit` (10). `--limit` fuerza el tamaño.
-2. Corre con el perfil `mb_softwash` (o `--tenant`/`TENANT`), salteando lo ya trabajado, con PDFs en
-   inglés con QR y outreach pack.
+2. Corre con el perfil `mb_softwash` (o `--tenant`/`TENANT`), salteando lo ya trabajado. Si el
+   perfil tiene `daily_mix`, reparte el lote entre verticales (MB Softwash: 35 % condominios
+   onsite, 25 % condominios con administradora, 25 % plazas, 10 % edificios comerciales, 5 %
+   clínicas NPI); cada porción corre por separado, lo que falte se completa con la primera, y el
+   lote final se une, se deduplica por teléfono y se ordena por `lead_score` y ticket antes de los
+   PDFs, las hojas de campo, el outreach pack y el CRM. `--seed` o `--no-mix` vuelven a una sola
+   fuente.
 3. `--commit` importa los aceptados; si no, dry-run.
 4. Con `SLACK_WEBHOOK_URL`, resumen: leads inyectados, valor anual del lote, top 3 con su señal y la
    carpeta de PDFs. También queda en `out/<lote>/daily_summary.json`.
@@ -450,6 +483,19 @@ costo estimado de APIs (total y por lead, precios ajustables con `PRICE_<API>`),
   todo funciona igual con reglas.
 - **Duplicados**: por `phone_key` (últimos 10 dígitos, igual que el CRM) dentro del lote,
   contra el ledger local y contra el CRM (precheck en dry-run antes de enriquecer).
+
+## Contrato con la tarjeta del CRM
+
+`sales_strategy` va en dos líneas, como lo lee `src/lib/lead-brief.ts` del CRM: el gancho (con
+«Zona: …» al final de la misma línea) y debajo «Ficha: …». La Ficha nunca se corta a mitad de un
+dato: tiene prioridad dentro de los 2000 caracteres y se recorta el gancho (conservando entera la
+frase de Zona). `tests/test_crm_brief_contract.py` corre el parser del CRM (copia en
+`tests/contract/lead-brief.ts`, con Node) sobre salidas reales del motor —Zona, Plan B, otros
+tel., consolidación de central de administradora, plazas— y verifica que vuelva cada dato. Si el
+CRM está clonado al lado, el test también avisa cuando su `lead-brief.ts` cambió.
+
+Hasta este cambio el motor mandaba todo en una sola línea, así que los leads ya importados no
+muestran la Ficha en la tarjeta.
 
 ## Qué recibe el CRM
 

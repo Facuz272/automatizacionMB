@@ -21,7 +21,7 @@ from .. import appraiser, costs
 from ..config import cities_for, settings
 from ..dbpr import _title_case
 from ..models import Lead
-from .dbpr_seed import CITY_ZIPS, _norm_city
+from .dbpr_seed import area_filter
 
 DOR_WHERE = {
     "plaza": "(DOR_CODE_CUR LIKE '11%' OR DOR_CODE_CUR LIKE '15%' OR DOR_CODE_CUR LIKE '16%')",
@@ -32,11 +32,9 @@ NAME = {"plaza": "Shopping/Plaza", "commercial": "Edificio comercial", "clinic":
 
 
 def where_clause(vertical: str, cities: list[str], min_sqft: int) -> str:
-    names, zips = set(), set()
-    for c in cities:
-        n = _norm_city(c)
-        names.add(n.title().replace("'", "''"))
-        zips |= CITY_ZIPS.get(n, set())
+    area = area_filter(cities)
+    names = {n.title().replace("'", "''") for n in area.names}
+    zips = set(area.zips) - area.exclude
     area = " OR ".join([f"TRUE_SITE_CITY = '{n}'" for n in sorted(names)] +
                        [f"TRUE_SITE_ZIP_CODE LIKE '{z}%'" for z in sorted(zips)])
     return (f"{DOR_WHERE[vertical]} AND CONDO_FLAG <> 'Y' AND BUILDING_ACTUAL_AREA >= {int(min_sqft)}"

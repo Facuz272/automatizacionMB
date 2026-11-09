@@ -91,6 +91,7 @@ def summary(out: Path, committed: bool) -> dict[str, Any]:
         "top": [{"name": l.get("company_name"), "address": l.get("address"), "score": l.get("lead_score"),
                  "signal": _signal_es(l), "est_high": (l.get("estimated_deal") or {}).get("high")} for l in top],
         "pdf_dir": str(out / "pdf"), "outreach_pack": str(out / "outreach_pack.md"),
+        "field_sheets": str(out / "campo"), "mix": qr.get("mix"),
     }
 
 
@@ -102,6 +103,8 @@ def slack_text(s: dict[str, Any], why: str) -> str:
             f"Motivo del tamaño: {why}. Sin teléfono: {s['needs_phone']}"
             + (f" · edificios consolidados en llamadas de administradora: {s['consolidated_siblings']}"
                if s["consolidated_siblings"] else ""))
+    if s.get("mix"):
+        head += "\nMix: " + " · ".join(f"{k} {v['accepted']}/{v['quota']}" for k, v in s["mix"].items())
     tops = "\n".join(f"{i}. *{t['name']}* ({t['address']}) — {t['signal']}"
                      + (f" · hasta {money(t['est_high'])}/año" if t.get("est_high") else "")
                      for i, t in enumerate(s["top"], 1))
@@ -121,9 +124,111 @@ def post_slack(text: str, url: str | None = None) -> bool:
         return False
 
 
+# ── multi-vertical mix ──────────────────────────────────────────────────────
+
+SEEDS = {"dbpr", "pa", "npi", "places", "osm"}
+
+
+def validate_mix(slices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out = []
+    for i, sl in enumerate(slices):
+        if sl.get("seed") not in SEEDS or not (sl.get("share") or 0) > 0:
+            raise ValueError(f"daily_mix[{i}]: hace falta seed ({'/'.join(sorted(SEEDS))}) y share > 0")
+        if sl["seed"] == "pa" and sl.get("vertical") not in ("plaza", "commercial", "clinic"):
+            raise ValueError(f"daily_mix[{i}]: seed pa requiere vertical plaza|commercial|clinic")
+        out.append({"name": sl.get("name") or f"{sl['seed']}-{sl.get('vertical') or sl.get('strategy', 'onsite')}",
+                    "share": float(sl["share"]), "seed": sl["seed"], "strategy": sl.get("strategy") or "onsite",
+                    "vertical": sl.get("vertical")})
+    return out
+
+
+def quotas(total: int, slices: list[dict[str, Any]]) -> list[int]:
+    """Largest-remainder split of `total` by share (sums exactly to total)."""
+    weight = sum(s["share"] for s in slices) or 1
+    raw = [total * s["share"] / weight for s in slices]
+    q = [int(x) for x in raw]
+    for i in sorted(range(len(raw)), key=lambda i: -(raw[i] - q[i]))[: total - sum(q)]:
+        q[i] += 1
+    return q
+
+
+def _with_vertical(vertical: str | None):
+    from contextlib import contextmanager
+
+    from . import pipeline
+
+    @contextmanager
+    def cm():
+        target = pipeline.settings
+        before = target.seed_vertical
+        if vertical:
+            object.__setattr__(target, "seed_vertical", vertical)
+        try:
+            yield
+        finally:
+            object.__setattr__(target, "seed_vertical", before)
+    return cm()
+
+
+def run_mix(total: int, slices: list[dict[str, Any]], *, send: bool, commit: bool, use_ai: bool = True,
+            out_dir: Path | None = None) -> Path:
+    """Each slice runs as its own collection (no CRM send, no PDFs) in out/<mix>/slices/, then the accepted
+    leads are merged, de-duplicated by phone, ranked by lead_score and ticket, and finalized as ONE batch:
+    PDFs, field sheets, outreach pack, CRM payload/import, quality report with the per-slice breakdown."""
+    import csv
+
+    from . import pipeline, scoring
+    from .models import Lead
+    from .normalize import phone_key
+
+    slices = validate_mix(slices)
+    batch_id = pipeline.new_batch_id("mix")
+    out = Path(out_dir or settings.out_dir) / batch_id
+    out.mkdir(parents=True, exist_ok=True)
+    leads: list[Lead] = []
+    rejected: list[dict] = []
+    np_rows: list[dict] = []
+    breakdown: dict[str, dict[str, Any]] = {}
+
+    def one(sl: dict[str, Any], n: int) -> None:
+        with _with_vertical(sl["vertical"]):
+            o = pipeline.run(strategy=sl["strategy"], limit=n, sources=[sl["seed"]], use_ai=use_ai, send=False,
+                             out_dir=out / "slices", make_pdfs=False)
+        got = [Lead.from_record(json.loads(l)) for l in (o / "leads.jsonl").read_text(encoding="utf-8").splitlines()
+               if l.strip()]
+        leads.extend(got)
+        rejected.extend(json.loads(l) for l in (o / "rejected.jsonl").read_text(encoding="utf-8").splitlines() if l.strip())
+        if (o / "needs_phone.csv").exists():
+            np_rows.extend(csv.DictReader(open(o / "needs_phone.csv", encoding="utf-8")))
+        b = breakdown.setdefault(sl["name"], {"quota": 0, "accepted": 0, "batches": []})
+        b["quota"] += n
+        b["accepted"] += len(got)
+        b["batches"].append(o.name)
+
+    for sl, q in zip(slices, quotas(total, slices)):
+        if q > 0:
+            one(sl, q)
+    deficit = total - len(leads)
+    if deficit > 0:                      # slices that came short (e.g. no phones) → top up from the main slice
+        logger.info("Mix: faltan {} leads; se completan con '{}'", deficit, slices[0]["name"])
+        one(slices[0], deficit)
+
+    best: dict[str, Lead] = {}
+    for l in scoring.rank(leads):
+        best.setdefault(phone_key(l.phone or "") or l.source_id, l)
+    accepted = scoring.rank(list(best.values()))[:total]
+    if np_rows:
+        with open(out / "needs_phone.csv", "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(np_rows[0].keys()))
+            w.writeheader()
+            w.writerows(np_rows)
+    return pipeline.finalize(out, batch_id, "mix", accepted, rejected, send=send, commit=commit, make_pdfs=True,
+                             pdf_lang="en", extra={"mix": breakdown})
+
+
 def run(*, target_pool: int = 40, fallback_limit: int = 10, limit: int | None = None, strategy: str = "onsite",
         sources: list[str] | None = None, commit: bool = False, use_ai: bool = True, out_dir: Path | None = None,
-        slack: bool = True) -> dict[str, Any]:
+        slack: bool = True, mix: bool | None = None) -> dict[str, Any]:
     from . import pipeline
 
     health = None if limit is not None else fetch_health()
@@ -134,9 +239,14 @@ def run(*, target_pool: int = 40, fallback_limit: int = 10, limit: int | None = 
         if slack:
             post_slack(f"*Lead Engine · daily*: no hace falta cargar leads hoy ({why}).")
         return s
-    out = pipeline.run(strategy=strategy, limit=n, sources=sources, use_ai=use_ai,
-                       send=bool(settings.crm_webhook_secret), commit=commit, out_dir=out_dir,
-                       make_pdfs=True, pdf_lang="en")
+    use_mix = (mix if mix is not None else not sources) and bool(settings.daily_mix)
+    if use_mix:
+        out = run_mix(n, settings.daily_mix, send=bool(settings.crm_webhook_secret), commit=commit, use_ai=use_ai,
+                      out_dir=out_dir)
+    else:
+        out = pipeline.run(strategy=strategy, limit=n, sources=sources, use_ai=use_ai,
+                           send=bool(settings.crm_webhook_secret), commit=commit, out_dir=out_dir,
+                           make_pdfs=True, pdf_lang="en")
     s = summary(out, committed=commit)
     s["why"] = why
     (out / "daily_summary.json").write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")

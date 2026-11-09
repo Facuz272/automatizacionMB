@@ -156,7 +156,12 @@ def lookup(address: str | None) -> dict[str, Any] | None:
     from .dbpr import zip5 as zip_of
     from .municipal_signals import county_of, like_pattern, same_street, street_parts
 
-    if _disabled or not settings.appraiser_enabled or county_of(address) != "miami-dade":
+    if not settings.appraiser_enabled:
+        return None
+    if county_of(address) == "broward":                 # east-corridor ZIPs only, 5 s budget
+        from . import broward
+        return broward.lookup(address)
+    if _disabled or county_of(address) != "miami-dade":
         return None
     parts = street_parts(address)
     if not parts:
@@ -184,6 +189,8 @@ def lookup(address: str | None) -> dict[str, Any] | None:
 def reset() -> None:
     global _disabled
     _disabled = False
+    from . import broward
+    broward.reset()
 
 
 # ── milestone inspection window (pure) ──────────────────────────────────────

@@ -147,7 +147,10 @@ def analyze_live(firm: dict[str, Any], depth: int = 10) -> dict[str, Any]:
     """Cadastre + municipal signals for the firm's `depth` largest buildings where the official layers
     have coverage (Miami-Dade); `analyzed` counts only buildings the cadastre actually returned."""
     milestone = with_records = analyzed = 0
-    covered = [b for b in firm["building_list"] if (b.get("county") or "").upper() in LIVE_COUNTIES][:depth]
+    from .broward import allowed_zips
+    east = allowed_zips()
+    covered = [b for b in firm["building_list"] if (b.get("county") or "").upper() in LIVE_COUNTIES
+               or ((b.get("county") or "").upper() == "BROWARD" and (b.get("zip") or "")[:5] in east)][:depth]
     for b in covered:
         addr = b["address"]
         cad = appraiser.lookup(addr) or {}
