@@ -120,7 +120,8 @@ def resolve_seed(lead: Lead, use_search: bool) -> None:
     for the official site. The website crawl in the gate then fills a missing phone.
     """
     if settings.google_places_api_key:
-        found = google_places.find_place(lead.company_name, lead.address or "", lead.strategy_kind)
+        found = google_places.find_place(lead.company_name, lead.address or "", lead.strategy_kind,
+                                         vertical=lead.vertical)
         if found:
             for attr in ("phone", "website_url", "domain", "maps_url", "google_rating", "total_reviews", "place_types",
                          "reviews", "lat", "lng", "phones"):

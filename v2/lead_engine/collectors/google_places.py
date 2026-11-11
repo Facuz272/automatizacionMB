@@ -10,6 +10,7 @@ coordinates used for the OpenStreetMap building profile.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Iterator
 
@@ -35,6 +36,39 @@ EXCLUDED_TYPES = {
     "lodging", "hotel", "real_estate_agency_only", "restaurant", "store", "car_dealer",
     "school", "church", "hospital", "storage", "moving_company",
 }
+
+
+# Google lists parts of a property as their own places (the garage, the hotel's event venue, a restaurant
+# or a shop inside). When looking up a known building (cadastre / DBPR seed) those listings carry the
+# phone of that business, not of the property's management, so they are never the match.
+SUB_LISTING_TYPES = {
+    "parking", "parking_garage", "parking_lot", "event_venue", "wedding_venue", "banquet_hall", "convention_center",
+    "restaurant", "bar", "cafe", "coffee_shop", "bakery", "night_club", "meal_takeaway", "meal_delivery",
+    "spa", "gym", "fitness_center", "beauty_salon", "hair_salon", "barber_shop", "nail_salon",
+    "convenience_store", "grocery_store", "supermarket", "clothing_store", "department_store", "shoe_store",
+    "liquor_store", "pharmacy", "drugstore", "car_wash", "car_rental", "storage", "laundry", "atm", "bank",
+}
+SUB_LISTING_NAME = re.compile(
+    r"(?i)\b(?:parking|garage|valet|wedding|weddings|meeting|meetings|events?|venue|ballroom|banquet|conference|"
+    r"restaurant|bar|grill|caf[eé]|bistro|kitchen|lounge|pizzeria|sushi|spa|salon|barber|gym|fitness|market|"
+    r"shop|store|boutique|deli|pharmacy|laundry|car wash|storage|atm)\b")
+LODGING_TYPES = {"lodging", "hotel", "resort_hotel", "motel", "extended_stay_hotel"}
+
+
+def sub_listing_reason(place: dict, seed_name: str) -> str | None:
+    """Why a Places result is a business inside / attached to the property rather than the property (pure).
+    A keyword already in the seed's own name ("Brickell Parking LLC") does not count."""
+    name = ((place.get("displayName") or {}).get("text") or "")
+    types = set(place.get("types") or [])
+    bad_types = types & SUB_LISTING_TYPES
+    if bad_types and not types & {"condominium_complex", "apartment_building", "apartment_complex", "shopping_mall",
+                                  "hospital", "lodging", "hotel"}:
+        return "tipo " + ",".join(sorted(bad_types))
+    seed_words = {w.lower() for w in re.findall(r"[A-Za-z]+", seed_name or "")}
+    for m in SUB_LISTING_NAME.finditer(name):
+        if m.group(0).lower() not in seed_words:
+            return f"nombre «{m.group(0)}»"
+    return None
 
 
 class PlacesError(RuntimeError):
@@ -71,11 +105,12 @@ def _search(query: str, page_token: str | None, with_reviews: bool, page_size: i
     raise PlacesError("Places no respondió tras 3 intentos")
 
 
-def _to_lead(place: dict, strategy: str) -> Lead | None:
+def _to_lead(place: dict, strategy: str, allow_lodging: bool = False) -> Lead | None:
     if place.get("businessStatus") not in (None, "OPERATIONAL"):
         return None
     types = place.get("types") or []
-    if EXCLUDED_TYPES.intersection(types):
+    excluded = EXCLUDED_TYPES - LODGING_TYPES if allow_lodging else EXCLUDED_TYPES
+    if excluded.intersection(types):
         return None
     website = place.get("websiteUri")
     phone_raw = place.get("nationalPhoneNumber") or place.get("internationalPhoneNumber")
@@ -141,20 +176,47 @@ def collect(strategy: str, max_candidates: int, cities: list[str] | None = None)
                 time.sleep(2)  # page tokens need a moment to become valid
 
 
-def find_place(name: str, address: str, strategy: str) -> Lead | None:
-    """One targeted lookup for a known building (DBPR seed): "<name>, <address>".
+def find_place(name: str, address: str, strategy: str, vertical: str | None = None) -> Lead | None:
+    """One targeted lookup for a known building (DBPR / cadastre seed): "<name>, <address>".
 
-    Accepts the result only when its street address is the same building (number +
-    street + ZIP) or, within the same ZIP, the name is clearly the same. One request
-    per building instead of sweeping whole zones.
+    Accepts a result only when it is the property itself: same street address (number + street + ZIP)
+    or, within the same ZIP, clearly the same name — and never a business inside or attached to it
+    (garage, event venue, restaurant, shop… see sub_listing_reason). Same-address matches win over
+    name matches. Hotels (commercial seeds) may match lodging listings. One request per building.
     """
     from ..dbpr import address_key, name_similarity, zip5
 
     try:
-        data = _search(f"{name}, {address}", None, with_reviews=settings.places_reviews, page_size=3)
+        data = _search(f"{name}, {address}", None, with_reviews=settings.places_reviews, page_size=5)
     except PlacesError as exc:
         logger.warning("Places find_place {}: {}", name, exc)
         return None
+    want_key, want_zip = address_key(address), zip5(address)
+    by_name: Lead | None = None
+    skipped = []
+    for p in data.get("places") or []:
+        reason = sub_listing_reason(p, name)
+        if reason:
+            skipped.append(f"{(p.get('displayName') or {}).get('text')} ({reason})")
+            continue
+        lead = _to_lead(p, strategy, allow_lodging=vertical in ("commercial", "clinic"))
+        if not lead:
+            continue
+        if want_key and address_key(lead.address) == want_key:
+            lead.evidence["places_match"] = "address"
+            if skipped:
+                lead.evidence["places_skipped"] = skipped
+            return lead
+        if by_name is None and zip5(lead.address) == want_zip and name_similarity(name, lead.company_name) >= 0.5:
+            by_name = lead
+    if by_name is not None:
+        by_name.evidence["places_match"] = "name"
+        if skipped:
+            by_name.evidence["places_skipped"] = skipped
+        return by_name
+    if skipped:
+        logger.info("Places: sin la propiedad para {} (descartados: {})", name, "; ".join(skipped))
+    return None
     want_key, want_zip = address_key(address), zip5(address)
     for p in data.get("places") or []:
         lead = _to_lead(p, strategy)
