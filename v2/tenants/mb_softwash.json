@@ -157,5 +157,6 @@
     "min_job_usd": 1500,
     "annual_discount_pct": 10,
     "maintenance_visits_per_year": 2
-  }
+  },
+  "competitor_nearby": true
 }

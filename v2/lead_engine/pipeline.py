@@ -429,10 +429,44 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
             if lead.email != before and check_mx:
                 lead.email_status = email_verify.email_status(lead.email)
     rule_qualify(lead)  # fills whatever is still empty
+    apply_plan_b_fallback(lead)
     scoring.apply(lead)
     lead.evidence["site_pages"] = facts.pages[:6]
     if facts.rendered:
         lead.evidence["rendered_pages"] = facts.rendered[:4]
+
+
+FALLBACK_ROLES = {
+    "community": "Chief Engineer / Director of Facilities / In-House Maintenance",
+    "plaza": "Property Manager / Facilities Manager del centro",
+    "commercial": "Property Manager / Chief Engineer del edificio",
+    "clinic": "Facilities Director / Plant Operations",
+}
+
+
+def apply_plan_b_fallback(lead: Lead) -> None:
+    """Second door for the setter when the site names nobody else (no site, closed resident portals):
+      1. the management firm's / commercial operator's published office line, when it differs from the lead's phone;
+      2. otherwise, ask reception / the concierge for the in-house facilities role of the vertical."""
+    if lead.plan_b():
+        return
+    own = {phone_key(lead.phone or "")}
+    firm = lead.management_company if lead.management_type == "third_party" else None
+    number, who = None, None
+    op = lead.evidence.get("commercial_operator")
+    if op and op.get("phone_scope") == "florida" and op.get("phone"):
+        number, who = op["phone"], op["name"]
+    elif firm:
+        from . import phone_resolver
+        fp = phone_resolver.firm_phone(firm)
+        if fp:
+            number, who = fp["number"], fp.get("firm") or firm
+    if number and phone_key(number) not in own:
+        lead.plan_b_fallback = {"text": f"administradora {who} (pedir por el Property Manager del edificio)",
+                                "phone": number, "source": "management_firm"}
+        return
+    role = FALLBACK_ROLES.get(lead.vertical, FALLBACK_ROLES["community"])
+    lead.plan_b_fallback = {"text": f"pedir en recepción/conserjería por el {role}", "source": "tactical"}
 
 
 def apply_competitor_intel(leads: list[Lead], pool: list[dict]) -> None:
@@ -446,7 +480,7 @@ def apply_competitor_intel(leads: list[Lead], pool: list[dict]) -> None:
         summary = competitor_intel.analyze(neighbors, own_reviews=lead.reviews)
         if summary.get("neighbors_scanned") or summary.get("mentions"):
             lead.competitor_intel = summary
-        line = competitor_intel.hook_line(summary)
+        line = competitor_intel.hook_line(summary, address=lead.address, own_name=lead.company_name)
         if line and lead.sales_strategy and line not in lead.sales_strategy:
             lead.sales_strategy = f"{lead.sales_strategy} {line}"
 

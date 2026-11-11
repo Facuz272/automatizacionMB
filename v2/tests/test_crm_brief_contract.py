@@ -105,12 +105,32 @@ def rebuilt(ficha: dict) -> list[str]:
     return got
 
 
+def with_zona_line(l: Lead, summary: dict) -> Lead:
+    line = competitor_intel.hook_line(summary, address=l.address, own_name=l.company_name)
+    assert line and line.startswith("Zona: ")
+    l.sales_strategy = f"{l.sales_strategy} {line}"
+    return l
+
+
+NEIGHBOURS_WITH_PROBLEMS = competitor_intel.analyze([
+    {"name": "Akoya Condominium", "distance_m": 300, "reviews": [{"text": "The pool deck is filthy and nobody fixes it."}]},
+    {"name": "Blue Diamond Condominium", "distance_m": 450, "reviews": [{"text": "Black mold in the garage stairs."}]}])
+QUIET_NEIGHBOURS = competitor_intel.analyze([
+    {"name": "Akoya Condominium", "distance_m": 300, "reviews": [{"text": "Lovely staff, great views."}]},
+    {"name": "Blue Diamond Condominium", "distance_m": 450, "reviews": []}])
+
 CASES = {
     "full": lambda: full_lead(),
     "zona": lambda: with_zona(full_lead()),
     "consolidated+zona": lambda: with_zona(with_consolidation(full_lead())),
     "no_ficha_extras": lambda: full_lead(contacts=[], office_hours=None, phones=[], portfolio_cluster={},
                                          licenses={}, management_domain={}),
+    "zona_condiciones+planb_firma": lambda: with_zona_line(full_lead(contacts=[], plan_b_fallback={
+        "text": "administradora Castle Group (pedir por el Property Manager del edificio)", "phone": "+19549262921"}),
+        NEIGHBOURS_WITH_PROBLEMS),
+    "zona_cercania+planb_tactico": lambda: with_zona_line(full_lead(contacts=[], plan_b_fallback={
+        "text": "pedir en recepción/conserjería por el Chief Engineer / Director of Facilities / In-House Maintenance"}),
+        QUIET_NEIGHBOURS),
     "plaza": lambda: full_lead(vertical="plaza", cadastre={"kind": "property", "building_sqft": 85000,
                                                              "owner_name": "SUNNY PLAZA LLC", "care_of": "ACME MGMT"}),
 }
@@ -130,7 +150,19 @@ def test_every_engine_output_is_parsed_whole_by_the_crm(case):
     assert sorted(rebuilt(f)) == sorted(facts_of(brief))             # nothing lost, nothing merged
     assert f["score"] == lead.lead_score
     zona = competitor_intel.hook_line(ZONA_SUMMARY)
-    if "zona" in case:
+    if case == "zona_condiciones+planb_firma":
+        z = parsed["zona"]
+        assert z["finding"].startswith("reseñas de edificios vecinos sobre Collins Ave (Akoya Condominium y Blue Diamond")
+        assert " mencionan " in z["finding"] and z["argument"]
+        assert (f["planB"], f["planBPhone"]) == ("administradora Castle Group (pedir por el Property Manager del edificio)",
+                                                 "+19549262921")
+    elif case == "zona_cercania+planb_tactico":
+        z = parsed["zona"]
+        assert z["finding"] == ("estuvimos relevando propiedades sobre Collins Ave cerca de Akoya Condominium y "
+                                "Blue Diamond Condominium")
+        assert z["argument"] == competitor_intel.PROXIMITY_ARGUMENT and f["planBPhone"] is None
+        assert f["planB"].startswith("pedir en recepción/conserjería por el Chief Engineer")
+    elif "zona" in case:
         assert parsed["zona"]["finding"] == ("reseñas de 2 edificio(s) vecino(s) dicen que "
                                              + ZONA_SUMMARY["top_weakness_es"])
         assert parsed["zona"]["argument"] == ZONA_SUMMARY["argument"]

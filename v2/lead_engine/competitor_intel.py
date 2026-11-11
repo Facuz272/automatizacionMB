@@ -101,13 +101,78 @@ def scan_review(text: str) -> list[dict[str, Any]]:
     return out
 
 
+# ── physical condition of neighbouring buildings (second level of the zone hook) ──────────────
+
+# Terms that are a problem by themselves, and terms that need a negative cue in the same sentence
+# ("pool deck is filthy" counts, "beautiful pool deck" does not).
+CONDITION_SELF = {
+    "moho y algas": re.compile(r"(?i)\b(?:mold|mould|mildew|algae|moho|hongos|verd[ií]n)\b"),
+    "suciedad y manchas": re.compile(r"(?i)\b(?:dirty|filthy|grime|grimy|stains?|stained|sucio|sucia|manchas?)\b"),
+}
+CONDITION_AREA = {
+    "fachada": re.compile(r"(?i)\b(?:facade|fa[cç]ade|exterior|paint(?:ing)?|stucco|fachada|pintura)\b"),
+    "pool deck": re.compile(r"(?i)\bpool ?(?:deck|area)\b|\bpiscina\b"),
+    "pasillos y aceras": re.compile(r"(?i)\b(?:walkways?|hallways?|sidewalks?|catwalks?|pasillos?|aceras?)\b"),
+    "garaje": re.compile(r"(?i)\b(?:parking|garage|estacionamiento|garaje)\b"),
+    "mantenimiento": re.compile(r"(?i)\b(?:maintenance|maintained|upkeep|mantenimiento)\b"),
+    "obras y renovación": re.compile(r"(?i)\b(?:renovation|construction|repairs?|scaffold\w*|obras?|renovaci[oó]n)\b"),
+    "recertificación / inspección": re.compile(
+        r"(?i)\b(?:40[- ]year|recertification|milestone|structural inspection|special assessments?|recertificaci[oó]n)\b"),
+}
+NEGATIVE_CUE = re.compile(
+    r"(?i)\b(?:bad|poor(?:ly)?|terrible|awful|horrible|worst|dirty|filthy|broken|needs?|needed|never|issues?|problems?|"
+    r"leak\w*|crack\w*|rust\w*|peel\w*|neglect\w*|disgusting|slow|closed|under|falling|old|outdated|lack|"
+    r"assessments?|mal|malo|p[eé]simo|roto|nunca|falta|problemas?)\b")
+CONDITION_ARGUMENT = {
+    "moho y algas": "el softwash elimina moho y algas con producto a baja presión y frena que vuelvan",
+    "suciedad y manchas": "limpieza a baja presión que saca manchas y suciedad sin dañar pintura ni sellos",
+    "recertificación / inspección": "preparar fachada y áreas comunes antes de la inspección y de la pintura",
+    "obras y renovación": "dejar fachada y áreas comunes listas al cerrar las obras",
+}
+DEFAULT_CONDITION_ARGUMENT = "una limpieza exterior programada mantiene fachada y áreas comunes al nivel de la zona"
+PROXIMITY_ARGUMENT = "ofrecer la inspección gratuita aprovechando el relevamiento de la zona"
+
+
+def scan_conditions(text: str) -> list[dict[str, str]]:
+    """Physical / exterior-maintenance problems in one review (pure). One hit per label."""
+    out, seen = [], set()
+    for label, rx in CONDITION_SELF.items():
+        m = rx.search(text or "")
+        if m and label not in seen:
+            seen.add(label)
+            out.append({"label": label, "quote": _sentence_around(text, m.start(), m.end(), max_len=160)})
+    for label, rx in CONDITION_AREA.items():
+        for m in rx.finditer(text or ""):
+            sentence = _sentence_around(text, m.start(), m.end(), max_len=160)
+            if label not in seen and (NEGATIVE_CUE.search(sentence) or any(r.search(sentence)
+                                                                            for r in CONDITION_SELF.values())):
+                seen.add(label)
+                out.append({"label": label, "quote": sentence})
+                break
+    return out
+
+
+def street_of(address: str | None) -> str | None:
+    """'5875 Collins Ave, Miami Beach, FL 33140' → 'Collins Ave'."""
+    first = (address or "").split(",")[0].strip()
+    m = re.match(r"^\d+[A-Za-z]?(?:-\d+)?\s+(.+)$", first)
+    return m.group(1).strip() if m else None
+
+
 def analyze(neighbors: Iterable[dict[str, Any]], *, own_reviews: list[dict] | None = None) -> dict[str, Any]:
     """neighbors: {"name", "distance_m", "reviews": [{"text","published","relative"}]} → zone summary (pure)."""
     mentions: list[dict[str, Any]] = []
+    conditions: list[dict[str, Any]] = []
+    names: list[dict[str, Any]] = []
     scanned = 0
     for nb in neighbors:
         scanned += 1
+        if nb.get("name"):
+            names.append({"name": nb["name"], "distance_m": nb.get("distance_m")})
         for rv in nb.get("reviews") or []:
+            for c in scan_conditions(rv.get("text") or ""):
+                conditions.append({**c, "building": nb.get("name"), "distance_m": nb.get("distance_m"),
+                                   "date": rv.get("published", "")[:7] if rv.get("published") else rv.get("relative")})
             for hit in scan_review(rv.get("text") or ""):
                 mentions.append({**hit, "building": nb.get("name"), "distance_m": nb.get("distance_m"),
                                  "date": rv.get("published", "")[:7] if rv.get("published") else rv.get("relative")})
@@ -117,7 +182,10 @@ def analyze(neighbors: Iterable[dict[str, Any]], *, own_reviews: list[dict] | No
                              "date": rv.get("published", "")[:7] if rv.get("published") else rv.get("relative")})
     counts = Counter(m["weakness"] for m in mentions)
     summary: dict[str, Any] = {"neighbors_scanned": scanned, "mentions": mentions[:12], "weaknesses": dict(counts),
-                               "vendors": sorted({m["vendor"] for m in mentions if m.get("vendor")})}
+                               "vendors": sorted({m["vendor"] for m in mentions if m.get("vendor")}),
+                               "conditions": conditions[:12],
+                               "neighbor_names": sorted(names, key=lambda n: n["distance_m"] if n["distance_m"] is not None
+                                                        else 1e9)[:6]}
     if counts:
         top, n = counts.most_common(1)[0]
         buildings = {m["building"] for m in mentions if m["weakness"] == top}
@@ -126,14 +194,41 @@ def analyze(neighbors: Iterable[dict[str, Any]], *, own_reviews: list[dict] | No
     return summary
 
 
-def hook_line(summary: dict[str, Any]) -> str | None:
-    """'Zona: en 3 edificios vecinos … → argumento: …' (never names a competitor)."""
-    if not summary or not summary.get("top_weakness"):
+def _names(items: list[str], n: int = 2) -> str:
+    uniq = list(dict.fromkeys(i for i in items if i))[:n]
+    return " y ".join(uniq)
+
+
+def hook_line(summary: dict[str, Any], *, address: str | None = None, own_name: str | None = None) -> str | None:
+    """Zone line for the setter, always in the CRM's "Zona: <finding> → argumento: <argument>." shape:
+
+      1. neighbours' reviews show a weakness of a cleaning vendor (never names the vendor);
+      2. neighbours' reviews describe physical / exterior-maintenance problems (mold, stains, facade, pool deck,
+         walkways, parking, renovation, 40-year inspection) — names up to two of those buildings;
+      3. otherwise, proximity: up to two real neighbouring buildings found by Places in the same radius.
+    """
+    if not summary:
         return None
-    nb = [m for m in summary["mentions"] if m["weakness"] == summary["top_weakness"] and m["building"] != "este edificio"]
-    where = (f"reseñas de {len({m['building'] for m in nb})} edificio(s) vecino(s)" if nb
-             else "reseñas de este edificio")
-    return f"Zona: {where} dicen que {summary['top_weakness_es']} → argumento: {summary['argument']}."
+    if summary.get("top_weakness"):
+        nb = [m for m in summary["mentions"] if m["weakness"] == summary["top_weakness"] and m["building"] != "este edificio"]
+        where = (f"reseñas de {len({m['building'] for m in nb})} edificio(s) vecino(s)" if nb
+                 else "reseñas de este edificio")
+        return f"Zona: {where} dicen que {summary['top_weakness_es']} → argumento: {summary['argument']}."
+    own = (own_name or "").strip().lower()
+    street = street_of(address)
+    conds = [c for c in summary.get("conditions") or [] if c.get("building") and c["building"].strip().lower() != own]
+    if conds:
+        top = Counter(c["label"] for c in conds).most_common(2)
+        labels = " y ".join(l for l, _ in top)
+        who = _names([c["building"] for c in conds])           # the two nearest buildings with a problem
+        where = f"sobre {street} " if street else ""
+        arg = CONDITION_ARGUMENT.get(top[0][0], DEFAULT_CONDITION_ARGUMENT)
+        return f"Zona: reseñas de edificios vecinos {where}({who}) mencionan {labels} → argumento: {arg}."
+    near = _names([n["name"] for n in summary.get("neighbor_names") or [] if n["name"].strip().lower() != own])
+    if near:
+        where = f"sobre {street} " if street else ""
+        return f"Zona: estuvimos relevando propiedades {where}cerca de {near} → argumento: {PROXIMITY_ARGUMENT}."
+    return None
 
 
 def neighbors_from_pool(lead_lat: float | None, lead_lng: float | None, pool: Iterable[dict[str, Any]],

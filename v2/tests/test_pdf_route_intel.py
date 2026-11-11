@@ -107,7 +107,10 @@ def test_analyze_summary_and_hook_line():
     line = ci.hook_line(s)
     assert line.startswith("Zona: reseñas de 2 edificio(s) vecino(s) dicen que el moho") and "softwash" in line
     assert "Sunshine" not in line                                                     # never names a competitor
-    assert ci.hook_line(ci.analyze([{"name": "x", "reviews": [{"text": "great"}]}])) is None
+    # no vendor weakness and no physical problem: the proximity hook names the neighbour
+    assert ci.hook_line(ci.analyze([{"name": "x", "reviews": [{"text": "great"}]}])).startswith(
+        "Zona: estuvimos relevando propiedades cerca de x")
+    assert ci.hook_line(ci.analyze([])) is None
 
 
 def test_neighbors_from_pool_radius_and_exclusion():

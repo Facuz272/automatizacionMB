@@ -149,6 +149,8 @@ class Lead:
     vertical: str = "community"
     # every decision maker found: {"name","title","role" (pm|facilities|board|exec|other),"source","phone"?}
     contacts: list[dict[str, Any]] = field(default_factory=list)
+    # tactical Plan B when no second named contact exists: {"text", "phone"?, "source"} (pipeline.apply_plan_b_fallback)
+    plan_b_fallback: dict[str, Any] = field(default_factory=dict)
     office_hours: str | None = None
     # official cadastre (appraiser.lookup), lodging licence (lodging.match)
     cadastre: dict[str, Any] = field(default_factory=dict)
@@ -255,6 +257,9 @@ class Lead:
         pb = self.plan_b()
         if pb:
             parts.append(f"Plan B: {pb['title'] or 'contacto'} {pb['name']}" + (f" {pb['phone']}" if pb.get("phone") else ""))
+        elif self.plan_b_fallback.get("text"):
+            fb = self.plan_b_fallback
+            parts.append(f"Plan B: {fb['text']}" + (f" {fb['phone']}" if fb.get("phone") else ""))
         if self.office_hours:
             parts.append(f"oficina {self.office_hours}")
         md = self.management_domain

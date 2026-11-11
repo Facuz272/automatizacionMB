@@ -327,6 +327,26 @@ después del lavado a presión → argumento: el softwash trata el moho con prod
 de solo arrastrarlo, por eso dura más.
 ```
 
+### Gancho de zona y Plan B en todos los leads
+
+El gancho de zona (`Zona: … → argumento: …`) tiene tres niveles, en orden:
+
+1. reseñas de edificios vecinos que muestran una debilidad de una empresa de limpieza (sin nombrarla);
+2. reseñas de vecinos que describen problemas físicos o de mantenimiento exterior (moho, algas,
+   suciedad, manchas, fachada, pool deck, pasillos, garaje, mantenimiento, obras, 40 años /
+   inspección): nombra hasta dos de esos edificios y la calle;
+3. si nadie se queja de nada: proximidad, con hasta dos edificios vecinos reales que Google Places
+   devolvió en el mismo radio («Estuvimos relevando propiedades sobre Collins Ave cerca de A y B»).
+   Nunca nombra al propio edificio. Requiere `competitor_nearby` (activo en `mb_softwash`; una
+   búsqueda Nearby de Places por lead).
+
+El Plan B usa primero un segundo contacto con nombre del sitio del edificio. Si no hay sitio o es un
+portal cerrado (BuildingLink), se arma uno táctico: el teléfono publicado de la administradora / CAM
+(o del operador comercial) cuando es distinto del teléfono del lead, o, si no, «pedir en
+recepción/conserjería por el Chief Engineer / Director of Facilities / In-House Maintenance» (en
+plazas y comerciales, el Property / Facilities Manager). Los dos formatos los lee la tarjeta del CRM
+(`tests/test_crm_brief_contract.py`).
+
 ### Rutas de inspección
 
 ```bash

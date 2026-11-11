@@ -25,7 +25,7 @@ TENANTS_DIR = Path(os.getenv("TENANTS_DIR", str(BASE_DIR / "tenants")))
 COMPANY_MAP = {"name": "company_name", "phone": "company_phone", "email": "company_email",
                "website": "company_website", "booking_url": "company_booking_url",
                "documents_available": "documents_available"}
-SETTINGS_KEYS = {"brand_color", "pdf_lang", "target_cities", "zip_restrictions", "exclude_zips", "field_rates", "daily_mix", "min_units", "pvp_tiers", "allow_mgmt_firm_phone",
+SETTINGS_KEYS = {"brand_color", "pdf_lang", "target_cities", "zip_restrictions", "exclude_zips", "field_rates", "daily_mix", "competitor_nearby", "min_units", "pvp_tiers", "allow_mgmt_firm_phone",
                  "mgmt_phones"}
 ALLOWED = {"slug", "company", "valuation_rates", "inspectors", "notes"} | SETTINGS_KEYS
 
