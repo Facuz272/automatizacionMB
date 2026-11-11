@@ -94,3 +94,10 @@ def test_plan_b_commercial_operator_and_real_contact_first(monkeypatch):
     named.add_contact("Carlos Ruiz", "Chief Engineer", "website")
     pipeline.apply_plan_b_fallback(named)
     assert named.plan_b_fallback == {} and "Plan B: Chief Engineer Carlos Ruiz" in named.brief()
+
+
+def test_the_same_complex_under_another_listing_is_not_a_neighbour():
+    s = ci.analyze([{"name": "Lago grande", "distance_m": 50, "reviews": [{"text": "Dirty garage."}]},
+                    {"name": "Legacy at Hialeah", "distance_m": 400, "reviews": [{"text": "Mold in hallways."}]}])
+    line = ci.hook_line(s, address="2570 W 67th Pl, Hialeah, FL 33016", own_name="Lago Grande Three-a")
+    assert "(Legacy at Hialeah)" in line and "Lago grande" not in line

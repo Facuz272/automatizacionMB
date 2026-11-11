@@ -214,9 +214,14 @@ def hook_line(summary: dict[str, Any], *, address: str | None = None, own_name: 
         where = (f"reseñas de {len({m['building'] for m in nb})} edificio(s) vecino(s)" if nb
                  else "reseñas de este edificio")
         return f"Zona: {where} dicen que {summary['top_weakness_es']} → argumento: {summary['argument']}."
-    own = (own_name or "").strip().lower()
+    from .dbpr import name_similarity
+
+    def is_own(name: str) -> bool:                 # "Lago grande" is the same complex as "Lago Grande Three-a"
+        return bool(own_name) and (name.strip().lower() == own_name.strip().lower()
+                                   or name_similarity(name, own_name) >= 0.6)
+
     street = street_of(address)
-    conds = [c for c in summary.get("conditions") or [] if c.get("building") and c["building"].strip().lower() != own]
+    conds = [c for c in summary.get("conditions") or [] if c.get("building") and not is_own(c["building"])]
     if conds:
         top = Counter(c["label"] for c in conds).most_common(2)
         labels = " y ".join(l for l, _ in top)
@@ -224,7 +229,7 @@ def hook_line(summary: dict[str, Any], *, address: str | None = None, own_name: 
         where = f"sobre {street} " if street else ""
         arg = CONDITION_ARGUMENT.get(top[0][0], DEFAULT_CONDITION_ARGUMENT)
         return f"Zona: reseñas de edificios vecinos {where}({who}) mencionan {labels} → argumento: {arg}."
-    near = _names([n["name"] for n in summary.get("neighbor_names") or [] if n["name"].strip().lower() != own])
+    near = _names([n["name"] for n in summary.get("neighbor_names") or [] if not is_own(n["name"])])
     if near:
         where = f"sobre {street} " if street else ""
         return f"Zona: estuvimos relevando propiedades {where}cerca de {near} → argumento: {PROXIMITY_ARGUMENT}."
