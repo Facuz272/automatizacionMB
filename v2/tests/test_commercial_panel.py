@@ -55,7 +55,7 @@ RK_MAIL = "17100 COLLINS AVE STE 225, SUNNY ISLES BEACH, FL 33160"
 
 
 def test_operator_phone_enters_the_cascade_only_when_allowed(monkeypatch):
-    monkeypatch.setattr(phone_resolver.lodging, "building_phone", lambda a, n: None)
+    monkeypatch.setattr(phone_resolver.lodging, "building_phone", lambda a, n, **k: None)
     object.__setattr__(settings, "allow_mgmt_firm_phone", False)
     lead = _plaza(1, RK_MAIL)
     assert phone_resolver.resolve(lead) is None and lead.phone is None
@@ -78,7 +78,7 @@ def test_plazas_of_one_operator_are_consolidated_on_the_biggest(wired, monkeypat
               _plaza(3, RK_MAIL, sqft=40000, lot=150000)]
     monkeypatch.setattr(pipeline, "_candidates", lambda *a, **k: iter(plazas))
     monkeypatch.setattr(pipeline.osm, "lookup_address", lambda address, name=None: None)
-    monkeypatch.setattr(phone_resolver.lodging, "building_phone", lambda a, n: None)
+    monkeypatch.setattr(phone_resolver.lodging, "building_phone", lambda a, n, **k: None)
     monkeypatch.setattr(pc.municipal_signals, "lookup", lambda a, **k: [])
     out = pipeline.run(strategy="onsite", limit=5, sources=["pa"], use_ai=False, use_apollo=False, precheck=False,
                        use_search=False, out_dir=wired / "o")

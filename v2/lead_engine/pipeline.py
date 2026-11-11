@@ -356,7 +356,8 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
     if lead.source != "pa" or not lead.cadastre:  # cadastre seeds carry their exact folio (unless re-seeded
         lead.cadastre = appraiser.lookup(lead.address) or lead.cadastre   # from needs_phone.csv by enrich-phones)
     if use_dbpr:
-        lead.lodging = lodging.match(lead.address) or {}
+        lead.lodging = lodging.match(lead.address, building_units=(lead.public_records.get("dbpr") or {}).get("units")
+                                     or lead.cadastre.get("units")) or {}
     lead.vertical = verticals.classify(appraiser=lead.cadastre.get("vertical"), source=lead.source,
                                        places_types=lead.place_types, name=lead.company_name,
                                        lodging_kind=lead.lodging.get("kind"))

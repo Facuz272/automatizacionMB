@@ -110,7 +110,8 @@ def resolve(lead: Lead, steps: tuple[str, ...] = ("lodging", "firm_central")) ->
     hit = None
     if "lodging" in steps:
         hit = lodging.building_phone(lead.address, [lead.company_name, dbpr_rec.get("association"),
-                                                    dbpr_rec.get("condo_name")])
+                                                    dbpr_rec.get("condo_name")],
+                                     building_units=dbpr_rec.get("units") or (lead.cadastre or {}).get("units"))
     if hit:
         lead.phone = hit["phone"]
         lead.phones.append({"number": hit["phone"], "label": hit["label"], "source": "dbpr_lodging",

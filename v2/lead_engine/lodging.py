@@ -84,7 +84,24 @@ def sync(groups: Iterable[str] | None = None, conn: sqlite3.Connection | None = 
     return out
 
 
-def match(address: str | None, conn: sqlite3.Connection | None = None) -> dict[str, Any] | None:
+# A licence speaks for the building only when it covers several units of it. Single-unit licences
+# ("1 room", owners' LLCs such as "GURSHUMOV 10D LLC") carry a private owner's phone and are never used.
+MIN_BUILDING_UNITS = 5
+TAPT_MIN_SHARE = 0.10            # apart-hotel licences inside a tower: rental companies holding a few units
+
+
+def is_building_licence(r: Any, building_units: int | None = None) -> bool:
+    """Operator licence (hotel / motel / apartments / apart-hotel) that represents the whole property."""
+    units = r["units"] or 0
+    if r["rank"] not in OPERATOR_RANKS or units < MIN_BUILDING_UNITS:
+        return False
+    if r["rank"] == "TAPT" and building_units and building_units >= 20:
+        return units >= TAPT_MIN_SHARE * building_units
+    return True
+
+
+def match(address: str | None, conn: sqlite3.Connection | None = None,
+          building_units: int | None = None) -> dict[str, Any] | None:
     """Lodging licences at this street address: the operator (if any) and how many condo rental groups."""
     key = address_key(address)
     if not key:
@@ -97,8 +114,11 @@ def match(address: str | None, conn: sqlite3.Connection | None = None) -> dict[s
         return None
     if not rows:
         return None
-    ops = sorted((r for r in rows if r["rank"] in OPERATOR_RANKS), key=lambda r: -(r["units"] or 0))
+    ops = sorted((r for r in rows if is_building_licence(r, building_units)), key=lambda r: -(r["units"] or 0))
     out: dict[str, Any] = {"condo_rental_licences": sum(1 for r in rows if r["rank"] == "CNDO")}
+    skipped = sum(1 for r in rows if r["rank"] in OPERATOR_RANKS and not is_building_licence(r, building_units))
+    if skipped:
+        out["unit_licences_skipped"] = skipped
     if ops:
         o = ops[0]
         out.update({
@@ -111,7 +131,7 @@ def match(address: str | None, conn: sqlite3.Connection | None = None) -> dict[s
 
 
 def building_phone(address: str | None, names: list[str | None], conn: sqlite3.Connection | None = None,
-                   min_similarity: float = 0.6) -> dict[str, Any] | None:
+                   min_similarity: float = 0.6, building_units: int | None = None) -> dict[str, Any] | None:
     """A phone that belongs to the building itself, from the lodging registry:
       * a whole-property operator licence (hotel/motel/apartments) at the address → front desk;
       * a condo rental licence (CNDO) held by the association itself (licensee ≈ association or condo name)
@@ -128,7 +148,7 @@ def building_phone(address: str | None, names: list[str | None], conn: sqlite3.C
                             (key,)).fetchall()
     except sqlite3.Error:
         return None
-    ops = sorted((r for r in rows if r["rank"] in OPERATOR_RANKS), key=lambda r: -(r["units"] or 0))
+    ops = sorted((r for r in rows if is_building_licence(r, building_units)), key=lambda r: -(r["units"] or 0))
     if ops:
         o = ops[0]
         return {"phone": o["phone"], "label": "front_desk", "license_number": o["license_number"],

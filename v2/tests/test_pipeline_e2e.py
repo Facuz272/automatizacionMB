@@ -65,7 +65,7 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline.dbpr, "cluster", lambda **kw: real_cluster(**{**kw, "conn": conn}))
     monkeypatch.setattr(pipeline.appraiser, "lookup", lambda address: dict(CADASTRE_5555)
                         if address and address.startswith("5555 Collins") else None)
-    monkeypatch.setattr(pipeline.lodging, "match", lambda address, conn=None: None)
+    monkeypatch.setattr(pipeline.lodging, "match", lambda address, conn=None, **k: None)
     monkeypatch.setattr(pipeline.geocode, "geocode", lambda address: None)
     monkeypatch.setattr(pipeline.npi, "enrich", lambda lead: None)
     monkeypatch.setattr(pipeline.mgmt_domains, "resolve", lambda firm, **kw: {

@@ -137,7 +137,7 @@ def _lodging_rows(conn) -> list[dict[str, Any]]:
     lodging.ensure(conn)
     out = []
     for r in conn.execute("SELECT * FROM dbpr_lodging WHERE status = '20' AND phone IS NOT NULL").fetchall():
-        if r["rank"] not in OPERATOR_RANKS and not (r["rank"] == "CNDO" and ASSOCIATION.search(r["licensee"] or "")):
+        if not lodging.is_building_licence(r) and not (r["rank"] == "CNDO" and ASSOCIATION.search(r["licensee"] or "")):
             continue
         address = f"{_title_case((r['address'] or '').split(',')[0])}, {_title_case(r['city'] or '')}, FL {r['zip'] or ''}"
         est = valuation.estimate({"units": r["units"]}) if (r["units"] or 0) >= 10 else None

@@ -151,7 +151,7 @@ def _seed_lead():
 
 
 def test_firm_central_phone_needs_explicit_opt_in_and_is_labelled(company, monkeypatch):
-    monkeypatch.setattr(phone_resolver.lodging, "building_phone", lambda a, n: None)
+    monkeypatch.setattr(phone_resolver.lodging, "building_phone", lambda a, n, **k: None)
     monkeypatch.setattr(phone_resolver, "firm_phone", lambda firm: {"number": "+19549262921", "source": "firm_website",
                                                                     "firm": "FirstService Residential",
                                                                     "url": "https://fsresidential.com"})
@@ -285,3 +285,33 @@ def test_pvp_tiers_env_format_and_cli_flags():
         with pytest.raises(SystemExit) as e:
             main(argv)
         assert e.value.code == 0
+
+
+def test_single_unit_rental_licences_never_give_the_building_phone(tmp_path):
+    """Regression (live smoke test, The Tides 3901 S Ocean Dr): a TAPT licence for one apartment
+    ("GURSHUMOV 10D LLC", 1 unit) was taken as the tower's front desk."""
+    addr = "3901 S Ocean Dr, Hollywood, FL 33019"
+    conn = _lodging(tmp_path, [
+        {"lic": "TAP1622174", "rank": "TAPT", "licensee": "GURSHUMOV 10D LLC", "business": "GURSHUMOV 10D LLC",
+         "address": addr, "phone": "+13055011111", "units": 1},
+        {"lic": "TAP2", "rank": "TAPT", "licensee": "BEACH RENTALS LLC", "address": addr, "phone": "+13055011112",
+         "units": 12},                                       # 12 of 722 units: a rental company, not the building
+    ])
+    assert lodging.building_phone(addr, ["The Tides"], conn, building_units=722) is None
+    m = lodging.match(addr, conn, building_units=722)
+    assert "phone" not in m and m["unit_licences_skipped"] == 2
+    # a real operator of the property still counts (hotel or the apart-hotel running most of the tower)
+    conn.execute("INSERT INTO dbpr_lodging VALUES ('TAP3','TAPT','TIDES HOTEL MGMT LLC','The Tides',NULL,?,?,"
+                 "'HOLLYWOOD','33019','Broward','+13055011113',400,'20')", (addr, dbpr.address_key(addr)))
+    conn.commit()
+    assert lodging.building_phone(addr, ["x"], conn, building_units=722)["phone"] == "+13055011113"
+    assert lodging.match(addr, conn, building_units=722)["phone"] == "+13055011113"
+
+
+@pytest.mark.parametrize("rank,units,building,ok", [
+    ("TAPT", 1, None, False), ("TAPT", 4, None, False), ("HOTL", 3, None, False), ("NAPT", 5, None, True),
+    ("HOTL", 120, None, True), ("TAPT", 30, 722, False), ("TAPT", 80, 722, True), ("TAPT", 8, None, True),
+    ("CNDO", 200, None, False),
+])
+def test_is_building_licence(rank, units, building, ok):
+    assert lodging.is_building_licence({"rank": rank, "units": units}, building) is ok

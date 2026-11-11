@@ -112,7 +112,7 @@ def test_run_consolidates_firm_central_buildings_in_crm_hook_pdf_and_needs_phone
             _bldg(3, 180, "300 Collins Ave, Miami Beach, FL 33140")]
     monkeypatch.setattr(pipeline.dbpr_seed, "collect", lambda strategy, n: iter(blds))
     monkeypatch.setattr(pipeline.osm, "lookup_address", lambda address, name=None: None)
-    monkeypatch.setattr(phone_resolver.lodging, "building_phone", lambda a, n: None)
+    monkeypatch.setattr(phone_resolver.lodging, "building_phone", lambda a, n, **k: None)
     monkeypatch.setattr(phone_resolver, "firm_phone", lambda firm: {"number": CENTRAL, "source": "firm_website",
                                                                     "firm": "Castle Group", "url": "https://castlegroup.com"})
     out = pipeline.run(strategy="portfolio", limit=5, use_ai=False, use_apollo=False, precheck=False, use_search=False,
