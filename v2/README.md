@@ -335,6 +335,33 @@ Acepta una lista o `{outcomes|leads|items|data: [...], next_cursor}`; los motivo
 CRM ("Número equivocado", "Administración remota / externa", "Fuera de zona", "No es administrador")
 se mapean solos.
 
+### Enriquecer leads que ya están en el CRM (`backfill-crm`)
+
+```bash
+python -m lead_engine --tenant mb_softwash backfill-crm --active --limit 50          # dry run (no escribe)
+python -m lead_engine backfill-crm --from-batch out/enrich-AAAAMMDD-HHMM --commit    # envía lo ya revisado
+```
+
+Lee `GET /api/public/leads-unenriched` (leads abiertos sin Ficha / administradora / dirección / ZIP),
+ordena papeles enviados → llamadas activas → resto (`--status a,b` o `--active` para filtrar) y para
+cada uno:
+
+- **Identidad primero**: Places (con el filtro de garajes / salones / locales) solo se usa si el
+  resultado tiene **el mismo teléfono o el mismo dominio web** que el lead, o un nombre claramente igual
+  y único en la zona. Sin identidad confiable el lead no se envía (vuelve en una corrida futura).
+- **Administradoras** (la mayoría de los leads viejos): su propia firma como `management_company`,
+  cuántos condominios administra según DBPR (con ejemplos), licencia CAB, email verificado, contacto real
+  del sitio y Plan B al director de operaciones. Sin catastro ni valuación: su dirección es una oficina.
+- **Edificios**: el enriquecimiento completo del motor (DBPR, catastro, licencias, IA, email, Plan B,
+  ticket estimado, score) + gancho de zona por Places Nearby.
+- El teléfono del CRM nunca cambia; las otras líneas van a la Ficha. Contactos que no son personas
+  ("Important Links", "Property Management Group") se descartan.
+
+Siempre hace el dry run del CRM y deja todo en `out/enrich-…/` (`backfill.jsonl`, `enrich_payload.json`,
+`crm_dry_run.json`, `crm_commit.json`, `backfill_report.json` con lo que recibió Ficha / Plan B /
+administradora / ZIP y el costo de APIs). El CRM conserva el gancho de la setter, agrega Zona/Ficha solo
+si no había Ficha y completa solo campos vacíos; un envío real marca el lead por 30 días.
+
 ### Directivos de la asociación (Sunbiz)
 
 DBPR da el nombre legal exacto de la asociación (`OLYMPUS ASSOC., INC.`) pero su `Managing Entity

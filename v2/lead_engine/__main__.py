@@ -12,6 +12,7 @@
   python -m lead_engine enrich-phones out/<lote>/needs_phone.csv --dry-run   # reintentar teléfonos pendientes
   python -m lead_engine daily --target-pool 40 [--commit]  # rutina diaria completa
   python -m lead_engine feedback [--metrics]               # resultados del CRM → teléfonos malos, conversión
+  python -m lead_engine backfill-crm --active --limit 50 [--commit]  # enriquecer leads ya cargados
   python -m lead_engine sunbiz-sync                         # directivos de asociaciones (data/sunbiz/)
 """
 
@@ -130,6 +131,15 @@ def _main(argv: list[str] | None = None) -> int:
     sb = sub.add_parser("sunbiz-sync", help="indexar el Corporate Data File de Sunbiz dejado en data/sunbiz/")
     sb.add_argument("--dir", help="carpeta con los archivos (default data/sunbiz/)")
     sb.add_argument("--all", action="store_true", help="indexar todas las entidades, no solo asociaciones")
+    bf = sub.add_parser("backfill-crm", help="enriquecer leads que ya están en el CRM (Ficha, administradora, ZIP)")
+    bf.add_argument("--status", help="estados del CRM separados por coma (default: todos, papers_sent primero)")
+    bf.add_argument("--active", action="store_true", help="solo papeles enviados y llamadas activas")
+    bf.add_argument("--limit", type=int, help="máximo de leads a trabajar")
+    bf.add_argument("--commit", action="store_true", help="escribir en el CRM (siempre hace antes el dry run)")
+    bf.add_argument("--no-ai", action="store_true")
+    bf.add_argument("--no-nearby", action="store_true", help="sin Places Nearby (sin gancho de zona)")
+    bf.add_argument("--include-attempted", action="store_true", help="incluir los intentados en los últimos 30 días")
+    bf.add_argument("--from-batch", help="out/enrich-…: enviar (--commit) el payload ya revisado de esa corrida")
     rt = sub.add_parser("route", help="ruta de inspecciones optimizada por zonas")
     rt.add_argument("input", help="leads.jsonl del lote o export del CRM (.csv/.json) con address e inspection_at")
     rt.add_argument("--date", help="día (YYYY-MM-DD, default hoy en Miami)")
@@ -237,6 +247,24 @@ def _main(argv: list[str] | None = None) -> int:
                   "y dejalo ahí (.txt/.dat/.zip, o CSV con encabezados).")
             return 1
         print(json.dumps(stats, indent=2))
+        return 0
+    if args.cmd == "backfill-crm":
+        from . import backfill
+        statuses = [x.strip() for x in args.status.split(",") if x.strip()] if args.status else (
+            list(backfill.ACTIVE) if args.active else None)
+        try:
+            if args.from_batch:
+                if not args.commit:
+                    print("--from-batch solo tiene sentido con --commit")
+                    return 2
+                print(json.dumps(backfill.commit_saved(args.from_batch), ensure_ascii=False, indent=2))
+                return 0
+            rep = backfill.run(statuses=statuses, limit=args.limit, commit=args.commit, use_ai=not args.no_ai,
+                               nearby=not args.no_nearby, include_attempted=args.include_attempted)
+        except backfill.CrmError as exc:
+            print(f"CRM: {exc}")
+            return 1
+        print(json.dumps({k: v for k, v in rep.items()}, ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "route":
         return _route(args)

@@ -221,7 +221,9 @@ class Lead:
 
         b = self.building or {}
         prop = self.cadastre or {}
-        parts: list[str] = [vertical_label(self.vertical)]
+        # A CRM lead that is a management firm itself (backfill of older leads) is not a building.
+        parts: list[str] = ["Administradora de propiedades" if self.evidence.get("lead_kind") == "management_firm"
+                            else vertical_label(self.vertical)]
         if prop.get("year_built"):
             parts.append(f"construido {prop['year_built']}")
         if b.get("levels"):
@@ -250,7 +252,12 @@ class Lead:
             from .valuation import label as deal_label
             parts.append(deal_label(self.estimated_deal))
         cl = self.portfolio_cluster
-        if cl and cl.get("count", 0) > 1:
+        if cl and cl.get("count") and self.evidence.get("lead_kind") == "management_firm":
+            names = ", ".join(x["name"] for x in cl.get("siblings", [])[:2])
+            n = cl["count"]
+            parts.append(f"administra {n} condominio{'s' if n != 1 else ''} registrado{'s' if n != 1 else ''} en DBPR "
+                         f"en la zona" + (f" (incl. {names})" if names else ""))
+        elif cl and cl.get("count", 0) > 1:
             who = self.management_company if cl.get("by") == "company" and self.management_company else (
                 self.contact_name if cl.get("by") == "person" and self.contact_name else "la misma administración")
             names = ", ".join(x["name"] for x in cl.get("siblings", [])[:2])
