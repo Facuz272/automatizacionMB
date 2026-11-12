@@ -140,6 +140,8 @@ def _main(argv: list[str] | None = None) -> int:
     bf.add_argument("--no-nearby", action="store_true", help="sin Places Nearby (sin gancho de zona)")
     bf.add_argument("--include-attempted", action="store_true", help="incluir los intentados en los últimos 30 días")
     bf.add_argument("--from-batch", help="out/enrich-…: enviar (--commit) el payload ya revisado de esa corrida")
+    bf.add_argument("--rebuild", action="store_true",
+                    help="con --from-batch: rearmar el payload con las reglas actuales (sin APIs) y repetir el dry run")
     rt = sub.add_parser("route", help="ruta de inspecciones optimizada por zonas")
     rt.add_argument("input", help="leads.jsonl del lote o export del CRM (.csv/.json) con address e inspection_at")
     rt.add_argument("--date", help="día (YYYY-MM-DD, default hoy en Miami)")
@@ -253,6 +255,9 @@ def _main(argv: list[str] | None = None) -> int:
         statuses = [x.strip() for x in args.status.split(",") if x.strip()] if args.status else (
             list(backfill.ACTIVE) if args.active else None)
         try:
+            if args.from_batch and args.rebuild:
+                print(json.dumps(backfill.rebuild_saved(args.from_batch), ensure_ascii=False, indent=2))
+                return 0
             if args.from_batch:
                 if not args.commit:
                     print("--from-batch solo tiene sentido con --commit")

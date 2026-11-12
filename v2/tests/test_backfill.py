@@ -353,3 +353,47 @@ def test_firm_without_site_uses_the_verified_catalog(monkeypatch):
     _search_returns(monkeypatch, [])
     crawled.clear()
     assert backfill.payload_row(r2, backfill.enrich_row(r2, use_ai=False, nearby=False), "t") is None and not crawled
+
+
+def test_out_of_state_headquarters_and_realtor_emails_are_not_sent():
+    from lead_engine.models import Lead
+    firm = Lead(source="crm", source_id="crm:x", strategy_kind="portfolio", company_name="The Management Trust",
+                address="8485 W Sunset Rd #100, Las Vegas, NV 89113", website_url="https://managementtrust.com/",
+                management_company="The Management Trust", management_type="third_party")
+    firm.evidence["lead_kind"], firm.web_text = "management_firm", "site"
+    p = backfill.payload_row(row(name="The Management Trust"), firm, "t")
+    assert "address" not in p and p["website_url"] == "https://managementtrust.com/"
+    tower = Lead(source="crm", source_id="crm:y", strategy_kind="onsite", company_name="Ponce Towers",
+                 address="134 Madeira Ave, Miami, FL 33134", email="b@magiccityrealtors.com", email_status="mx")
+    tower.evidence["lead_kind"], tower.web_text = "building", "site"
+    p = backfill.payload_row(row(name="Ponce Towers"), tower, "t")
+    assert "email" not in p and p["address"] == "134 Madeira Ave, Miami, FL 33134"
+    tower.email = "board@poncetowers.org"
+    assert backfill.payload_row(row(name="Ponce Towers"), tower, "t")["email"] == "board@poncetowers.org"
+    assert not backfill.plausible_person("Financial Reporting")
+
+
+def test_rebuild_reapplies_rules_without_calling_apis(wired, fake_crm, monkeypatch):  # noqa: F811
+    object.__setattr__(settings, "google_places_api_key", "k")
+    _search_returns(monkeypatch, PLACES)
+    rep = backfill.run(limit=5, use_ai=False, nearby=False, out_dir=wired / "o")
+    out = wired / "o" / rep["batch_id"]
+    rows = [json.loads(l) for l in (out / "backfill.jsonl").read_text().splitlines()]
+    rows[0]["lead"]["contacts"].append({"name": "Financial Reporting", "title": "Owner", "role": "exec",
+                                        "source": "website"})
+    (out / "backfill.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    monkeypatch.setattr(backfill, "enrich_row", lambda *a, **k: pytest.fail("no API is called again"))
+    monkeypatch.setattr(gp, "_search", lambda *a, **k: pytest.fail("no API is called again"))
+    rep2 = backfill.rebuild_saved(out)
+    sent = json.loads((out / "enrich_payload.json").read_text())["leads"]
+    assert rep2["rebuilt"] and len(sent) == 1 and "Financial Reporting" not in json.dumps(sent)
+    assert "\nFicha: " in sent[0]["sales_strategy"] and fake_crm.posts[-1][0] is True
+
+
+def test_dropping_a_fake_plan_b_contact_restores_the_generic_one():
+    from lead_engine.models import Lead
+    l = Lead(source="crm", source_id="crm:n", strategy_kind="portfolio", company_name="Novel Management")
+    l.evidence["lead_kind"] = "management_firm"
+    l.add_contact("Financial Reporting", "Owner", "website")
+    backfill.drop_implausible_contacts(l)
+    assert l.contacts == [] and "Plan B: pedir por el Director de Operaciones" in l.brief()

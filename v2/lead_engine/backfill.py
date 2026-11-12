@@ -206,7 +206,8 @@ NOT_A_PERSON = re.compile(
     r"company|admin|login|page|news|menu|click|here|welcome|community|communities|condo\w*|hoa|services|"
     r"maintenance|accounting|leasing|sales|owners?|apply|online|payments?|forms?|faq|careers?|our|your|free|"
     r"rental|analysis|order|estoppel|request|quote|schedule|book|view|learn|more|read|start|sign|pay|submit|"
-    r"download|corporate|profiles?|resources?|testimonials?|reviews?|blog|gallery|events?|amenities)\b")
+    r"download|corporate|profiles?|resources?|testimonials?|reviews?|blog|gallery|events?|amenities|"
+    r"financial|financials|reporting|reports?|statements?|documents?|directory|calendar|newsletter)\b")
 
 
 def plausible_person(name: str | None, company: str | None = None) -> bool:
@@ -220,6 +221,17 @@ def plausible_person(name: str | None, company: str | None = None) -> bool:
     return all(w[:1].isupper() for w in words if w.isalpha())
 
 
+def ensure_plan_b(lead: Lead) -> None:
+    """A Plan B is always printed: a real second contact, else the firm's / building's generic second door."""
+    if lead.plan_b() or (lead.plan_b_fallback or {}).get("text"):
+        return
+    if lead.evidence.get("lead_kind") == "management_firm":
+        lead.plan_b_fallback = {"text": FIRM_PLAN_B, "source": "tactical"}
+    else:
+        from .pipeline import apply_plan_b_fallback
+        apply_plan_b_fallback(lead)
+
+
 def drop_implausible_contacts(lead: Lead) -> None:
     from .models import clean_person_name
 
@@ -230,6 +242,7 @@ def drop_implausible_contacts(lead: Lead) -> None:
     if lead.contact_name and not plausible_person(lead.contact_name, lead.company_name):
         lead.evidence["contact_dropped"] = lead.contact_name
         lead.contact_name = lead.contact_title = None
+    ensure_plan_b(lead)
 
 
 def firm_hook(lead: Lead) -> str:
@@ -417,6 +430,10 @@ def identified(lead: Lead) -> bool:
                 or lead.evidence.get("address_from") or lead.web_text)
 
 
+REALTOR_EMAIL = re.compile(r"(?i)@(?:[\w-]+\.)*(?:[\w-]*realt\w*|[\w-]*homes?|kw|compass|remax|coldwellbanker|"
+                           r"sothebysrealty|exprealty|bhhs\w*|[\w-]*condosforsale)\.[a-z.]+$")
+
+
 def payload_row(row: dict[str, Any], lead: Lead, batch_id: str) -> dict[str, Any] | None:
     """Exactly what POST /api/public/leads-enrich takes for one lead (always by id); None when there is
     nothing worth sending."""
@@ -430,7 +447,12 @@ def payload_row(row: dict[str, Any], lead: Lead, batch_id: str) -> dict[str, Any
     for k in ("management_company", "contact_name", "contact_title", "email", "website_url", "maps_url"):
         if p.get(k):
             out[k] = p[k]
+    if p.get("email") and lead.evidence.get("lead_kind") == "building" and REALTOR_EMAIL.search(p["email"]):
+        p.pop("email")                                 # a realtor's address on a condo page is not the building's
+        out.pop("email", None)
     addr = building_address(p.get("address")) if lead.evidence.get("lead_kind") == "building" else p.get("address")
+    if addr and not re.search(r",\s*FL\b", addr):
+        addr = None                                    # a national firm's out-of-state headquarters is no use here
     if addr and dbpr.zip5(addr) and "@" not in addr:
         out["address"] = addr
     if out.get("contact_name") and not out.get("contact_title"):
@@ -537,5 +559,35 @@ def commit_saved(out: Path) -> dict[str, Any]:
     (out / "crm_commit.json").write_text(json.dumps(real, ensure_ascii=False, indent=2), encoding="utf-8")
     worked = [json.loads(l) for l in (out / "backfill.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
     report = {**report, "committed": True, **summarize(worked, payloads, real)}
+    (out / "backfill_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
+
+
+def rebuild_saved(out: Path) -> dict[str, Any]:
+    """Recompute enrich_payload.json of a dry run from the leads it already enriched (backfill.jsonl), with the
+    current clean-up rules: no API is called again. Only leads that were identified then are rebuilt."""
+    out = Path(out)
+    worked = [json.loads(l) for l in (out / "backfill.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    batch_id = json.loads((out / "enrich_payload.json").read_text(encoding="utf-8"))["batch_id"]
+    payloads = []
+    for w in worked:
+        if not w.get("sent") or not w.get("lead"):
+            continue
+        lead = Lead.from_record(w["lead"])
+        lead.web_text = "(identificado en la corrida original)"
+        drop_implausible_contacts(lead)
+        p = payload_row({"id": w["id"], "name": w["name"], "phone": lead.phone}, lead, batch_id)
+        w["fields"] = sorted(set(p or {}) - {"id", "phone", "name"})
+        w["sent"] = bool(p)
+        if p:
+            payloads.append(p)
+    (out / "backfill.jsonl").write_text("\n".join(json.dumps(w, ensure_ascii=False, default=str) for w in worked)
+                                        + "\n", encoding="utf-8")
+    (out / "enrich_payload.json").write_text(json.dumps({"batch_id": batch_id, "leads": payloads},
+                                                        ensure_ascii=False, indent=2), encoding="utf-8")
+    dry = post_enrich(payloads, batch_id, dry_run=True) if payloads else None
+    (out / "crm_dry_run.json").write_text(json.dumps(dry, ensure_ascii=False, indent=2), encoding="utf-8")
+    report = json.loads((out / "backfill_report.json").read_text(encoding="utf-8"))
+    report = {**report, "committed": False, **summarize(worked, payloads, dry), "rebuilt": True}
     (out / "backfill_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
