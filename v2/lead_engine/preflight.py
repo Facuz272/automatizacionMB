@@ -101,6 +101,10 @@ def registry_checks() -> list[Check]:
             n = 0
         out.append(Check("datos", label, OK if n else PENDING, f"{n:,} filas" if n else f"vacío: {cmd}"))
     conn.close()
+    from . import sunbiz
+    n = sunbiz.count() if sunbiz._db_path().exists() else 0
+    out.append(Check("datos", "Sunbiz (directivos)", OK if n else PENDING,
+                     f"{n:,} asociaciones" if n else "vacío: archivo en data/sunbiz/ + sunbiz-sync (opcional)"))
     return out
 
 

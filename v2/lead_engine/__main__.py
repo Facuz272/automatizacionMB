@@ -11,6 +11,8 @@
   python -m lead_engine portfolios --top 15 --pdf          # ranking de administradoras + dossiers PDF
   python -m lead_engine enrich-phones out/<lote>/needs_phone.csv --dry-run   # reintentar teléfonos pendientes
   python -m lead_engine daily --target-pool 40 [--commit]  # rutina diaria completa
+  python -m lead_engine feedback [--metrics]               # resultados del CRM → teléfonos malos, conversión
+  python -m lead_engine sunbiz-sync                         # directivos de asociaciones (data/sunbiz/)
 """
 
 from __future__ import annotations
@@ -122,6 +124,12 @@ def _main(argv: list[str] | None = None) -> int:
     dy.add_argument("--no-slack", action="store_true")
     dy.add_argument("--no-mix", action="store_true", help="una sola fuente en vez del mix de verticales del perfil")
     dy.add_argument("--no-ai", action="store_true")
+    fbp = sub.add_parser("feedback", help="leer /api/public/lead-outcomes del CRM: teléfonos malos, administradoras, conversión")
+    fbp.add_argument("--since", help="ISO 8601; por defecto desde la última lectura")
+    fbp.add_argument("--metrics", action="store_true", help="solo mostrar la conversión guardada (sin red)")
+    sb = sub.add_parser("sunbiz-sync", help="indexar el Corporate Data File de Sunbiz dejado en data/sunbiz/")
+    sb.add_argument("--dir", help="carpeta con los archivos (default data/sunbiz/)")
+    sb.add_argument("--all", action="store_true", help="indexar todas las entidades, no solo asociaciones")
     rt = sub.add_parser("route", help="ruta de inspecciones optimizada por zonas")
     rt.add_argument("input", help="leads.jsonl del lote o export del CRM (.csv/.json) con address e inspection_at")
     rt.add_argument("--date", help="día (YYYY-MM-DD, default hoy en Miami)")
@@ -209,6 +217,26 @@ def _main(argv: list[str] | None = None) -> int:
         sheets = inspector_sheet.generate_batch([r for r in recs if (r.get("lead_score") or 0) >= args.min_score],
                                                 out.parent / "campo")
         print(f"{len(files)} PDF en {out}/ · {len(sheets)} hojas de campo en {out.parent / 'campo'}/")
+        return 0
+    if args.cmd == "feedback":
+        from . import feedback
+        if not args.metrics:
+            rep = feedback.sync(since=args.since)
+            print(feedback.report_text(rep))
+        print(json.dumps({"conversion": feedback.conversion(),
+                          "mix_weights": feedback.weighted_mix(settings.daily_mix or [])[1]}, ensure_ascii=False, indent=2))
+        return 0
+    if args.cmd == "sunbiz-sync":
+        from pathlib import Path
+
+        from . import sunbiz
+        folder = Path(args.dir) if args.dir else sunbiz.data_dir()
+        stats = sunbiz.sync(folder, everything=args.all)
+        if not stats["files"]:
+            print(f"No hay archivos en {folder}: descargá el Corporate Data File de Sunbiz (trimestral o diario) "
+                  "y dejalo ahí (.txt/.dat/.zip, o CSV con encabezados).")
+            return 1
+        print(json.dumps(stats, indent=2))
         return 0
     if args.cmd == "route":
         return _route(args)

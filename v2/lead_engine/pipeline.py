@@ -85,7 +85,10 @@ def merge_phones(lead: Lead, facts: SiteFacts) -> None:
 
 
 def choose_primary_phone(lead: Lead) -> None:
-    """Management office / property manager line beats Google's main number; front desk/leasing never win."""
+    """Management office / property manager line beats Google's main number; front desk/leasing never win.
+    A firm line chosen because the CRM said the building is run externally stays primary."""
+    if lead.evidence.get("phone_feedback") == "external_management" and lead.phone:
+        return
     usable = [p for p in lead.phones if p["label"] != "fax"]
     if not usable:
         return
@@ -95,6 +98,52 @@ def choose_primary_phone(lead: Lead) -> None:
         if lead.phone and lead.phone != best["number"]:
             lead.evidence["phone_replaced"] = {"from": lead.phone, "to": best["number"], "label": best["label"]}
         lead.phone = best["number"]
+
+
+# ── CRM feedback: phones proven wrong for this building, firm preferred ────
+
+def drop_bad_phones(lead: Lead, bad: set[str]) -> list[str]:
+    """Remove every number the CRM proved wrong / dead for this building; re-pick the primary among the rest."""
+    if not bad:
+        return []
+    removed = [p["number"] for p in lead.phones if phone_key(p["number"]) in bad]
+    lead.phones = [p for p in lead.phones if phone_key(p["number"]) not in bad]
+    if lead.phone and phone_key(lead.phone) in bad:
+        removed.append(lead.phone)
+        lead.phone = None
+        if lead.evidence.get("phone_from"):
+            lead.evidence["phone_from_discarded"] = lead.evidence.pop("phone_from")
+    if removed:
+        lead.evidence["bad_phones_excluded"] = sorted(set(removed) | set(lead.evidence.get("bad_phones_excluded") or []))
+    lead.evidence["bad_phone_keys"] = sorted(bad)
+    if not lead.phone:
+        choose_primary_phone(lead)
+    return removed
+
+
+def apply_prefer_firm(lead: Lead, bad: set[str]) -> bool:
+    """The CRM reported 'external management': dial the firm's published office line first (the building's own
+    line stays as a backup in the Ficha). Uses the firm named by DBPR / the site; no firm line → unchanged."""
+    from . import phone_resolver
+
+    rec = lead.public_records.get("dbpr") or {}
+    company = lead.management_company or rec.get("management_company")
+    fp = phone_resolver.firm_phone(company) if company else None
+    lead.evidence["prefer_firm"] = True
+    if not fp or phone_key(fp["number"]) in bad or phone_key(fp["number"]) == phone_key(lead.phone or ""):
+        lead.evidence["prefer_firm_unresolved"] = company or "administradora desconocida"
+        return False
+    if not any(phone_key(p["number"]) == phone_key(fp["number"]) for p in lead.phones):
+        lead.phones.append({"number": fp["number"], "label": "firm_central", "source": fp["source"],
+                            "context": f"{fp['firm']} · administración externa (CRM)"})
+    if lead.phone:
+        lead.evidence["phone_replaced"] = {"from": lead.phone, "to": fp["number"], "label": "firm_central"}
+    lead.phone = fp["number"]
+    lead.management_company = lead.management_company or company
+    lead.management_type = "third_party"
+    lead.evidence["phone_from"] = "firm_central"
+    lead.evidence["phone_feedback"] = "external_management"
+    return True
 
 
 def _fill_from_site(lead: Lead, facts: SiteFacts) -> None:
@@ -271,6 +320,30 @@ def apply_dbpr(lead: Lead, rec: dict | None) -> None:
         lead.evidence["contact_from"] = "dbpr"
 
 
+def apply_sunbiz(lead: Lead) -> None:
+    """Board officers of the association (local Sunbiz index, matched by DBPR legal name + ZIP / city):
+    contacts for the Ficha's Plan B, and President / VP as the contact when nobody else is known.
+    Only names and titles; never an address."""
+    from . import sunbiz
+
+    rec = lead.public_records.get("dbpr") or {}
+    legal = rec.get("association") or lead.association_name
+    if not legal:
+        return
+    hit = sunbiz.match(legal, dbpr.zip5(lead.address), dbpr.city_of(lead.address))
+    if not hit:
+        return
+    lead.public_records["sunbiz"] = hit
+    people = [o for o in hit["officers"] if o["name"] and o.get("kind") != "C"]
+    for o in people:
+        lead.add_contact(o["name"], sunbiz.board_title(o["title"]), "sunbiz")
+    if not lead.contact_name and hit["active"]:
+        top = next((o for o in people if (o["title"] or "").split(" /")[0] in ("President", "Vice President")), None)
+        if top and len(top["name"].split()) >= 2:
+            lead.contact_name, lead.contact_title = top["name"], sunbiz.board_title(top["title"])
+            lead.evidence["contact_from"] = "sunbiz"
+
+
 def apply_search(lead: Lead, found: dict) -> None:
     if not found:
         return
@@ -334,6 +407,7 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
             apply_dbpr(lead, {**lead.public_records["dbpr"]})
         else:
             apply_dbpr(lead, dbpr.match(lead.address, lead.company_name))
+        apply_sunbiz(lead)
 
     # External search when the site and registry left gaps.
     emails: dict[str, str] = dict(facts.emails)
@@ -431,6 +505,7 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
                 lead.email_status = email_verify.email_status(lead.email)
     rule_qualify(lead)  # fills whatever is still empty
     apply_firm_backup_phone(lead)
+    drop_bad_phones(lead, set(lead.evidence.get("bad_phone_keys") or []))
     apply_plan_b_fallback(lead)
     scoring.apply(lead)
     lead.evidence["site_pages"] = facts.pages[:6]
@@ -460,7 +535,8 @@ def firm_line(lead: Lead) -> tuple[str, str] | None:
         fp = phone_resolver.firm_phone(lead.management_company)
         if fp:
             number, who = fp["number"], fp.get("firm") or lead.management_company
-    if number and phone_key(number) != phone_key(lead.phone or ""):
+    if number and phone_key(number) != phone_key(lead.phone or "") and \
+            phone_key(number) not in set(lead.evidence.get("bad_phone_keys") or []):
         return number, who
     return None
 
@@ -592,8 +668,13 @@ def _run(strategy, limit, sources, seed, use_ai, use_apollo, precheck, send, com
         attempts += 1
         if attempts > max_candidates:
             break
+        bad = ledger.bad_phones_for(lead)        # CRM feedback: numbers proven wrong / dead for this building
         if lead.source in ("dbpr", "pa"):
             resolve_seed(lead, use_search)
+        if bad and drop_bad_phones(lead, bad) and not lead.phone and lead.source in ("dbpr", "pa"):
+            from . import phone_resolver
+            if phone_resolver.resolve(lead, steps=("lodging",)):     # Places had it; the lodging line is next
+                drop_bad_phones(lead, bad)
         if lead.reviews and lead.lat is not None:
             review_pool.append({"id": lead.source_id, "name": lead.company_name, "lat": lead.lat, "lng": lead.lng,
                                 "reviews": lead.reviews})
@@ -602,10 +683,13 @@ def _run(strategy, limit, sources, seed, use_ai, use_apollo, precheck, send, com
         if needs_site and lead.website_url:
             facts = crawl(lead.website_url)
             _fill_from_site(lead, facts)
+            drop_bad_phones(lead, bad)
         if not lead.phone and lead.source in ("dbpr", "pa"):
             from . import phone_resolver
-            if phone_resolver.resolve(lead, steps=("firm_central",)):
+            if phone_resolver.resolve(lead, steps=("firm_central",)) and not drop_bad_phones(lead, bad):
                 lead.evidence["phone_cascade"] = "firm_central"
+        if ledger.flags_for(lead).get("prefer_firm"):
+            apply_prefer_firm(lead, bad)
         problem = contactability_problem(lead, settings.target_state)
         if problem:
             if lead.source in ("dbpr", "pa") and not lead.phone:

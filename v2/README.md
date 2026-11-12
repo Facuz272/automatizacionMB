@@ -313,6 +313,40 @@ siguiente los salta, así `--seed dbpr --limit 20` trae los 20 siguientes del ra
 `--ignore-seen` los vuelve a incluir; `--retry-needs-phone` reintenta solo los que quedaron sin
 teléfono. El `quality_report.json` cuenta `skipped_seen_in_earlier_runs`.
 
+### Feedback del CRM (`feedback`, paso 0 de `daily`)
+
+Al arrancar, `daily` lee `GET /api/public/lead-outcomes?since=…` (header `x-webhook-secret`) y lo guarda
+en `data/state.db` (`crm_outcomes`, `bad_phones`, `building_flags`). Si el endpoint todavía no existe
+(404) o falla, solo deja un warning y la corrida sigue igual.
+
+- `discard_reason = wrong_number` o `no_answer_streak >= 6` (sin inspección ni venta) → ese teléfono
+  queda vetado para ese edificio y el edificio se reabre (`rephone`): la próxima corrida lo vuelve a
+  trabajar, descarta ese número venga de donde venga (Places, OSM, web, Lodging, administradora) y
+  usa otro; si no hay otro, va a `needs_phone.csv`.
+- `external_management` → el edificio se reabre con `prefer_firm`: se marca la línea publicada de la
+  administradora como teléfono principal y la del edificio queda de respaldo en la Ficha.
+- `out_of_area` → se informa el ZIP (candidato a `exclude_zips`), no se aplica solo.
+  `not_management` → se cuenta.
+- Conversión (inspección agendada / venta) por semilla, segmento, condado y fuente:
+  `python -m lead_engine feedback --metrics`. Con 30+ leads trabajados, la porción del `daily_mix`
+  se multiplica por su tasa de inspección contra la tasa general (entre x0.5 y x2.0).
+
+Acepta una lista o `{outcomes|leads|items|data: [...], next_cursor}`; los motivos en castellano del
+CRM ("Número equivocado", "Administración remota / externa", "Fuera de zona", "No es administrador")
+se mapean solos.
+
+### Directivos de la asociación (Sunbiz)
+
+DBPR da el nombre legal exacto de la asociación (`OLYMPUS ASSOC., INC.`) pero su `Managing Entity
+Number` no es el documento de Sunbiz: el cruce es por nombre legal normalizado (ASSOC/ASSN →
+ASSOCIATION, CONDO → CONDOMINIUM, sin INC/puntuación) + ZIP/ciudad. Descargar el Corporate Data File
+(trimestral o diario) del servicio de descargas de la División de Corporaciones, dejarlo en
+`data/sunbiz/` (`.txt`/`.dat`, también dentro de `.zip`, o CSV con encabezados) y correr
+`python -m lead_engine sunbiz-sync`. Se indexan solo asociaciones con presidente, VP, tesorero,
+secretario, directores / manager y agente registrado: **nombre y cargo, nunca domicilios**. En el
+enriquecimiento, el presidente o VP pasa a ser el contacto si no hay otro y el resto alimenta el Plan B
+de la Ficha. La búsqueda online de Sunbiz responde 403 a clientes automáticos y no se usa.
+
 ### Inteligencia competitiva de la zona
 
 Con las reseñas de todos los edificios vistos en la corrida (gratis) y, si `COMPETITOR_NEARBY=true`,

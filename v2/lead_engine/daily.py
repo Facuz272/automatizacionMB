@@ -1,5 +1,7 @@
 """Daily routine in one command (`python -m lead_engine daily`).
 
+  0. CRM feedback (feedback.py): GET /api/public/lead-outcomes → bad phones / external firms / conversion
+     (a 404 or failure is only a warning); committed batches the CRM did not confirm are re-sent first.
   1. CRM pool: GET {CRM_BASE_URL}/api/public/health (x-webhook-secret = CRM_WEBHOOK_SECRET). When the
      answer carries an available-leads count (`pool_available`, or `facts.pool_available` /
      `pool_remaining` / `pool_restante`) the batch is `--target-pool` minus that count. The current CRM
@@ -113,6 +115,13 @@ def slack_text(s: dict[str, Any], why: str) -> str:
             f"Motivo del tamaño: {why}. Sin teléfono: {s['needs_phone']}"
             + (f" · edificios consolidados en llamadas de administradora: {s['consolidated_siblings']}"
                if s["consolidated_siblings"] else ""))
+    fb = s.get("feedback") or {}
+    if fb.get("ok") and (fb.get("bad_phones") or fb.get("prefer_firm") or fb.get("out_of_area_zips")):
+        from .feedback import report_text
+        head += "\n" + report_text(fb).replace("feedback CRM:", "Feedback del CRM:")
+    if s.get("mix_weights"):
+        head += "\nPesos por conversión: " + " · ".join(f"{w['slice']} x{w['multiplier']} ({w['samples']} muestras)"
+                                                      for w in s["mix_weights"] if w["multiplier"] != 1.0)
     if s.get("mix"):
         head += "\nMix: " + " · ".join(f"{k} {v['accepted']}/{v['quota']}" for k, v in s["mix"].items())
     tops = "\n".join(f"{i}. *{t['name']}* ({t['address']}) — {t['signal']}"
@@ -259,7 +268,13 @@ def run(*, target_pool: int | None = None, fallback_limit: int = 10, limit: int 
 
 
 def _run(*, target_pool, fallback_limit, limit, strategy, sources, commit, use_ai, out_dir, slack, mix) -> dict[str, Any]:
-    from . import pipeline
+    from . import feedback, pipeline
+
+    # 0a. What happened to earlier leads (bad phones → buildings reopened, external firms, conversion).
+    #     Tolerant: a missing endpoint / CRM error is only a warning.
+    fb = feedback.sync() if settings.crm_webhook_secret else {"ok": False, "skipped": True, "why": "sin CRM_WEBHOOK_SECRET"}
+    if not fb.get("skipped"):
+        logger.info(feedback.report_text(fb))
 
     # 0. Committed batches the CRM did not confirm last time go first; while the CRM keeps failing no new
     #    batch is built (it would only add spend to the queue).
@@ -269,19 +284,22 @@ def _run(*, target_pool, fallback_limit, limit, strategy, sources, commit, use_a
         logger.error("daily: {}", why)
         if slack:
             post_slack(f"*Lead Engine · daily*: {why}. Último error: {resent['still_pending'][0]['error']}")
-        return {"batch": None, "skipped": True, "why": why, **resent}
+        return {"batch": None, "skipped": True, "why": why, "feedback": fb, **resent}
 
     health = None if limit is not None else fetch_health()
     n, why = (limit, "--limit explícito") if limit is not None else batch_size(health, target_pool, fallback_limit)
     logger.info("daily: {} leads ({})", n, why)
     if n <= 0:
-        s = {"batch": None, "skipped": True, "why": why, **({"resent_batches": resent["resent"]} if resent["resent"] else {})}
+        s = {"batch": None, "skipped": True, "why": why, "feedback": fb,
+             **({"resent_batches": resent["resent"]} if resent["resent"] else {})}
         if slack:
             post_slack(f"*Lead Engine · daily*: no hace falta cargar leads hoy ({why}).")
         return s
     use_mix = (mix if mix is not None else not sources) and bool(settings.daily_mix)
+    weights: list[dict[str, Any]] = []
     if use_mix:
-        out = run_mix(n, settings.daily_mix, send=bool(settings.crm_webhook_secret), commit=commit, use_ai=use_ai,
+        slices, weights = feedback.weighted_mix(validate_mix(settings.daily_mix))   # conversion with >= 30 samples
+        out = run_mix(n, slices, send=bool(settings.crm_webhook_secret), commit=commit, use_ai=use_ai,
                       out_dir=out_dir)
     else:
         out = pipeline.run(strategy=strategy, limit=n, sources=sources, use_ai=use_ai,
@@ -289,6 +307,9 @@ def _run(*, target_pool, fallback_limit, limit, strategy, sources, commit, use_a
                            make_pdfs=True, pdf_lang="en")
     s = summary(out, committed=commit)
     s["why"] = why
+    s["feedback"] = fb
+    if any(w["multiplier"] != 1.0 for w in weights):
+        s["mix_weights"] = weights
     if resent["resent"]:
         s["resent_batches"] = resent["resent"]
     (out / "daily_summary.json").write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")

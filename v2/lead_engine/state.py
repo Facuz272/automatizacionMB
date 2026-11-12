@@ -11,6 +11,10 @@ skips the rest, so
 `--retry-needs-phone` retries only the ones that lacked a phone.
 `pending_batches`: committed batches whose CRM send failed after the retries; `daily` re-sends them
 before building a new batch.
+`crm_outcomes` / `bad_phones` / `building_flags` / `feedback_state`: what the CRM says happened to each
+lead (feedback.py): phones proven wrong or dead for a building, buildings run by an external firm, and
+the conversion samples behind the daily mix weights. A building whose phone failed is set back to
+"rephone" (not consumed) so the next run looks for another line.
 `seen` / `imported`: older per-source and per-phone tables, kept for compatibility.
 The CRM remains the source of truth for duplicates.
 """
@@ -41,11 +45,32 @@ CREATE INDEX IF NOT EXISTS seen_leads_src ON seen_leads(source_id);
 CREATE TABLE IF NOT EXISTS pending_batches (
   batch_id TEXT PRIMARY KEY, out_dir TEXT, created_at TEXT, attempts INTEGER, last_error TEXT
 );
+-- CRM feedback (feedback.py): one row per CRM lead, last known outcome.
+CREATE TABLE IF NOT EXISTS crm_outcomes (
+  crm_id TEXT PRIMARY KEY, batch_id TEXT, source TEXT, seed TEXT, segment TEXT, county TEXT, zip TEXT,
+  phone_key TEXT, building_key TEXT, status TEXT, call_attempts INTEGER, no_answer_streak INTEGER,
+  discard_reason TEXT, objection TEXT, inspection_scheduled INTEGER, closed_won INTEGER, updated_at TEXT,
+  synced_at TEXT
+);
+CREATE INDEX IF NOT EXISTS crm_outcomes_phone ON crm_outcomes(phone_key);
+-- Phones the CRM proved useless for a building (wrong number / never answers); never offered again there.
+CREATE TABLE IF NOT EXISTS bad_phones (
+  building_key TEXT, phone_key TEXT, reason TEXT, crm_id TEXT, created_at TEXT,
+  PRIMARY KEY (building_key, phone_key)
+);
+-- Per-building hints from the CRM (prefer_firm: the building is run by an external management firm).
+CREATE TABLE IF NOT EXISTS building_flags (
+  building_key TEXT, flag TEXT, value TEXT, crm_id TEXT, created_at TEXT, PRIMARY KEY (building_key, flag)
+);
+CREATE TABLE IF NOT EXISTS feedback_state (key TEXT PRIMARY KEY, value TEXT);
 """
 
 # Statuses that mean "this building is done": a new run skips it. "processed" (older versions wrote it
 # before the CRM confirmed) is deliberately not here.
 CONSUMED = {"imported", "in_crm", "needs_phone", "rejected"}
+# Written by the CRM feedback when a building must be worked again (bad phone / external firm): not consumed,
+# and mark_seen may overwrite it (rank -1).
+REOPENED = "rephone"
 
 STATUS_RANK = {"rejected": 0, "needs_phone": 1, "processed": 2, "in_crm": 3, "imported": 4}
 
@@ -61,6 +86,11 @@ def seed_keys(lead) -> list[str]:
     if lead.source_id:
         keys.append("src:" + lead.source_id)
     return keys
+
+
+def building_keys(lead) -> list[str]:
+    """Keys a building's CRM feedback (bad phones, flags) is stored under: the same identity keys."""
+    return seed_keys(lead)
 
 
 class Ledger:
@@ -161,3 +191,55 @@ class Ledger:
     def seen_counts(self) -> dict[str, int]:
         return dict(self.conn.execute("SELECT status, COUNT(*) FROM seen_leads WHERE seed_key LIKE 'src:%' "
                                       "GROUP BY status").fetchall())
+
+    # ── CRM feedback ──────────────────────────────────────────────────────
+    def buildings_for_phone(self, pkey: str) -> list[dict]:
+        """seen_leads rows (one per building) whose phone was this one."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT address_key, source_id, source, company_name, batch_id FROM seen_leads "
+            "WHERE phone_key = ?", (pkey,)).fetchall()
+        return [dict(zip(("address_key", "source_id", "source", "company_name", "batch_id"), r)) for r in rows]
+
+    def reopen_building(self, address_key: str | None, source_id: str | None) -> int:
+        """Make a consumed building eligible again (next run looks for another phone / the firm's line)."""
+        cur = self.conn.execute(
+            "UPDATE seen_leads SET status = ?, last_seen = ? WHERE (address_key IS NOT NULL AND address_key = ?) "
+            "OR (source_id IS NOT NULL AND source_id = ?)",
+            (REOPENED, datetime.now(timezone.utc).isoformat(), address_key, source_id))
+        self.conn.commit()
+        return cur.rowcount
+
+    def add_bad_phone(self, building_key: str, pkey: str, reason: str, crm_id: str | None = None) -> bool:
+        cur = self.conn.execute("INSERT OR IGNORE INTO bad_phones VALUES (?,?,?,?,?)",
+                                (building_key, pkey, reason, crm_id, datetime.now(timezone.utc).isoformat()))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def bad_phones_for(self, lead) -> set[str]:
+        keys = building_keys(lead)
+        if not keys:
+            return set()
+        rows = self.conn.execute(f"SELECT phone_key FROM bad_phones WHERE building_key IN ({','.join('?' * len(keys))})",
+                                 keys).fetchall()
+        return {r[0] for r in rows}
+
+    def set_flag(self, building_key: str, flag: str, value: str = "1", crm_id: str | None = None) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO building_flags VALUES (?,?,?,?,?)",
+                          (building_key, flag, value, crm_id, datetime.now(timezone.utc).isoformat()))
+        self.conn.commit()
+
+    def flags_for(self, lead) -> dict[str, str]:
+        keys = building_keys(lead)
+        if not keys:
+            return {}
+        rows = self.conn.execute(f"SELECT flag, value FROM building_flags WHERE building_key IN "
+                                 f"({','.join('?' * len(keys))})", keys).fetchall()
+        return dict(rows)
+
+    def get_state(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM feedback_state WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_state(self, key: str, value: str) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO feedback_state VALUES (?,?)", (key, value))
+        self.conn.commit()
