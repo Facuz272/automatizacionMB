@@ -221,6 +221,11 @@ def plausible_person(name: str | None, company: str | None = None) -> bool:
 
 
 def drop_implausible_contacts(lead: Lead) -> None:
+    from .models import clean_person_name
+
+    lead.contact_name = clean_person_name(lead.contact_name)
+    for c in lead.contacts:
+        c["name"] = clean_person_name(c.get("name")) or c.get("name")
     lead.contacts = [c for c in lead.contacts if plausible_person(c.get("name"), lead.company_name)]
     if lead.contact_name and not plausible_person(lead.contact_name, lead.company_name):
         lead.evidence["contact_dropped"] = lead.contact_name
@@ -331,6 +336,13 @@ def enrich_row(row: dict[str, Any], *, use_ai: bool = True, nearby: bool = True)
     from .web_extract import SiteFacts
 
     firm = is_firm(row.get("name"))
+    if firm and not is_company_site(row.get("website_url")):
+        # No site on the lead: our verified catalog of management firms may know its official domain.
+        from . import mgmt_domains
+        hit = mgmt_domains.from_catalog(row.get("name"))
+        if hit:
+            row = {**row, "website_url": f"https://{hit[1]}/"}
+            logger.info("{}: dominio del catálogo verificado {}", row.get("name"), hit[1])
     found = identify(row, "portfolio" if firm else "onsite") if settings.google_places_api_key else None
     if found:
         firm = is_firm(row.get("name"), found.place_types)

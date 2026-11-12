@@ -15,6 +15,7 @@ exposure, labelled phones, lead_score). The full record stays in leads.jsonl.
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 
@@ -99,6 +100,14 @@ def fit_brief(brief: str, limit: int) -> str:
     return f"{head}: " + " · ".join(facts + ([score] if score else [])) if facts or score else ""
 
 
+def clean_person_name(name: str | None) -> str | None:
+    """'Guillermo Cancio-' → 'Guillermo Cancio': loose dashes, commas, colons or bullets left by the page layout."""
+    if not name:
+        return name
+    n = re.sub(r"\s+", " ", name).strip(" \t-–—,;:|/•·*")
+    return n or None
+
+
 @dataclass
 class Lead:
     # identity / source
@@ -179,6 +188,7 @@ class Lead:
     def add_contact(self, name: str | None, title: str | None, source: str, phone: str | None = None) -> None:
         from .roles import role_of
 
+        name = clean_person_name(name)
         if not name or len(name.split()) < 2:
             return
         for c in self.contacts:

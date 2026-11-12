@@ -321,3 +321,35 @@ def test_a_realtor_line_printed_on_several_building_sites_is_dropped():
     assert all("+15612991145" not in [p["number"] for p in l.phones] for l in leads)
     assert all(len(l.phones) == 2 for l in leads)                     # own lines survive
     assert [l.email for l in leads] == [None, None, "pm@thepoint.org"]
+
+
+@pytest.mark.parametrize("raw,clean", [("Guillermo Cancio-", "Guillermo Cancio"), ("Ana Diaz ,", "Ana Diaz"),
+                                       ("– Luis Paz:", "Luis Paz"), ("John Smith Jr.", "John Smith Jr."),
+                                       ("  Mary   Ann  Lee • ", "Mary Ann Lee")])
+def test_loose_punctuation_is_trimmed_from_names(raw, clean):
+    from lead_engine.models import Lead, clean_person_name
+    assert clean_person_name(raw) == clean
+    l = Lead(source="crm", source_id="crm:x", strategy_kind="onsite", company_name="X")
+    l.add_contact(raw, "President of the Board", "website")
+    assert l.contacts[0]["name"] == clean
+
+
+def test_firm_without_site_uses_the_verified_catalog(monkeypatch):
+    object.__setattr__(settings, "google_places_api_key", "k")
+    grs = _place("G1", "GRS Community Management", "3900 Woodlake Blvd, Lake Worth, FL 33463, USA", "(561) 641-8554",
+                 "https://www.grsmgt.com/")
+    grs["types"] = ["real_estate_agency"]
+    _search_returns(monkeypatch, [grs])
+    crawled = []
+    monkeypatch.setattr(pipeline, "crawl", lambda url, max_pages=5: crawled.append(url) or parse_page(
+        "<html><body>GRS</body></html>", url))
+    monkeypatch.setattr(dbpr, "cluster", lambda **kw: None)
+    r = row(name="GRS Community Management", phone="+13050000000", website_url=None)
+    lead = backfill.enrich_row(r, use_ai=False, nearby=False)
+    assert crawled == ["https://grsmgt.com/"] and lead.evidence["places_match"] == "website"
+    p = backfill.payload_row(r, lead, "t")
+    assert p["website_url"] == "https://grsmgt.com/" and p["address"].endswith("FL 33463")
+    r2 = row(name="Unknown Firm Management", phone="+13050000000", website_url=None)
+    _search_returns(monkeypatch, [])
+    crawled.clear()
+    assert backfill.payload_row(r2, backfill.enrich_row(r2, use_ai=False, nearby=False), "t") is None and not crawled
