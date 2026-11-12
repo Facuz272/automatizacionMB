@@ -235,7 +235,7 @@ def _main(argv: list[str] | None = None) -> int:
         if not args.metrics:
             rep = feedback.sync(since=args.since)
             print(feedback.report_text(rep))
-        print(json.dumps({"conversion": feedback.conversion(),
+        print(json.dumps({"conversion": feedback.conversion(), "quote_loss_reasons": feedback.loss_reasons(),
                           "mix_weights": feedback.weighted_mix(settings.daily_mix or [])[1]}, ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "sunbiz-sync":

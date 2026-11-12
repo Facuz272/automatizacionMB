@@ -292,3 +292,66 @@ def test_slack_mentions_the_feedback():
                                        "out_of_area_zips": {}, "not_management": 0},
                           "mix_weights": [{"slice": "condos", "multiplier": 1.5, "samples": 40}]}, "x")
     assert "Feedback del CRM: 9 resultados · 1 teléfonos descartados" in t and "condos x1.5 (40 muestras)" in t
+
+
+# ── post-visit quote (CRM Block C) ──────────────────────────────────────────
+
+def test_post_visit_fields_are_stored(crm):
+    crm.pages = [Resp(200, {"ok": True, "count": 3, "leads": [
+        outcome(id="q1", phone="+13054270001", visit_completed=True, quote_amount_usd=18500, quote_status="won",
+                quote_loss_reason=None, closed_won=True),
+        outcome(id="q2", phone="+13054270002", visit_completed=True, quote_amount_usd="12,400.50", quote_status="lost",
+                quote_loss_reason="Price"),
+        outcome(id="q3", phone="+13054270003")]}),            # an older CRM: the four keys are absent
+                 ]
+    assert feedback.sync()["stored"] == 3
+    rows = {r[0]: r[1:] for r in Ledger().conn.execute(
+        "SELECT crm_id, visit_completed, quote_amount_usd, quote_status, quote_loss_reason FROM crm_outcomes")}
+    assert rows["q1"] == (1, 18500.0, "won", None)
+    assert rows["q2"] == (1, 12400.5, "lost", "price")
+    assert rows["q3"] == (None, None, None, None)                 # absent ≠ false
+
+
+@pytest.mark.parametrize("raw,amount", [(18500, 18500.0), ("12,400.50", 12400.5), ("$900", 900.0), (None, None),
+                                        ("n/a", None), (-5, None), (True, None)])
+def test_quote_amounts(raw, amount):
+    assert feedback._amount(raw) == amount
+
+
+def test_visit_without_calls_is_a_conversion_sample():
+    o = feedback.normalize_outcome(outcome(call_attempts=0, visit_completed=True))
+    assert feedback.worked(o)
+
+
+def test_old_state_db_gains_the_columns_and_keeps_its_rows(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE crm_outcomes (crm_id TEXT PRIMARY KEY, batch_id TEXT, source TEXT, seed TEXT, segment TEXT, "
+              "county TEXT, zip TEXT, phone_key TEXT, building_key TEXT, status TEXT, call_attempts INTEGER, "
+              "no_answer_streak INTEGER, discard_reason TEXT, objection TEXT, inspection_scheduled INTEGER, "
+              "closed_won INTEGER, updated_at TEXT, synced_at TEXT)")
+    c.execute("INSERT INTO crm_outcomes (crm_id, status) VALUES ('old', 'new')")
+    c.commit()
+    c.close()
+    led = Ledger(path)
+    cols = {r[1] for r in led.conn.execute("PRAGMA table_info(crm_outcomes)")}
+    assert {"visit_completed", "quote_amount_usd", "quote_status", "quote_loss_reason"} <= cols
+    assert led.conn.execute("SELECT status FROM crm_outcomes WHERE crm_id = 'old'").fetchone() == ("new",)
+    feedback.ingest([feedback.normalize_outcome(outcome(id="new", visit_completed=True, quote_status="board_review",
+                                                        quote_amount_usd=7300))], led)
+    assert led.conn.execute("SELECT quote_status, quote_amount_usd FROM crm_outcomes WHERE crm_id='new'").fetchone() == (
+        "board_review", 7300.0)
+    Ledger(path)                                                  # idempotent
+
+
+def test_conversion_counts_visits_quotes_and_loss_reasons():
+    rows = [outcome(id=f"v{i}", phone=f"+1305427{i:04d}", call_attempts=2, visit_completed=True,
+                    quote_amount_usd=10000, quote_status=s, quote_loss_reason=r, closed_won=s == "won")
+            for i, (s, r) in enumerate([("won", None), ("won", None), ("lost", "price"), ("lost", None),
+                                        ("board_review", None)])]
+    feedback.ingest(map(feedback.normalize_outcome, rows))
+    g = feedback.conversion(by=("seed",))[0]
+    assert (g["visits"], g["quotes"], g["quotes_won"], g["quotes_lost"]) == (5, 5, 2, 2)
+    assert g["quoted_usd"] == 50000 and g["won_usd"] == 20000 and g["quote_win_rate"] == 0.5
+    assert feedback.loss_reasons() == {"price": 1, "sin motivo": 1}

@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS crm_outcomes (
   crm_id TEXT PRIMARY KEY, batch_id TEXT, source TEXT, seed TEXT, segment TEXT, county TEXT, zip TEXT,
   phone_key TEXT, building_key TEXT, status TEXT, call_attempts INTEGER, no_answer_streak INTEGER,
   discard_reason TEXT, objection TEXT, inspection_scheduled INTEGER, closed_won INTEGER, updated_at TEXT,
-  synced_at TEXT
+  synced_at TEXT, visit_completed INTEGER, quote_amount_usd REAL, quote_status TEXT, quote_loss_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS crm_outcomes_phone ON crm_outcomes(phone_key);
 -- Phones the CRM proved useless for a building (wrong number / never answers); never offered again there.
@@ -99,6 +99,19 @@ class Ledger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    # Columns added after a table was first created (state.db files from earlier versions keep their rows).
+    ADDED_COLUMNS = {"crm_outcomes": {"visit_completed": "INTEGER", "quote_amount_usd": "REAL",
+                                      "quote_status": "TEXT", "quote_loss_reason": "TEXT"}}
+
+    def _migrate(self) -> None:
+        for table, cols in self.ADDED_COLUMNS.items():
+            have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            for col, kind in cols.items():
+                if col not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+        self.conn.commit()
 
     def outcome(self, source_id: str) -> str | None:
         row = self.conn.execute("SELECT outcome FROM seen WHERE source_id = ?", (source_id,)).fetchone()

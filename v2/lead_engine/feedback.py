@@ -8,7 +8,9 @@ goes on as before. Also accepted: a bare list, or `outcomes` / `items` / `data` 
 Per lead (extra keys ignored, missing ones tolerated): id, batch_id | import_batch_id, source, segment,
 phone, status, call_attempts, no_answer_streak, discard_reason (wrong_number | not_management |
 external_management | out_of_area; the CRM's Spanish labels are accepted too), objection,
-inspection_scheduled, closed_won, changed_at [, address, zip, county].
+inspection_scheduled, closed_won, changed_at [, address, zip, county]; post-visit (CRM 0055, latest quote):
+visit_completed, quote_amount_usd, quote_status (visit_completed | quote_sent | board_review |
+changes_requested | won | lost), quote_loss_reason (price | competitor | postponed | no_budget | scope_mismatch).
 
 What the engine does with it (state.db):
   · wrong_number, or no_answer_streak >= 6 (and no inspection / sale on it) → the phone goes to `bad_phones`
@@ -79,6 +81,17 @@ def _bool(v: Any) -> bool:
     return bool(v)
 
 
+def _amount(v: Any) -> float | None:
+    """USD amount from a number or a numeric string ('12,500.00'); None when missing or not a number."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        x = float(str(v).replace(",", "").replace("$", "").strip()) if isinstance(v, str) else float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(x, 2) if x >= 0 else None
+
+
 def _zip(*texts: Any) -> str | None:
     for t in texts:
         m = re.search(r"\b(\d{5})(?:-\d{4})?\b(?!.*\b\d{5}\b)", str(t or ""))
@@ -115,6 +128,11 @@ def normalize_outcome(raw: dict[str, Any]) -> dict[str, Any] | None:
         "objection": raw.get("objection") or raw.get("objection_reason"),
         "inspection_scheduled": _bool(raw.get("inspection_scheduled")),
         "closed_won": _bool(raw.get("closed_won")),
+        # Post-visit (CRM 0055, latest quote of the lead); None when the CRM does not send them.
+        "visit_completed": _bool(raw["visit_completed"]) if raw.get("visit_completed") is not None else None,
+        "quote_amount_usd": _amount(raw.get("quote_amount_usd")),
+        "quote_status": _slug(raw.get("quote_status")) or None,
+        "quote_loss_reason": _slug(raw.get("quote_loss_reason")) or None,
         "updated_at": raw.get("changed_at") or raw.get("updated_at"),
     }
 
@@ -209,7 +227,8 @@ def _building_keys(o: dict[str, Any], buildings: list[dict]) -> list[tuple[list[
 
 def worked(o: dict[str, Any]) -> bool:
     """A conversion sample: somebody called it, or it ended (discarded / inspection / sale)."""
-    return bool(o["call_attempts"] or o["discard_reason"] or o["inspection_scheduled"] or o["closed_won"])
+    return bool(o["call_attempts"] or o["discard_reason"] or o["inspection_scheduled"] or o["closed_won"]
+                or o.get("visit_completed"))
 
 
 def ingest(outcomes: Iterable[dict[str, Any]], ledger: Ledger | None = None) -> dict[str, Any]:
@@ -220,13 +239,19 @@ def ingest(outcomes: Iterable[dict[str, Any]], ledger: Ledger | None = None) -> 
     for o in outcomes:
         buildings = ledger.buildings_for_phone(o["phone_key"]) if o.get("phone_key") else []
         targets = _building_keys(o, buildings)
-        ledger.conn.execute(
-            "INSERT OR REPLACE INTO crm_outcomes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (o["crm_id"], o["batch_id"], o["source"], o["seed"] or next((b["source"] for b in buildings
-                                                                         if b.get("source")), None), o["segment"], _county(o, buildings), o["zip"],
-             o["phone_key"], targets[0][0][0] if targets else None, o["status"], o["call_attempts"],
-             o["no_answer_streak"], o["discard_reason"], o["objection"], int(o["inspection_scheduled"]),
-             int(o["closed_won"]), o["updated_at"], now))
+        vc = o.get("visit_completed")
+        row = {"crm_id": o["crm_id"], "batch_id": o["batch_id"], "source": o["source"],
+               "seed": o["seed"] or next((b["source"] for b in buildings if b.get("source")), None),
+               "segment": o["segment"], "county": _county(o, buildings), "zip": o["zip"], "phone_key": o["phone_key"],
+               "building_key": targets[0][0][0] if targets else None, "status": o["status"],
+               "call_attempts": o["call_attempts"], "no_answer_streak": o["no_answer_streak"],
+               "discard_reason": o["discard_reason"], "objection": o["objection"],
+               "inspection_scheduled": int(o["inspection_scheduled"]), "closed_won": int(o["closed_won"]),
+               "updated_at": o["updated_at"], "synced_at": now,
+               "visit_completed": None if vc is None else int(vc), "quote_amount_usd": o.get("quote_amount_usd"),
+               "quote_status": o.get("quote_status"), "quote_loss_reason": o.get("quote_loss_reason")}
+        ledger.conn.execute(f"INSERT OR REPLACE INTO crm_outcomes ({', '.join(row)}) VALUES "
+                            f"({', '.join('?' * len(row))})", tuple(row.values()))
         rep["stored"] += 1
         reason = o["discard_reason"]
         converted = o["inspection_scheduled"] or o["closed_won"]
@@ -296,15 +321,32 @@ def conversion(ledger: Ledger | None = None, by: tuple[str, ...] = ("seed", "seg
     cols = [GROUPS[b] for b in by]
     sel = ", ".join(f"COALESCE({c}, '?')" for c in cols)
     rows = ledger.conn.execute(
-        f"SELECT {sel}, COUNT(*), SUM(inspection_scheduled OR closed_won), SUM(closed_won) FROM crm_outcomes "
+        f"SELECT {sel}, COUNT(*), SUM(inspection_scheduled OR closed_won), SUM(closed_won), "
+        "SUM(COALESCE(visit_completed, 0)), SUM(quote_amount_usd IS NOT NULL), "
+        "SUM(CASE WHEN quote_status = 'won' THEN 1 ELSE 0 END), SUM(CASE WHEN quote_status = 'lost' THEN 1 ELSE 0 END), "
+        "SUM(quote_amount_usd), SUM(CASE WHEN quote_status = 'won' THEN quote_amount_usd END) FROM crm_outcomes "
         "WHERE call_attempts > 0 OR discard_reason IS NOT NULL OR inspection_scheduled = 1 OR closed_won = 1 "
+        "OR visit_completed = 1 OR quote_status IS NOT NULL "
         f"GROUP BY {sel} ORDER BY COUNT(*) DESC").fetchall()
     out = []
+    k = len(cols)
     for r in rows:
-        n, insp, won = r[len(cols)], r[len(cols) + 1] or 0, r[len(cols) + 2] or 0
-        out.append({**dict(zip(by, r[:len(cols)])), "n": n, "inspections": insp, "closed": won,
-                    "inspection_rate": round(insp / n, 3) if n else 0.0, "close_rate": round(won / n, 3) if n else 0.0})
+        n, insp, won = r[k], r[k + 1] or 0, r[k + 2] or 0
+        visits, quoted, q_won, q_lost = (r[k + 3] or 0), (r[k + 4] or 0), (r[k + 5] or 0), (r[k + 6] or 0)
+        out.append({**dict(zip(by, r[:k])), "n": n, "inspections": insp, "closed": won,
+                    "inspection_rate": round(insp / n, 3) if n else 0.0, "close_rate": round(won / n, 3) if n else 0.0,
+                    "visits": visits, "quotes": quoted, "quotes_won": q_won, "quotes_lost": q_lost,
+                    "quoted_usd": round(r[k + 7] or 0, 2), "won_usd": round(r[k + 8] or 0, 2),
+                    "quote_win_rate": round(q_won / (q_won + q_lost), 3) if q_won + q_lost else None})
     return out
+
+
+def loss_reasons(ledger: Ledger | None = None) -> dict[str, int]:
+    """Why quotes were lost (price, competitor, postponed, no_budget, scope_mismatch, sin motivo)."""
+    ledger = ledger or Ledger()
+    rows = ledger.conn.execute("SELECT COALESCE(quote_loss_reason, 'sin motivo'), COUNT(*) FROM crm_outcomes "
+                               "WHERE quote_status = 'lost' GROUP BY 1 ORDER BY 2 DESC").fetchall()
+    return dict(rows)
 
 
 def _slice_rows(ledger: Ledger, sl: dict[str, Any]) -> tuple[int, int]:
