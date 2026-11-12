@@ -9,6 +9,7 @@ import requests
 from lead_engine import backfill, costs, dbpr, pipeline
 from lead_engine.collectors import google_places as gp
 from lead_engine.config import settings
+from lead_engine.normalize import phone_key
 from lead_engine.web_extract import parse_page
 
 from test_pipeline_e2e import PLACES, _place, wired  # noqa: F401  (fixture)
@@ -98,6 +99,9 @@ def test_papers_sent_and_live_calls_go_first():
     ("Town Aventura Luxury Apartments", None, False), ("Mystic Pointe Tower 100", None, False),
     ("Avanti Way", ["condominium_complex"], False),
     ("Premier Association Management", ["condominium_complex"], False),      # Places says it is a building
+    ("RealManage Coral Springs", ["service"], True), ("Condominium Associates", None, True),
+    ("Privé Condominium Management", ["condominium_complex"], False),
+    ("Lago Grande Homeowners Associates", None, False), ("Grove at Grand Bay Condominium Association", None, False),
 ])
 def test_firm_or_building(name, types, firm):
     assert backfill.is_firm(name, types) is firm
@@ -265,7 +269,9 @@ def test_network_errors_surface_as_crm_errors(monkeypatch):
 
 @pytest.mark.parametrize("name,ok", [("Laura Vega", True), ("Ana M. Diaz", True), ("Important Links", False),
                                      ("Property Management Group", False), ("Contact Us", False), ("Owner", False),
-                                     ("Keystone Property", False), ("Board Of Directors", False), ("john smith", False)])
+                                     ("Keystone Property", False), ("Board Of Directors", False), ("john smith", False),
+                                     ("Free Rental Analysis", False), ("Order Estoppel", False),
+                                     ("Corporate Profiles", False)])
 def test_contact_names_must_be_people(name, ok):
     assert backfill.plausible_person(name, "Keystone Property Management") is ok
 
@@ -290,3 +296,28 @@ def test_commit_saved_sends_exactly_the_reviewed_payload(wired, fake_crm, monkey
     rep2 = backfill.commit_saved(out)
     assert fake_crm.posts[-2:] == [(True, [l["id"] for l in sent]), (False, [l["id"] for l in sent])]
     assert rep2["committed"] and (out / "crm_commit.json").exists() and rep2["costs"] == rep["costs"]
+
+
+def test_units_are_stripped_from_building_addresses():
+    assert backfill.building_address("800 Claughton Island Dr APT 603, Miami, FL 33131") == \
+        "800 Claughton Island Dr, Miami, FL 33131"
+    assert backfill.building_address("600 NE 36th St Apt C11, Miami, FL 33137") == "600 NE 36th St, Miami, FL 33137"
+    assert backfill.building_address("1 Ocean Dr, Miami Beach, FL 33139") == "1 Ocean Dr, Miami Beach, FL 33139"
+
+
+def test_a_realtor_line_printed_on_several_building_sites_is_dropped():
+    from lead_engine.models import Lead
+    agent = {"number": "+15612991145", "label": "leasing", "source": "tel_link", "context": ""}
+    leads = []
+    for i, name in enumerate(("Icon", "Grove at Grand Bay", "The Point")):
+        l = Lead(source="crm", source_id=f"crm:{i}", strategy_kind="onsite", company_name=name,
+                 phone=f"+1305695691{i}", email="inquiry@condomatch.com" if i < 2 else "pm@thepoint.org",
+                 email_status="mx")
+        l.phones = [{"number": l.phone, "label": "google_main", "source": "google_places", "context": ""}, dict(agent),
+                    {"number": f"+1305111222{i}", "label": "management", "source": "text", "context": ""}]
+        leads.append(l)
+    rep = backfill.drop_shared_boilerplate(leads)
+    assert rep["phones"] == [phone_key("+15612991145")] and "inquiry@condomatch.com" in rep["emails"]
+    assert all("+15612991145" not in [p["number"] for p in l.phones] for l in leads)
+    assert all(len(l.phones) == 2 for l in leads)                     # own lines survive
+    assert [l.email for l in leads] == [None, None, "pm@thepoint.org"]

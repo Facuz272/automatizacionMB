@@ -115,12 +115,21 @@ def select(rows: list[dict[str, Any]], statuses: list[str] | None, limit: int | 
     return picked[:limit] if limit else picked
 
 
+STRONG_FIRM = re.compile(r"(?i)manag|\bmgmt\b|\brealty\b|real estate|\bassociates\b|\bproperties\b|"
+                         r"\bproperty\s+(?:group|services|solutions)\b|\bservices\b|consult|\bpmi?\b|\bhoa\b")
+HOA_NAME = re.compile(r"(?i)\bassociation\b|\bassn\b|\bhomeowners\b|\bclub\b|\bapartments?\b|\btowers?\b|"
+                      r"\bleasing office\b|\bclubhouse\b|\bvillage\b")
+
+
 def is_firm(name: str | None, place_types: list[str] | None = None) -> bool:
-    """A management company lead (not a building). Places types win over the name when they are clear."""
+    """A management company lead (not a building). Places building types win; then firm vocabulary
+    ("RealManage", "Condominium Associates", "Isram Realty") unless the name is an association / building."""
     types = set(place_types or [])
     if types & BUILDING_TYPES:
         return False
     n = name or ""
+    if STRONG_FIRM.search(n) and not HOA_NAME.search(n):
+        return True
     if FIRM_RX.search(n) and not re.search(r"(?i)\bcondo\w*|\btowers?\b|\bapartments?\b|\bclubhouse\b|"
                                            r"\bhomeowners\b|\bleasing office\b", n):
         return True
@@ -195,7 +204,9 @@ NOT_A_PERSON = re.compile(
     r"(?i)\b(?:links?|management|mgmt|group|propert(?:y|ies)|services?|association|assn|team|office|department|"
     r"contact|info|important|home|about|portal|residents?|board|staff|support|customer|realty|inc|llc|corp|"
     r"company|admin|login|page|news|menu|click|here|welcome|community|communities|condo\w*|hoa|services|"
-    r"maintenance|accounting|leasing|sales|owners?|apply|online|payments?|forms?|faq|careers?|our|your)\b")
+    r"maintenance|accounting|leasing|sales|owners?|apply|online|payments?|forms?|faq|careers?|our|your|free|"
+    r"rental|analysis|order|estoppel|request|quote|schedule|book|view|learn|more|read|start|sign|pay|submit|"
+    r"download|corporate|profiles?|resources?|testimonials?|reviews?|blog|gallery|events?|amenities)\b")
 
 
 def plausible_person(name: str | None, company: str | None = None) -> bool:
@@ -355,6 +366,39 @@ def enrich_row(row: dict[str, Any], *, use_ai: bool = True, nearby: bool = True)
     return lead
 
 
+UNIT_RX = re.compile(r"(?i),?\s+(?:apt|apartment|unit|#)\s*[\w-]+(?=,)")
+LISTING_DOMAINS = {"condomatch.com", "zillow.com", "realtor.com", "apartments.com", "trulia.com", "redfin.com",
+                   "condo.com", "keeq.io"}
+
+
+def building_address(address: str | None) -> str | None:
+    """A building's street address without the unit of the listing it came from ('… APT 603, Miami' → '…, Miami')."""
+    return UNIT_RX.sub("", address) if address else address
+
+
+def _site_phone(p: dict) -> bool:
+    return p.get("source") not in ("crm", "google_places")
+
+
+def drop_shared_boilerplate(leads: list[Lead]) -> dict[str, list[str]]:
+    """A phone or email that the websites of two or more different leads print (a realtor's or listing portal's
+    page about each building) belongs to that agent, not to any of the buildings: dropped everywhere, and so
+    is any email on a listing-portal domain."""
+    from collections import Counter
+
+    phone_n = Counter(k for l in leads for k in {phone_key(x["number"]) for x in l.phones if _site_phone(x)})
+    email_n = Counter(l.email.lower() for l in leads if l.email)
+    bad_phones = {k for k, n in phone_n.items() if n >= 2}
+    bad_emails = {e for e, n in email_n.items() if n >= 2} | {
+        l.email.lower() for l in leads if l.email and l.email.split("@")[-1].lower() in LISTING_DOMAINS}
+    for l in leads:
+        l.phones = [p for p in l.phones if not (_site_phone(p) and phone_key(p["number"]) in bad_phones)]
+        if l.email and l.email.lower() in bad_emails:
+            l.evidence["email_dropped"] = l.email
+            l.email, l.email_status = None, None
+    return {"phones": sorted(bad_phones), "emails": sorted(bad_emails)}
+
+
 def identified(lead: Lead) -> bool:
     """Enough identity to print facts about this lead (never a Ficha built on a guess)."""
     return bool(lead.evidence.get("places_match") or lead.public_records.get("dbpr")
@@ -374,8 +418,9 @@ def payload_row(row: dict[str, Any], lead: Lead, batch_id: str) -> dict[str, Any
     for k in ("management_company", "contact_name", "contact_title", "email", "website_url", "maps_url"):
         if p.get(k):
             out[k] = p[k]
-    if p.get("address") and dbpr.zip5(p["address"]) and "@" not in p["address"]:
-        out["address"] = p["address"]
+    addr = building_address(p.get("address")) if lead.evidence.get("lead_kind") == "building" else p.get("address")
+    if addr and dbpr.zip5(addr) and "@" not in addr:
+        out["address"] = addr
     if out.get("contact_name") and not out.get("contact_title"):
         out.pop("contact_name")                        # a bare name without a role misleads the setter
     useful = set(out) - {"id", "phone", "name"}
@@ -423,26 +468,29 @@ def run(*, statuses: list[str] | None = None, limit: int | None = None, commit: 
         out.mkdir(parents=True, exist_ok=True)
         rows = select(fetch_unenriched(include_attempted), statuses, limit)
         logger.info("backfill-crm {}: {} leads ({})", batch_id, len(rows), ", ".join(statuses or ["todos"]))
-        payloads, worked = [], []
+        payloads, worked, done = [], [], []
         try:
             for i, row in enumerate(rows, 1):
                 try:
-                    lead = enrich_row(row, use_ai=use_ai, nearby=nearby)
+                    done.append((row, enrich_row(row, use_ai=use_ai, nearby=nearby)))
                 except Exception as exc:                # noqa: BLE001 — one bad lead never stops the batch
                     logger.exception("backfill {}: {}", row.get("name"), exc)
                     worked.append({"id": row["id"], "name": row.get("name"), "error": str(exc)[:200]})
                     continue
-                p = payload_row(row, lead, batch_id)
-                worked.append({"id": row["id"], "name": row.get("name"), "status": row.get("status"),
-                               "kind": lead.evidence.get("lead_kind"), "match": lead.evidence.get("places_match"),
-                               "sent": bool(p), "fields": sorted(set(p or {}) - {"id", "phone", "name"}),
-                               "lead": lead.internal_record()})
-                if p:
-                    payloads.append(p)
-                logger.info("[{}/{}] {} · {} · {}", i, len(rows), row.get("name"), lead.evidence.get("lead_kind"),
-                            ", ".join(sorted(set(p or {}) - {"id", "phone", "name"})) or "sin datos confiables")
+                logger.info("[{}/{}] {} · {}", i, len(rows), row.get("name"), done[-1][1].evidence.get("lead_kind"))
         finally:
             render.close()
+        shared = drop_shared_boilerplate([l for _, l in done])
+        if shared["phones"] or shared["emails"]:
+            logger.info("Teléfonos/emails de portales o agentes repetidos en varios sitios, descartados: {}", shared)
+        for row, lead in done:
+            p = payload_row(row, lead, batch_id)
+            worked.append({"id": row["id"], "name": row.get("name"), "status": row.get("status"),
+                           "kind": lead.evidence.get("lead_kind"), "match": lead.evidence.get("places_match"),
+                           "sent": bool(p), "fields": sorted(set(p or {}) - {"id", "phone", "name"}),
+                           "lead": lead.internal_record()})
+            if p:
+                payloads.append(p)
         (out / "backfill.jsonl").write_text("\n".join(json.dumps(w, ensure_ascii=False, default=str) for w in worked)
                                             + "\n", encoding="utf-8")
         (out / "enrich_payload.json").write_text(json.dumps({"batch_id": batch_id, "leads": payloads},
