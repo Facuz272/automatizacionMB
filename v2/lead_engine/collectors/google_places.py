@@ -71,6 +71,9 @@ def sub_listing_reason(place: dict, seed_name: str) -> str | None:
     return None
 
 
+MAX_QUERY_FAILURES = 3
+
+
 class PlacesError(RuntimeError):
     pass
 
@@ -151,12 +154,24 @@ def collect(strategy: str, max_candidates: int, cities: list[str] | None = None)
     """Yield raw candidates for a strategy, city by city, until max_candidates."""
     seen: set[str] = set()
     emitted = 0
+    failures = 0
     for city in cities or cities_for(strategy):
         for q in QUERIES[strategy]:
             query = f"{q} {city}"
             token: str | None = None
             for page in range(3):  # Google caps text search at 60 results
-                data = _search(query, token, with_reviews=settings.places_reviews or strategy == "pain")
+                try:
+                    data = _search(query, token, with_reviews=settings.places_reviews or strategy == "pain")
+                except PlacesError as exc:
+                    # A failed query/page (after _search's own retries) skips that query, never the run;
+                    # three in a row (bad key, quota, outage) end the collection with what was found.
+                    failures += 1
+                    logger.warning("Places '{}' pág {} falló ({}); se sigue con la próxima búsqueda", query, page + 1, exc)
+                    if failures >= MAX_QUERY_FAILURES:
+                        logger.error("Places: {} búsquedas seguidas fallaron; se corta la recolección", failures)
+                        return
+                    break
+                failures = 0
                 places = data.get("places") or []
                 logger.info("Places '{}' pág {}: {} resultados", query, page + 1, len(places))
                 for p in places:

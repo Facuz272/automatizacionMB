@@ -39,6 +39,7 @@ class Settings:
     anthropic_api_key: str | None = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY"))
     anthropic_model: str = field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5"))
     anthropic_effort: str = field(default_factory=lambda: os.getenv("ANTHROPIC_EFFORT", "low"))
+    anthropic_timeout_s: float = field(default_factory=lambda: float(os.getenv("ANTHROPIC_TIMEOUT_S", "60")))
     crm_base_url: str = field(
         default_factory=lambda: os.getenv("CRM_BASE_URL", "https://mbguiaclientes.lovable.app").rstrip("/")
     )

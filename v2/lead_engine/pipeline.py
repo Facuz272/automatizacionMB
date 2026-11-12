@@ -421,7 +421,7 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
     if use_ai and ai_enrich.available():
         candidate_emails = sorted(set(emails) | ({lead.email} if lead.email else set()))
         if check_mx:
-            candidate_emails = [e for e in candidate_emails if email_verify.email_status(e) not in email_verify.DROP]
+            candidate_emails = [e for e in candidate_emails if email_verify.email_status(e) not in email_verify.drop_statuses()]
         evidence = ai_enrich.build_evidence(lead, facts.people, candidate_emails, facts.managed_by, ap)
         result = ai_enrich.enrich(lead, evidence)
         if result:
@@ -430,6 +430,7 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
             if lead.email != before and check_mx:
                 lead.email_status = email_verify.email_status(lead.email)
     rule_qualify(lead)  # fills whatever is still empty
+    apply_firm_backup_phone(lead)
     apply_plan_b_fallback(lead)
     scoring.apply(lead)
     lead.evidence["site_pages"] = facts.pages[:6]
@@ -445,26 +446,43 @@ FALLBACK_ROLES = {
 }
 
 
+def firm_line(lead: Lead) -> tuple[str, str] | None:
+    """(number, firm) of the management firm's / commercial operator's published office line, when the
+    building is managed by a third party and that line differs from the lead's own phone."""
+    if lead.management_type != "third_party" and not lead.evidence.get("commercial_operator"):
+        return None
+    op = lead.evidence.get("commercial_operator")
+    number, who = None, None
+    if op and op.get("phone_scope") == "florida" and op.get("phone"):
+        number, who = op["phone"], op["name"]
+    elif lead.management_company:
+        from . import phone_resolver
+        fp = phone_resolver.firm_phone(lead.management_company)
+        if fp:
+            number, who = fp["number"], fp.get("firm") or lead.management_company
+    if number and phone_key(number) != phone_key(lead.phone or ""):
+        return number, who
+    return None
+
+
+def apply_firm_backup_phone(lead: Lead) -> None:
+    """The firm's office line as a direct backup in the Ficha's other phones (never the primary)."""
+    line = firm_line(lead)
+    if line and not any(phone_key(p["number"]) == phone_key(line[0]) for p in lead.phones):
+        lead.phones.append({"number": line[0], "label": "firm_central", "source": "firm_backup",
+                            "context": f"central de {line[1]}"})
+
+
 def apply_plan_b_fallback(lead: Lead) -> None:
     """Second door for the setter when the site names nobody else (no site, closed resident portals):
       1. the management firm's / commercial operator's published office line, when it differs from the lead's phone;
       2. otherwise, ask reception / the concierge for the in-house facilities role of the vertical."""
     if lead.plan_b():
         return
-    own = {phone_key(lead.phone or "")}
-    firm = lead.management_company if lead.management_type == "third_party" else None
-    number, who = None, None
-    op = lead.evidence.get("commercial_operator")
-    if op and op.get("phone_scope") == "florida" and op.get("phone"):
-        number, who = op["phone"], op["name"]
-    elif firm:
-        from . import phone_resolver
-        fp = phone_resolver.firm_phone(firm)
-        if fp:
-            number, who = fp["number"], fp.get("firm") or firm
-    if number and phone_key(number) not in own:
-        lead.plan_b_fallback = {"text": f"administradora {who} (pedir por el Property Manager del edificio)",
-                                "phone": number, "source": "management_firm"}
+    line = firm_line(lead)
+    if line:
+        lead.plan_b_fallback = {"text": f"administradora {line[1]} (pedir por el Property Manager del edificio)",
+                                "phone": line[0], "source": "management_firm"}
         return
     role = FALLBACK_ROLES.get(lead.vertical, FALLBACK_ROLES["community"])
     lead.plan_b_fallback = {"text": f"pedir en recepción/conserjería por el {role}", "source": "tactical"}
@@ -515,7 +533,23 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
         commit: bool = False, max_candidates: int | None = None, out_dir: Path | None = None,
         use_search: bool = True, use_geo: bool = True, use_dbpr: bool = True, check_mx: bool | None = None,
         make_pdfs: bool = False, pdf_lang: str | None = None, ignore_seen: bool = False,
-        retry_needs_phone: bool = False) -> Path:
+        retry_needs_phone: bool = False, remember: bool | None = None,
+        skip_keys: set[str] | None = None) -> Path:
+    """One batch. `remember` (default: `commit`) decides whether this run writes definitive outcomes
+    (rejections, in-CRM, imported) to the memory: dry runs never consume a building, and accepted leads
+    are only recorded once the CRM confirms them (finalize). `skip_keys` (source ids / address keys)
+    excludes buildings already produced earlier in the same daily mix."""
+    from . import runlock
+
+    with runlock.hold(f"run {strategy}"):
+        return _run(strategy, limit, sources, seed, use_ai, use_apollo, precheck, send, commit, max_candidates,
+                    out_dir, use_search, use_geo, use_dbpr, check_mx, make_pdfs, pdf_lang, ignore_seen,
+                    retry_needs_phone, commit if remember is None else remember, skip_keys or set())
+
+
+def _run(strategy, limit, sources, seed, use_ai, use_apollo, precheck, send, commit, max_candidates, out_dir,
+         use_search, use_geo, use_dbpr, check_mx, make_pdfs, pdf_lang, ignore_seen, retry_needs_phone, remember,
+         skip_keys) -> Path:
     sources = list(sources) if sources else default_sources()
     batch_id = new_batch_id(strategy)
     out = Path(out_dir or settings.out_dir) / batch_id
@@ -542,9 +576,10 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
         lead.rejected_reason = reason
         rejected.append({"company_name": lead.company_name, "source": lead.source, "source_id": lead.source_id,
                          "phone": lead.phone, "address": lead.address, "website": lead.website_url, "reason": reason})
-        ledger.mark(lead.source_id, lead.source, lead.phone, "rejected", reason, batch_id)
-        ledger.mark_seen(lead, "needs_phone" if lead in needs_phone else "in_crm" if reason == "ya existe en el CRM"
-                         else "rejected", batch_id, reason)
+        if remember:                      # dry runs never consume a building
+            ledger.mark(lead.source_id, lead.source, lead.phone, "rejected", reason, batch_id)
+            ledger.mark_seen(lead, "needs_phone" if lead in needs_phone else "in_crm" if reason == "ya existe en el CRM"
+                             else "rejected", batch_id, reason)
 
     # ── 1-2: collect + contactability gate ────────────────────────────────────
     attempts = skipped_seen = 0
@@ -552,6 +587,8 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
         if ledger.should_skip(lead, ignore_seen=ignore_seen, retry_needs_phone=retry_needs_phone):
             skipped_seen += 1                 # worked on in an earlier run: the ranking moves on
             continue
+        if skip_keys and (lead.source_id in skip_keys or (dbpr.address_key(lead.address) or "") in skip_keys):
+            continue                          # already produced earlier in this daily mix
         attempts += 1
         if attempts > max_candidates:
             break
@@ -615,7 +652,8 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
         for lead, facts in gated:
             if phone_key(lead.phone or "") in in_crm:
                 reject(lead, "ya existe en el CRM")
-                ledger.mark(lead.source_id, lead.source, lead.phone, "in_crm", None, batch_id)
+                if remember:
+                    ledger.mark(lead.source_id, lead.source, lead.phone, "in_crm", None, batch_id)
             else:
                 kept.append((lead, facts))
         gated = kept
@@ -630,9 +668,7 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
             enrich(lead, facts, use_apollo=use_apollo, use_ai=use_ai, use_search=use_search,
                    use_geo=use_geo, use_dbpr=use_dbpr, check_mx=check_mx)
             portfolio_consolidation.apply(lead)
-            accepted.append(lead)
-            ledger.mark(lead.source_id, lead.source, lead.phone, "accepted", None, batch_id)
-            ledger.mark_seen(lead, "processed", batch_id)
+            accepted.append(lead)             # recorded in the memory only when the CRM confirms it (finalize)
             logger.success("[{:>3}] {} · {} · {} · contacto={} · admin={} · email={}({})", lead.lead_score,
                            lead.company_name, lead.phone, lead.segment, lead.contact_name or "—",
                            lead.management_company or lead.management_type, lead.email or "—", lead.email_status)
@@ -646,6 +682,46 @@ def run(strategy: str = "onsite", limit: int = 20, sources: Iterable[str] | None
     return finalize(out, batch_id, strategy, accepted, rejected, needs_phone=needs_phone, send=send, commit=commit,
                     make_pdfs=make_pdfs, pdf_lang=pdf_lang, ledger=ledger, client=client,
                     extra={"skipped_seen_in_earlier_runs": skipped_seen})
+
+
+def record_commit(ledger: Ledger, batch_id: str, accepted: list[Lead], payloads: list[dict], report) -> None:
+    """The CRM confirmed a committed batch: only now are its leads consumed (imported / already in the CRM)."""
+    ledger.mark_imported(payloads, report)
+    bad = {d["index"] for d in report.duplicates} | {r["index"] for r in report.rejected} | {
+        x["index"] for x in report.skipped_local}
+    for i, l in enumerate(accepted):
+        ledger.mark_seen(l, "in_crm" if i in bad else "imported", batch_id)
+    ledger.clear_pending(batch_id)
+
+
+def resend_pending(client: crm_importer.CrmClient | None = None, ledger: Ledger | None = None) -> dict:
+    """Re-send committed batches whose CRM import failed earlier (oldest first). Returns
+    {"resent": [...], "still_pending": [...]}; a batch whose files are gone is dropped from the queue."""
+    ledger = ledger or Ledger()
+    client = client or crm_importer.CrmClient()
+    out = {"resent": [], "still_pending": []}
+    for p in ledger.pending():
+        d = Path(p["out_dir"])
+        if not (d / "crm_payload.json").exists() or not (d / "leads.jsonl").exists():
+            logger.warning("Lote pendiente {} sin archivos en {}; se quita de la cola", p["batch_id"], d)
+            ledger.clear_pending(p["batch_id"])
+            continue
+        payloads = json.loads((d / "crm_payload.json").read_text(encoding="utf-8"))["leads"]
+        accepted = [Lead.from_record(json.loads(l)) for l in (d / "leads.jsonl").read_text(encoding="utf-8").splitlines()
+                    if l.strip()]
+        try:
+            report = crm_importer.import_leads(payloads, p["batch_id"], dry_run=False, client=client)
+        except crm_importer.CrmError as exc:
+            ledger.add_pending(p["batch_id"], d, str(exc))
+            out["still_pending"].append({"batch_id": p["batch_id"], "attempts": p["attempts"] + 1, "error": str(exc)})
+            continue
+        (d / "crm_response_commit.json").write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=2),
+                                                    encoding="utf-8")
+        record_commit(ledger, p["batch_id"], accepted, payloads, report)
+        out["resent"].append({"batch_id": p["batch_id"], "inserted": report.inserted,
+                              "duplicates": len(report.duplicates)})
+        logger.success("Lote pendiente {} reenviado: {} insertados", p["batch_id"], report.inserted)
+    return out
 
 
 def finalize(out: Path, batch_id: str, strategy: str, accepted: list[Lead], rejected: list[dict], *,
@@ -678,16 +754,23 @@ def finalize(out: Path, batch_id: str, strategy: str, accepted: list[Lead], reje
         if not client.configured:
             logger.warning("No se envía al CRM: falta CRM_WEBHOOK_SECRET")
         else:
-            report = crm_importer.import_leads(payloads, batch_id, dry_run=not commit, client=client)
-            name = "crm_response_commit.json" if commit else "crm_response_dry.json"
-            (out / name).write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-            crm_summary = {k: v for k, v in report.as_dict().items() if k != "responses"}
-            if commit:
-                ledger.mark_imported(payloads, report)
-                bad = {d["index"] for d in report.duplicates} | {r["index"] for r in report.rejected} | {
-                    x["index"] for x in report.skipped_local}
-                for i, l in enumerate(accepted):
-                    ledger.mark_seen(l, "in_crm" if i in bad else "imported", batch_id)
+            try:
+                report = crm_importer.import_leads(payloads, batch_id, dry_run=not commit, client=client)
+            except crm_importer.CrmError as exc:
+                # Nothing is lost: crm_payload.json + leads.jsonl stay on disk and `daily` re-sends a
+                # committed batch before building the next one. The leads are not marked as consumed.
+                logger.error("CRM no confirmó el lote {} ({}); {}", batch_id, exc,
+                             "queda en la cola de reenvío" if commit else "era un dry-run, no se reintenta")
+                if commit:
+                    ledger.add_pending(batch_id, out, str(exc))
+                crm_summary = {"dry_run": not commit, "error": str(exc), "pending_resend": commit,
+                               "would_insert": 0, "inserted": 0, "duplicates": [], "rejected": []}
+            else:
+                name = "crm_response_commit.json" if commit else "crm_response_dry.json"
+                (out / name).write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+                crm_summary = {k: v for k, v in report.as_dict().items() if k != "responses"}
+                if commit:
+                    record_commit(ledger, batch_id, accepted, payloads, report)
 
     pdfs: list[Path] = []
     if make_pdfs and accepted:

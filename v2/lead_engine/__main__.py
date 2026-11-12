@@ -27,6 +27,17 @@ from .config import settings
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .runlock import RunLocked
+
+    try:
+        return _main(argv)
+    except RunLocked as exc:
+        logger.error("{}", exc)
+        print(str(exc), file=sys.stderr)
+        return 3
+
+
+def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="lead_engine", description="MB Lead Engine v2")
     ap.add_argument("--tenant", help="perfil de empresa en tenants/<slug>.json (default TENANT)")
     sub = ap.add_subparsers(dest="cmd", required=True)

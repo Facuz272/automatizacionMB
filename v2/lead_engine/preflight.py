@@ -66,6 +66,23 @@ def config_checks(env: dict[str, str] | None = None) -> list[Check]:
         v = getattr(settings, field_name)
         out.append(Check("tenant", label, OK if v else PENDING, v or "vacío en el perfil"))
     out += registry_checks()
+    out += run_state_checks()
+    return out
+
+
+def run_state_checks() -> list[Check]:
+    """Run lock (another run in progress?) and committed batches waiting for the CRM."""
+    from .runlock import holder, lock_path
+    from .state import Ledger
+
+    who = holder()
+    out = [Check("datos", "lock de corrida", ERROR if who else OK,
+                 f"hay una corrida en curso: {who}" if who else f"libre ({lock_path()})")]
+    pend = Ledger().pending()
+    out.append(Check("datos", "lotes pendientes de CRM", PENDING if pend else OK,
+                     "; ".join(f"{p['batch_id']} ({p['attempts']} intento/s: {(p['last_error'] or '')[:60]})"
+                               for p in pend[:3]) + (" · se reenvían al arrancar daily" if pend else "")
+                     if pend else "ninguno"))
     return out
 
 
@@ -134,6 +151,16 @@ def _overpass() -> str:
     return "responden: " + ", ".join(ok) + (f" · caídos: {', '.join(bad)}" if bad else "")
 
 
+def _dns_mx() -> str:
+    from . import email_verify
+    email_verify.backend.cache_clear()
+    b = email_verify.backend()
+    if b == "none":
+        raise RuntimeError("ningún DNS responde MX (ni el del sistema ni DNS-over-HTTPS): los emails no se verifican")
+    st = email_verify.domain_status("gmail.com")
+    return {"system": "DNS del sistema", "doh": "DNS-over-HTTPS (el DNS del sistema no responde MX)"}[b] + f" · gmail.com={st}"
+
+
 def _places() -> str:
     from .collectors.google_places import SEARCH_URL
     r = requests.post(SEARCH_URL, json={"textQuery": "condominium Miami Beach FL", "pageSize": 1}, timeout=TIMEOUT,
@@ -178,6 +205,7 @@ def network_probes() -> list[tuple[str, str, Callable[[], str] | None, str]]:
         ("red", "Census geocoder", _census, ""),
         ("red", "NPI Registry", _npi, ""),
         ("red", "Overpass (OSM) + mirrors", _overpass, ""),
+        ("red", "DNS / MX de emails", _dns_mx, ""),
         ("claves", "Google Places", _places if settings.google_places_api_key else None, "sin GOOGLE_PLACES_API_KEY"),
         ("claves", "Anthropic", _anthropic if settings.anthropic_api_key else None, "sin ANTHROPIC_API_KEY"),
         ("claves", "CRM /api/public/health", _crm if settings.crm_webhook_secret else None, "sin CRM_WEBHOOK_SECRET"),

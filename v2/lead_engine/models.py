@@ -64,6 +64,13 @@ def fmt_int(n: float | int) -> str:
     return f"{int(round(n)):,}".replace(",", ".")
 
 
+def _deliverable() -> set[str]:
+    """Email statuses sent to the CRM: verified MX, or unchecked (our DNS failed); a host without MX only
+    when EMAIL_REQUIRE_MX=false."""
+    from .email_verify import require_mx
+    return {"mx", "unchecked"} | (set() if require_mx() else {"a_only"})
+
+
 SALES_STRATEGY_MAX = 2000      # optText(2000) in the CRM import schema
 MIN_HOOK = 600
 
@@ -269,7 +276,9 @@ class Lead:
         primary = next((p for p in self.phones if p["number"] == self.phone), None)
         if primary and primary["label"] in ("management", "hoa", "firm_central"):
             parts.append(f"tel. principal = {PHONE_LABEL[primary['label']]}")
-        others = [f"{PHONE_LABEL.get(p['label'], p['label'])} {p['number']}" for p in self.secondary_phones()[:2]]
+        shown_b = (self.plan_b_fallback or {}).get("phone") if not pb else None     # already on the Plan B
+        others = [f"{PHONE_LABEL.get(p['label'], p['label'])} {p['number']}"
+                  for p in self.secondary_phones() if p["number"] != shown_b][:2]
         if others:
             parts.append("otros tel.: " + "; ".join(others))
         if self.lead_score:
@@ -312,7 +321,7 @@ class Lead:
             "contact_title": clip(self.contact_title, 120),
             "management_company": clip(management, 200),
             # Dead or misspelled domains (nxdomain / no MX nor A) never reach the CRM.
-            "email": self.email if self.email_status in ("mx", "a_only", "unchecked") else None,
+            "email": self.email if self.email_status in _deliverable() else None,
             "address": clip(self.address, 300),
             "website_url": clip(self.website_url, 500),
             "maps_url": clip(self.maps_url, 500),

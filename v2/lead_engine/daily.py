@@ -96,6 +96,7 @@ def summary(out: Path, committed: bool) -> dict[str, Any]:
         "consolidated_siblings": qr.get("consolidated_siblings", 0),
         "top": [{"name": l.get("company_name"), "address": l.get("address"), "score": l.get("lead_score"),
                  "signal": _signal_es(l), "est_high": (l.get("estimated_deal") or {}).get("high")} for l in top],
+        "crm_error": crm.get("error"), "pending_resend": bool(crm.get("pending_resend")),
         "pdf_dir": str(out / "pdf"), "outreach_pack": str(out / "outreach_pack.md"),
         "field_sheets": str(out / "campo"), "mix": qr.get("mix"),
     }
@@ -103,6 +104,9 @@ def summary(out: Path, committed: bool) -> dict[str, Any]:
 
 def slack_text(s: dict[str, Any], why: str) -> str:
     money = lambda n: f"US$ {n:,}".replace(",", ".")  # noqa: E731
+    if s.get("pending_resend"):
+        return (f"*Lead Engine · {s['batch']}*: el CRM no confirmó el lote ({s.get('crm_error')}). "
+                f"{s['accepted']} leads quedan en cola y se reenvían en la próxima corrida; nada se perdió.")
     head = (f"*Lead Engine · {s['batch']}*\n"
             f"{'Inyectados al CRM' if s['committed'] else 'Listos (dry-run, sin importar)'}: *{s['injected'] if s['committed'] else s['accepted']}*"
             f" · valor anual estimado del lote: *{money(s['annual_usd_low'])} – {money(s['annual_usd_high'])}*\n"
@@ -196,14 +200,26 @@ def run_mix(total: int, slices: list[dict[str, Any]], *, send: bool, commit: boo
     np_rows: list[dict] = []
     breakdown: dict[str, dict[str, Any]] = {}
 
+    produced: set[str] = set()           # source ids / addresses already worked in this mix (top-up skips them)
+
     def one(sl: dict[str, Any], n: int) -> None:
+        from .dbpr import address_key
+
         with _with_vertical(sl["vertical"]):
+            # Slices never send; their rejections are remembered only in a committed mix, and accepted
+            # leads only once the CRM confirms the merged batch (pipeline.finalize).
             o = pipeline.run(strategy=sl["strategy"], limit=n, sources=[sl["seed"]], use_ai=use_ai, send=False,
-                             out_dir=out / "slices", make_pdfs=False)
+                             out_dir=out / "slices", make_pdfs=False, remember=commit, skip_keys=set(produced))
         got = [Lead.from_record(json.loads(l)) for l in (o / "leads.jsonl").read_text(encoding="utf-8").splitlines()
                if l.strip()]
         leads.extend(got)
-        rejected.extend(json.loads(l) for l in (o / "rejected.jsonl").read_text(encoding="utf-8").splitlines() if l.strip())
+        rej = [json.loads(l) for l in (o / "rejected.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+        rejected.extend(rej)
+        for item in [*(l.internal_record() for l in got), *rej]:
+            if item.get("source_id"):
+                produced.add(item["source_id"])
+            if address_key(item.get("address")):
+                produced.add(address_key(item.get("address")))
         if (o / "needs_phone.csv").exists():
             np_rows.extend(csv.DictReader(open(o / "needs_phone.csv", encoding="utf-8")))
         b = breakdown.setdefault(sl["name"], {"quota": 0, "accepted": 0, "batches": []})
@@ -235,13 +251,31 @@ def run_mix(total: int, slices: list[dict[str, Any]], *, send: bool, commit: boo
 def run(*, target_pool: int | None = None, fallback_limit: int = 10, limit: int | None = None, strategy: str = "onsite",
         sources: list[str] | None = None, commit: bool = False, use_ai: bool = True, out_dir: Path | None = None,
         slack: bool = True, mix: bool | None = None) -> dict[str, Any]:
+    from . import pipeline, runlock
+
+    with runlock.hold("daily"):
+        return _run(target_pool=target_pool, fallback_limit=fallback_limit, limit=limit, strategy=strategy,
+                    sources=sources, commit=commit, use_ai=use_ai, out_dir=out_dir, slack=slack, mix=mix)
+
+
+def _run(*, target_pool, fallback_limit, limit, strategy, sources, commit, use_ai, out_dir, slack, mix) -> dict[str, Any]:
     from . import pipeline
+
+    # 0. Committed batches the CRM did not confirm last time go first; while the CRM keeps failing no new
+    #    batch is built (it would only add spend to the queue).
+    resent = pipeline.resend_pending() if settings.crm_webhook_secret else {"resent": [], "still_pending": []}
+    if resent["still_pending"]:
+        why = f"el CRM sigue sin confirmar {len(resent['still_pending'])} lote(s) pendiente(s); no se arma uno nuevo"
+        logger.error("daily: {}", why)
+        if slack:
+            post_slack(f"*Lead Engine · daily*: {why}. Último error: {resent['still_pending'][0]['error']}")
+        return {"batch": None, "skipped": True, "why": why, **resent}
 
     health = None if limit is not None else fetch_health()
     n, why = (limit, "--limit explícito") if limit is not None else batch_size(health, target_pool, fallback_limit)
     logger.info("daily: {} leads ({})", n, why)
     if n <= 0:
-        s = {"batch": None, "skipped": True, "why": why}
+        s = {"batch": None, "skipped": True, "why": why, **({"resent_batches": resent["resent"]} if resent["resent"] else {})}
         if slack:
             post_slack(f"*Lead Engine · daily*: no hace falta cargar leads hoy ({why}).")
         return s
@@ -255,6 +289,8 @@ def run(*, target_pool: int | None = None, fallback_limit: int = 10, limit: int 
                            make_pdfs=True, pdf_lang="en")
     s = summary(out, committed=commit)
     s["why"] = why
+    if resent["resent"]:
+        s["resent_batches"] = resent["resent"]
     (out / "daily_summary.json").write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
     s["slack_sent"] = post_slack(slack_text(s, why)) if slack else False
     return s

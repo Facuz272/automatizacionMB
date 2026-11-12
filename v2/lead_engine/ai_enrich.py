@@ -87,7 +87,9 @@ def _get_client():
     if _client is None:
         import anthropic
 
-        _client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        # Explicit budget: a hung request costs at most timeout × (max_retries + 1), never the SDK's 10 min.
+        _client = anthropic.Anthropic(api_key=settings.anthropic_api_key, timeout=settings.anthropic_timeout_s,
+                                      max_retries=2)
     return _client
 
 
@@ -161,8 +163,8 @@ def enrich(lead: Lead, evidence: dict) -> Enrichment | None:
     except anthropic.APIStatusError as exc:
         logger.warning("Claude HTTP {} en {}: {}", exc.status_code, lead.company_name, exc.message)
         return None
-    except anthropic.APIConnectionError as exc:
-        logger.warning("Claude sin conexión en {}: {}", lead.company_name, exc)
+    except anthropic.APIConnectionError as exc:      # includes APITimeoutError
+        logger.warning("Claude sin conexión o sin respuesta a tiempo en {}: {}", lead.company_name, exc)
         return None
     usage = getattr(response, "usage", None)
     if usage is not None:
@@ -219,7 +221,13 @@ def apply(lead: Lead, result: Enrichment, evidence: dict) -> None:
         if e and e in evidence.get("candidate_emails", []):
             lead.email = e
             lead.email_source = lead.email_source or "ai_choice"
-    if result.management_company and _mentioned(result.management_company, evidence):
+    from .web_extract import firm_like
+
+    if result.management_company and not firm_like(result.management_company):
+        # "a volunteer board" / "the owners": a description, not a company — keep the management type only
+        lead.evidence["ai_management_description"] = result.management_company
+        lead.management_type = result.management_type
+    elif result.management_company and _mentioned(result.management_company, evidence):
         lead.management_company = result.management_company.strip()
         lead.management_type = result.management_type
     elif result.management_company:

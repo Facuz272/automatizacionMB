@@ -15,6 +15,7 @@ from threading import Lock
 DEFAULT_PRICES = {
     "places_text_search": 0.035,           # Places API (New) Text Search, Enterprise fields (phone/website)
     "places_text_search_reviews": 0.040,   # + reviews (Enterprise + Atmosphere)
+    "places_nearby_reviews": 0.040,        # Nearby Search with reviews (Enterprise + Atmosphere), zone hook
     "claude_input_token": 2.0 / 1_000_000,   # Claude Sonnet 5.5
     "claude_output_token": 10.0 / 1_000_000,
     "serpapi": 0.015,

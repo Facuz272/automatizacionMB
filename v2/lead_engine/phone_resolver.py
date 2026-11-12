@@ -58,13 +58,29 @@ def pick_firm_phone(phones: list[dict[str, Any]]) -> dict[str, Any] | None:
     return sorted(usable, key=rank_phone)[0] if usable else None
 
 
+NEGATIVE_TTL_DAYS = 7        # "no phone on the site": retried after a week (the site may have been down)
+POSITIVE_TTL_DAYS = 90       # a phone found: refreshed every quarter
+
+
+def fresh(phone: str | None, fetched_at: str | None, now: datetime | None = None) -> bool:
+    """Whether a cached firm_phones row can be used without crawling the firm's site again (pure)."""
+    if not fetched_at:
+        return False
+    try:
+        age = (now or datetime.now(timezone.utc)) - datetime.fromisoformat(fetched_at)
+    except ValueError:
+        return False
+    return age.days < (POSITIVE_TTL_DAYS if phone else NEGATIVE_TTL_DAYS)
+
+
 @lru_cache(maxsize=64)
 def firm_site_phone(domain: str) -> dict[str, Any] | None:
     """Office phone published on the firm's official site (cached locally)."""
     try:
         conn = _db()
-        row = conn.execute("SELECT phone, context, url FROM firm_phones WHERE domain = ?", (domain,)).fetchone()
-        if row:
+        row = conn.execute("SELECT phone, context, url, fetched_at FROM firm_phones WHERE domain = ?",
+                           (domain,)).fetchone()
+        if row and fresh(row[0], row[3]):
             return {"number": row[0], "context": row[1], "url": row[2]} if row[0] else None
     except sqlite3.Error:
         conn = None

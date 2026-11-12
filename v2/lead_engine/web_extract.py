@@ -53,6 +53,17 @@ MANAGED_BY_RE = re.compile(
     r"(?i)(?:professionally\s+)?managed\s+by\s*:?\s+(?P<co>[A-Z][\w&.,'’\- ]{2,60}?)(?=[.,;\n]|\s{2}|$)"
 )
 _FALSE_NAMES = {"Contact Us", "Read More", "Learn More", "Privacy Policy", "Board Of", "Our Team"}
+# "managed by a volunteer board", "managed by the owners", "managed by our board": not a company.
+_NOT_A_FIRM = re.compile(
+    r"(?i)^(?:a|an|our|its|their|the\s+(?:board|owners|residents|association|members|developer|community))\b|"
+    r"\b(?:volunteer|volunteers|board|owners|residents|unit owners|members|committee|ourselves|itself|self[- ]managed)\b")
+
+
+def firm_like(name: str) -> bool:
+    """Plausible management-company name: starts with a capital letter (the regex runs case-insensitive,
+    so this is checked here) and is not a description of a board / volunteers / owners."""
+    name = name.strip()
+    return len(name) >= 3 and name[0].isupper() and not _NOT_A_FIRM.search(name)
 
 # ── phone labels ────────────────────────────────────────────────────────────
 PHONE_LABEL_RES: list[tuple[str, re.Pattern[str]]] = [
@@ -330,7 +341,7 @@ def parse_page(html: str, url: str = "") -> SiteFacts:
                 facts.people.append((name, title))
     for m in MANAGED_BY_RE.finditer(text):
         co = m.group("co").strip(" ,.")
-        if co and co not in facts.managed_by:
+        if co and firm_like(co) and co not in facts.managed_by:
             facts.managed_by.append(co)
     from .roles import office_hours
 

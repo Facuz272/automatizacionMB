@@ -576,6 +576,26 @@ a la hoja de campo, y botones para copiar el email y el WhatsApp del outreach pa
 --pdf` deja el suyo con el ranking y el dossier de cada administradora. Los enlaces son relativos:
 la carpeta se puede comprimir y compartir tal cual.
 
+## Piloto automático: qué garantiza
+
+- **Nada pagado se pierde.** Un edificio queda "consumido" en la memoria (`data/state.db`) solo cuando
+  el CRM confirma el lote de una corrida con `--commit`. Las corridas de prueba (sin `--commit`, o
+  dry-run al CRM) no consumen nada. Si el CRM falla después de sus reintentos, el lote queda en la
+  cola `pending_batches` (con `crm_payload.json` y `leads.jsonl` en disco) y `daily` lo reenvía al
+  arrancar; mientras el CRM siga fallando, no arma un lote nuevo. `import <lote>/crm_payload.json
+  --commit` hace lo mismo a mano.
+- **Una corrida a la vez.** `data/engine.lock` (flock, se libera solo aunque el proceso muera):
+  una segunda corrida sale con código 3 y el mensaje de quién la tiene.
+- **Fallas externas acotadas.** Claude: 60 s por llamada y 2 reintentos (`ANTHROPIC_TIMEOUT_S`);
+  si no responde, el lead sigue con reglas. Places: una búsqueda que falla se saltea; tres seguidas
+  cortan la recolección con lo encontrado. Overpass, catastros y capas municipales se apagan solos.
+- **Renderizado JS** (`RENDER_JS=auto`, por defecto): si el paquete de Playwright busca otra versión
+  de Chromium que la instalada, usa cualquier Chromium presente en la máquina.
+- **Emails verificados de verdad.** Si el DNS del sistema no responde MX (pasa en algunos entornos),
+  la verificación va por DNS-over-HTTPS; con `EMAIL_REQUIRE_MX=true` (por defecto) se descartan los
+  dominios sin MX. `preflight` muestra qué resolvedor se usa, el lock y la cola pendiente.
+- La carpeta `data/` (memoria, padrones, lock, caché) tiene que vivir en un disco persistente.
+
 ## Pre-vuelo (`preflight`)
 
 ```bash

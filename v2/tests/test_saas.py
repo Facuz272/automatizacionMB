@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from lead_engine import cam, dbpr, lodging, pdf_common, pdf_generator, phone_resolver, portfolio_pdf, portfolios
-from lead_engine import pipeline, tenant, valuation
+from lead_engine import crm_importer, pipeline, tenant, valuation
 from lead_engine.config import settings
 from lead_engine.models import Lead
 from lead_engine.state import Ledger
@@ -187,12 +187,12 @@ def test_ledger_memory_by_address_and_source_never_downgrades(tmp_path):
     assert led.seen_counts() == {"imported": 1, "needs_phone": 1}
 
 
-def test_second_seed_run_skips_buildings_seen_in_the_first(wired, monkeypatch):  # noqa: F811
+def _seed_wiring(wired, monkeypatch, secret=None):
     from lead_engine import config
     from lead_engine.collectors import dbpr_seed
-    s = type(config.settings)(**{**config.settings.__dict__, "google_places_api_key": None, "crm_webhook_secret": None,
+    s = type(config.settings)(**{**config.settings.__dict__, "google_places_api_key": None, "crm_webhook_secret": secret,
                                  "min_units": 100, "priority_units": 150})
-    for mod in (pipeline, dbpr_seed):
+    for mod in (pipeline, dbpr_seed, crm_importer):
         monkeypatch.setattr(mod, "settings", s)
     conn = dbpr.connect(wired / "dbpr.db")
     real_collect = dbpr_seed.collect
@@ -201,14 +201,71 @@ def test_second_seed_run_skips_buildings_seen_in_the_first(wired, monkeypatch): 
     monkeypatch.setattr(pipeline.osm, "lookup_address", lambda address, name=None: {
         "lat": 25.93, "lng": -80.121, "phone": "+13059491000", "website": None, "name": "Oceania II",
         "levels": "28", "osm_id": "way/1"} if address.startswith("16485") else None)
-    kw = dict(strategy="onsite", limit=5, use_ai=False, use_apollo=False, precheck=False, use_search=False)
-    first = pipeline.run(**kw, out_dir=wired / "o1")
-    assert [json.loads(l)["company_name"] for l in (first / "leads.jsonl").read_text().splitlines()] == ["Oceania II"]
-    second = pipeline.run(**kw, out_dir=wired / "o2")
-    assert (second / "leads.jsonl").read_text() == ""
+    return dict(strategy="onsite", limit=5, use_ai=False, use_apollo=False, precheck=False, use_search=False)
+
+
+def _names(out):
+    return [json.loads(l)["company_name"] for l in (out / "leads.jsonl").read_text().splitlines()]
+
+
+def test_dry_runs_never_consume_buildings(wired, monkeypatch):  # noqa: F811
+    kw = _seed_wiring(wired, monkeypatch)
+    assert _names(pipeline.run(**kw, out_dir=wired / "o1")) == ["Oceania II"]
+    assert _names(pipeline.run(**kw, out_dir=wired / "o2", send=True)) == ["Oceania II"]     # dry-run to the CRM
+    assert pipeline.Ledger().seen_counts() == {}                                            # nothing recorded
+
+
+def test_a_committed_batch_is_consumed_only_after_the_crm_confirms(wired, monkeypatch):  # noqa: F811
+    kw = _seed_wiring(wired, monkeypatch, secret="s")
+    calls = []
+
+    def ok(payloads, batch_id, dry_run, client, **k):
+        calls.append(dry_run)
+        return crm_importer.ImportReport(batch_id=batch_id, dry_run=dry_run, sent=len(payloads), inserted=len(payloads))
+    monkeypatch.setattr(crm_importer, "import_leads", ok)
+    first = pipeline.run(**kw, out_dir=wired / "o1", send=True, commit=True)
+    assert _names(first) == ["Oceania II"] and calls == [False]
+    second = pipeline.run(**kw, out_dir=wired / "o2", send=True, commit=True)
+    assert _names(second) == []
     assert json.loads((second / "quality_report.json").read_text())["skipped_seen_in_earlier_runs"] >= 1
-    third = pipeline.run(**kw, out_dir=wired / "o3", ignore_seen=True)
-    assert "Oceania II" in (third / "leads.jsonl").read_text()
+    assert pipeline.Ledger().seen_counts()["imported"] == 1
+    third = pipeline.run(**kw, out_dir=wired / "o3", ignore_seen=True)    # comes back, but its phone is in the CRM
+    assert _names(third) == [] and "teléfono repetido" in (third / "rejected.jsonl").read_text()
+
+
+def test_crm_outage_queues_the_batch_and_the_next_start_resends_it(wired, monkeypatch):  # noqa: F811
+    kw = _seed_wiring(wired, monkeypatch, secret="s")
+
+    def down(*a, **k):
+        raise crm_importer.CrmError("CRM no respondió: HTTP 503")
+    monkeypatch.setattr(crm_importer, "import_leads", down)
+    out = pipeline.run(**kw, out_dir=wired / "o1", send=True, commit=True)
+    q = json.loads((out / "quality_report.json").read_text())
+    assert q["crm"]["pending_resend"] and "503" in q["crm"]["error"]
+    assert [p["batch_id"] for p in pipeline.Ledger().pending()] == [out.name]
+    assert _names(pipeline.run(**kw, out_dir=wired / "o2")) == ["Oceania II"]     # not consumed while pending
+    assert pipeline.resend_pending()["still_pending"][0]["attempts"] == 2            # still down
+    got = []
+
+    def ok(payloads, batch_id, dry_run, client, **k):
+        got.append((batch_id, dry_run, [p["company_name"] for p in payloads]))
+        return crm_importer.ImportReport(batch_id=batch_id, dry_run=dry_run, sent=1, inserted=1)
+    monkeypatch.setattr(crm_importer, "import_leads", ok)
+    res = pipeline.resend_pending()
+    assert res["resent"] == [{"batch_id": out.name, "inserted": 1, "duplicates": 0}]
+    assert got == [(out.name, False, ["Oceania II"])] and pipeline.Ledger().pending() == []
+    assert (out / "crm_response_commit.json").exists()
+    assert _names(pipeline.run(**kw, out_dir=wired / "o3", send=True, commit=True)) == []   # now consumed
+
+
+def test_old_processed_rows_no_longer_block_a_building(tmp_path):
+    led = Ledger(tmp_path / "s.db")
+    lead = Lead(source="dbpr", source_id="dbpr:9", strategy_kind="onsite", company_name="X",
+                address="1 Ocean Dr, Miami Beach, FL 33139")
+    led.mark_seen(lead, "processed", "old")
+    assert not led.should_skip(lead)
+    led.mark_seen(lead, "imported", "b")
+    assert led.should_skip(lead)
 
 
 # ── portfolios ──────────────────────────────────────────────────────────────

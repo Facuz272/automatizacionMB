@@ -2,10 +2,15 @@
 
 `seen_leads`: every building a run worked on, keyed by its normalised street address (so the
 same tower arriving from DBPR, the cadastre or Places is one building) and by its source id
-(place_id, dbpr project, folio, NPI). Status: processed (accepted in a dry run), imported
-(committed to the CRM), needs_phone, rejected, in_crm. A new run skips them, so
+(place_id, dbpr project, folio, NPI). Only definitive outcomes are written, and only by committed
+runs (never by a dry run): imported (the CRM confirmed the insert), in_crm, needs_phone, rejected.
+A lead is never consumed before the CRM confirms it, so a run that dies half-way or a CRM outage
+loses nothing; "processed" rows written by older versions no longer block a building. A new run
+skips the rest, so
 `--seed dbpr --limit 20` brings the next 20 of the ranking; `--ignore-seen` forces them back and
 `--retry-needs-phone` retries only the ones that lacked a phone.
+`pending_batches`: committed batches whose CRM send failed after the retries; `daily` re-sends them
+before building a new batch.
 `seen` / `imported`: older per-source and per-phone tables, kept for compatibility.
 The CRM remains the source of truth for duplicates.
 """
@@ -33,7 +38,14 @@ CREATE TABLE IF NOT EXISTS seen_leads (
 );
 CREATE INDEX IF NOT EXISTS seen_leads_addr ON seen_leads(address_key);
 CREATE INDEX IF NOT EXISTS seen_leads_src ON seen_leads(source_id);
+CREATE TABLE IF NOT EXISTS pending_batches (
+  batch_id TEXT PRIMARY KEY, out_dir TEXT, created_at TEXT, attempts INTEGER, last_error TEXT
+);
 """
+
+# Statuses that mean "this building is done": a new run skips it. "processed" (older versions wrote it
+# before the CRM confirmed) is deliberately not here.
+CONSUMED = {"imported", "in_crm", "needs_phone", "rejected"}
 
 STATUS_RANK = {"rejected": 0, "needs_phone": 1, "processed": 2, "in_crm": 3, "imported": 4}
 
@@ -55,7 +67,7 @@ class Ledger:
     def __init__(self, path: Path | None = None):
         self.path = Path(path or settings.state_db)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.executescript(SCHEMA)
 
     def outcome(self, source_id: str) -> str | None:
@@ -107,7 +119,7 @@ class Ledger:
         if ignore_seen:
             return False
         st = self.seen_status(lead)
-        if st is None:
+        if st not in CONSUMED:
             return False
         return not (retry_needs_phone and st == "needs_phone")
 
@@ -126,6 +138,24 @@ class Ledger:
                 "phone_key=COALESCE(excluded.phone_key, seen_leads.phone_key), last_seen=excluded.last_seen",
                 (key, lead.source, lead.source_id, ak, phone_key(lead.phone) if lead.phone else None, lead.company_name,
                  status, reason, batch_id, now, now))
+        self.conn.commit()
+
+    # ── committed batches waiting for the CRM ─────────────────────────────
+    def add_pending(self, batch_id: str, out_dir: Path, error: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            "INSERT INTO pending_batches VALUES (?,?,?,1,?) ON CONFLICT(batch_id) DO UPDATE SET "
+            "attempts = pending_batches.attempts + 1, last_error = excluded.last_error",
+            (batch_id, str(out_dir), now, error[:500]))
+        self.conn.commit()
+
+    def pending(self) -> list[dict]:
+        rows = self.conn.execute("SELECT batch_id, out_dir, created_at, attempts, last_error FROM pending_batches "
+                                 "ORDER BY created_at").fetchall()
+        return [dict(zip(("batch_id", "out_dir", "created_at", "attempts", "last_error"), r)) for r in rows]
+
+    def clear_pending(self, batch_id: str) -> None:
+        self.conn.execute("DELETE FROM pending_batches WHERE batch_id = ?", (batch_id,))
         self.conn.commit()
 
     def seen_counts(self) -> dict[str, int]:

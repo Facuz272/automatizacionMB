@@ -189,10 +189,21 @@ def main(argv: list[str] | None = None) -> int:
     out.write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({k: v for k, v in report.as_dict().items() if k != "responses"}, ensure_ascii=False, indent=2))
     print(f"\nRespuesta completa: {out}")
-    if args.commit and report.inserted:
-        from .state import Ledger
+    if args.commit:
+        # A manual commit of a batch folder counts like daily's: its leads are consumed and it leaves the queue.
+        leads_file = args.file.with_name("leads.jsonl")
+        if leads_file.exists() and batch_id:
+            from .models import Lead
+            from .pipeline import record_commit
+            from .state import Ledger
 
-        Ledger().mark_imported(_load(args.file), report)
+            accepted = [Lead.from_record(json.loads(l)) for l in leads_file.read_text(encoding="utf-8").splitlines()
+                        if l.strip()]
+            record_commit(Ledger(), batch_id, accepted, _load(args.file), report)
+        elif report.inserted:
+            from .state import Ledger
+
+            Ledger().mark_imported(_load(args.file), report)
     return 0
 
 

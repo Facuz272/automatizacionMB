@@ -9,6 +9,8 @@ download is not present (e.g. /opt/pw-browsers/chromium).
 
 from __future__ import annotations
 
+import os
+
 from loguru import logger
 
 from . import costs
@@ -41,15 +43,38 @@ def _get_browser():
     kwargs = {"headless": True}
     if settings.playwright_chromium_path:
         kwargs["executable_path"] = settings.playwright_chromium_path
-    try:
-        _browser = _pw.chromium.launch(**kwargs)
-    except Exception as exc:  # noqa: BLE001 - any launch failure disables rendering for the run
-        logger.warning("Playwright no pudo abrir Chromium ({}); se sigue sin renderizar", str(exc).splitlines()[0])
-        _failed = True
-        _pw.stop()
-        _pw = None
-        raise
-    return _browser
+    attempts = [kwargs] + [{**kwargs, "executable_path": p} for p in fallback_executables()
+                           if p != kwargs.get("executable_path")]
+    last: Exception | None = None
+    for kw in attempts:
+        try:
+            _browser = _pw.chromium.launch(**kw)
+            if kw is not kwargs:
+                logger.info("Playwright: usando el Chromium instalado en {}", kw["executable_path"])
+            return _browser
+        except Exception as exc:  # noqa: BLE001 - try the next installed browser
+            last = exc
+    logger.warning("Playwright no pudo abrir Chromium ({}); se sigue sin renderizar", str(last).splitlines()[0])
+    _failed = True
+    _pw.stop()
+    _pw = None
+    raise last  # type: ignore[misc]
+
+
+def fallback_executables() -> list[str]:
+    """Chromium binaries already installed on the machine. The playwright package looks for the build it
+    was released with; when the machine has another one (seen live: package wants 1248, image has 1243)
+    rendering would silently stay off, so any installed Chromium is tried before giving up."""
+    import glob
+
+    roots = [os.getenv("PLAYWRIGHT_BROWSERS_PATH") or "", "/opt/pw-browsers", os.path.expanduser("~/.cache/ms-playwright")]
+    found: list[str] = []
+    for root in filter(None, roots):
+        for pattern in ("chromium", "chromium-*/chrome-linux*/chrome", "chromium_headless_shell-*/chrome-*/chrome-headless-shell"):
+            for path in sorted(glob.glob(os.path.join(root, pattern)), reverse=True):
+                if os.path.isfile(path) and os.access(path, os.X_OK) and path not in found:
+                    found.append(path)
+    return found
 
 
 def render(url: str | None = None, html: str | None = None, timeout_ms: int = 20000) -> str | None:

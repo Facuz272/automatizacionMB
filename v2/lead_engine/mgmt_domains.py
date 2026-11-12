@@ -46,6 +46,15 @@ CATALOG = {
     "Leland Management": "lelandmanagement.com",
     "Sentry Management": "sentrymgt.com",
     "Vesta Property Services": "vestapropertyservices.com",
+    # Added 2026-11-12 from the DBPR portfolio ranking of the service area; each domain was checked live
+    # (site answers, carries the firm's name and a Florida address/phone). Firms whose site could not be
+    # verified (SKRLD, FP Management, Neighborhood PM, Courtesy PM…) are left out rather than guessed:
+    # several obvious guesses belonged to unrelated companies.
+    "Gold Property Management & Associates": "goldpropertymanagement.com",
+    "GRS Community Management": "grsmgt.com",
+    "Unlimited Property Management": "unlimitedpm.com",
+    "Benchmark Property Management": "benchmarkpm.com",
+    "L&C Royal Management": "lcroyal.com",
 }
 
 
@@ -128,7 +137,7 @@ def resolve(firm: str | None, *, use_search: bool = True, fetch_email: bool = Tr
     if not domain:
         return None
     status = email_verify.domain_status(domain) if check_mx else "unchecked"
-    if status in email_verify.DROP:
+    if status in email_verify.drop_statuses():
         return None
     out: dict[str, Any] = {"domain": domain, "status": status, "source": source, "firm": hit[0] if hit else firm}
     if fetch_email:

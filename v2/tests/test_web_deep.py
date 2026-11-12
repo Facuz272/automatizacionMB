@@ -109,14 +109,24 @@ def test_email_mx_selection(monkeypatch):
     dead = Lead(source="s", source_id="y", strategy_kind="onsite", company_name="Z", email="a@nomail.com")
     pick_email(dead, {}, check_mx=True)
     assert dead.email is None and dead.email_status == "no_mail"
-    kept = Lead(source="s", source_id="z", strategy_kind="onsite", company_name="Z", email="a@other.com")
+    # a host without MX is dropped by default (EMAIL_REQUIRE_MX=true) …
+    no_mx = Lead(source="s", source_id="z", strategy_kind="onsite", company_name="Z", email="a@other.com")
+    pick_email(no_mx, {}, check_mx=True)
+    assert no_mx.email is None and no_mx.email_status == "a_only"
+    # … and kept (RFC 5321 implicit MX) when the tenant turns the rule off
+    monkeypatch.setenv("EMAIL_REQUIRE_MX", "false")
+    kept = Lead(source="s", source_id="w", strategy_kind="onsite", company_name="Z", email="a@other.com")
     pick_email(kept, {}, check_mx=True)
     assert kept.email_status == "a_only" and kept.crm_payload("b")["email"] == "a@other.com"
 
 
 def test_email_status_real_resolver_shapes(monkeypatch):
     dns = pytest.importorskip("dns.resolver")
-    email_verify.domain_status.cache_clear()
+
+    def reset():
+        email_verify.domain_status.cache_clear()
+        email_verify.backend.cache_clear()
+    reset()
 
     class R:
         lifetime = 0
@@ -131,24 +141,39 @@ def test_email_status_real_resolver_shapes(monkeypatch):
             return ["1.2.3.4"]
 
     monkeypatch.setattr(dns, "Resolver", R)
-    email_verify.mx_supported.cache_clear()
+    monkeypatch.setattr(email_verify, "_doh", lambda *a: pytest.fail("system DNS works: no DoH"))
+    assert email_verify.backend() == "system"
     assert email_verify.domain_status("mail.example") == "mx"
     assert email_verify.domain_status("web-only.example") == "a_only"
     assert email_verify.domain_status("gone.example") == "nxdomain"
-    email_verify.domain_status.cache_clear()
-    email_verify.mx_supported.cache_clear()
+    reset()
 
-    class Blind(R):   # resolver that never answers MX (captive DNS)
+    class Blind(R):   # captive DNS: never answers MX (seen live: gmail.com included)
         def resolve(self, domain, rtype):
             if rtype == "MX" and domain != "gone.example":
                 raise dns.NoAnswer()
             return super().resolve(domain, rtype)
 
     monkeypatch.setattr(dns, "Resolver", Blind)
+    # DNS-over-HTTPS answers: real MX checks instead of switching them off
+    doh = {("gmail.com", "MX"): ("ok", ["gmail-smtp-in.l.google.com"]),
+           ("olympuscondo.com", "MX"): ("ok", ["olympuscondo-com.mail.protection.outlook.com"]),
+           ("web-only.example", "MX"): ("noanswer", []), ("web-only.example", "A"): ("ok", ["1.2.3.4"]),
+           ("gone.example", "MX"): ("nxdomain", [])}
+    monkeypatch.setattr(email_verify, "_doh", lambda d, t, timeout: doh[(d, t)])
+    assert email_verify.backend() == "doh"
+    assert email_verify.domain_status("olympuscondo.com") == "mx"
+    assert email_verify.domain_status("web-only.example") == "a_only"
+    assert email_verify.domain_status("gone.example") == "nxdomain"
+    reset()
+
+    def down(*a):
+        raise email_verify._NoDNS("offline")
+    monkeypatch.setattr(email_verify, "_doh", down)   # no DoH either: keep emails, still catch dead domains
+    assert email_verify.backend() == "none"
     assert email_verify.domain_status("web-only.example") == "unchecked"
     assert email_verify.domain_status("gone.example") == "nxdomain"
-    email_verify.domain_status.cache_clear()
-    email_verify.mx_supported.cache_clear()
+    reset()
 
 
 def test_ai_hook_guard():
