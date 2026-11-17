@@ -43,7 +43,8 @@ UNENRICHED = "/api/public/leads-unenriched"
 ENRICH = "/api/public/leads-enrich"
 ENRICH_MAX = 200
 # Papers sent and live calls first, then the rest of the open leads.
-PRIORITY = ("papers_sent", "portal", "interested", "on_list", "scheduled", "callback", "no_contact", "future", "new")
+# Commercial priority: papers sent, call back, hot (interested) and answered (on list / portal / booked) first.
+PRIORITY = ("papers_sent", "callback", "interested", "on_list", "portal", "scheduled", "no_contact", "future", "new")
 ACTIVE = ("papers_sent", "portal", "interested", "on_list", "scheduled", "callback", "no_contact")
 
 FIRM_RX = re.compile(r"(?i)\b(?:management|mgmt|managers?|realty|real estate|properties|property|services|"
@@ -90,7 +91,7 @@ def fetch_unenriched(include_attempted: bool = False, page: int = 200, timeout: 
 def post_enrich(leads: list[dict[str, Any]], batch_id: str, dry_run: bool, timeout: float = 60) -> dict[str, Any]:
     """POST in chunks of 200; results are merged with indexes into the full list."""
     merged: dict[str, Any] = {"ok": True, "dry_run": dry_run, "received": 0, "updated": 0, "unchanged": 0,
-                              "errors": 0, "not_found": [], "ambiguous": [], "rejected": [], "results": []}
+                              "errors": 0, "would_suggest": 0, "suggested": 0, "not_found": [], "ambiguous": [], "rejected": [], "results": []}
     for start in range(0, len(leads), ENRICH_MAX):
         chunk = leads[start:start + ENRICH_MAX]
         r = requests.post(settings.crm_base_url.rstrip("/") + ENRICH, headers=_headers(), timeout=timeout,
@@ -98,7 +99,7 @@ def post_enrich(leads: list[dict[str, Any]], batch_id: str, dry_run: bool, timeo
         if r.status_code != 200:
             raise CrmError(f"{ENRICH}: HTTP {r.status_code} {r.text[:300]}")
         body = r.json()
-        for k in ("received", "updated", "unchanged", "errors"):
+        for k in ("received", "updated", "unchanged", "errors", "would_suggest", "suggested"):
             merged[k] += int(body.get(k) or 0)
         for k in ("not_found", "ambiguous", "rejected", "results"):
             merged[k] += [{**x, "index": x.get("index", 0) + start} for x in body.get(k) or []]
@@ -262,6 +263,8 @@ def firm_hook(lead: Lead) -> str:
             "precio por portafolio y una prueba en uno de sus edificios.")
 
 
+EST = re.compile(r"est\.\s*US\$", re.I)              # how the CRM recognises a USD estimate in the Ficha
+CRAWL_PAGES = 8                                        # deeper than a normal run: team / staff / contact pages
 FIRM_PLAN_B = "pedir por el Director de Operaciones / Regional Manager (decide proveedores del portafolio)"
 
 
@@ -295,6 +298,24 @@ def _merge_place(lead: Lead, found: Lead) -> None:
     lead.evidence["place_id"] = found.source_id
 
 
+def portfolio_estimate(company: str | None) -> dict[str, Any] | None:
+    """Annual exterior-cleaning range of a firm's DBPR portfolio in the coverage counties, from each condo's
+    registered units (valuation.estimate per building): the median building (what one trial is worth) and the
+    whole portfolio. None without condos with units."""
+    from statistics import median
+
+    from . import valuation
+
+    cl = dbpr.cluster(company=company, max_siblings=1000) if company else None
+    per = [e for e in (valuation.estimate({"units": s["units"], "vertical": "community"})
+                       for s in (cl or {}).get("siblings", []) if (s.get("units") or 0) >= 5) if e]
+    if not per:
+        return None
+    lows, highs = [e["low"] for e in per], [e["high"] for e in per]
+    return {"buildings": len(per), "median_low": int(median(lows)), "median_high": int(median(highs)),
+            "total_low": sum(lows), "total_high": sum(highs), "source": "DBPR units × valuation.py"}
+
+
 def _enrich_firm(lead: Lead, facts, use_ai: bool, check_mx: bool = True) -> None:
     """Management-firm lead: people and emails from its site, CAM firm licence, how many condos it runs in
     the coverage counties (DBPR), portfolio hook and Plan B. No cadastre / building profile: its address is
@@ -318,6 +339,9 @@ def _enrich_firm(lead: Lead, facts, use_ai: bool, check_mx: bool = True) -> None
         cl = {**cl, "count": cl["count"] - 1}          # cluster() counts the lead itself as one building
         lead.portfolio_cluster = cl
         lead.properties_count = cl["count"]
+        pe = portfolio_estimate(lead.management_company)
+        if pe:
+            lead.evidence["portfolio_estimate"] = pe
     emails: dict[str, str] = dict(facts.emails)
     pipeline.pick_email(lead, emails, check_mx)
     if use_ai and ai_enrich.available():
@@ -370,7 +394,7 @@ def enrich_row(row: dict[str, Any], *, use_ai: bool = True, nearby: bool = True)
     facts = SiteFacts()
     if lead.website_url:
         try:
-            facts = pipeline.crawl(lead.website_url)
+            facts = pipeline.crawl(lead.website_url, max_pages=CRAWL_PAGES)
             pipeline._fill_from_site(lead, facts)
         except Exception as exc:                        # noqa: BLE001 — a dead site never stops the batch
             logger.warning("sitio de {} falló: {}", lead.company_name, exc)
@@ -434,6 +458,61 @@ REALTOR_EMAIL = re.compile(r"(?i)@(?:[\w-]+\.)*(?:[\w-]*realt\w*|[\w-]*homes?|kw
                            r"sothebysrealty|exprealty|bhhs\w*|[\w-]*condosforsale)\.[a-z.]+$")
 
 
+# ── emails: who an address belongs to (mirror of the CRM's src/lib/lead-enrich.ts / decision-maker.ts) ──
+
+GENERIC_MAILBOX = re.compile(
+    r"^(info|office|admin|administration|management|manager|mgmt|pm|frontdesk|front[._-]?desk|reception|contact|"
+    r"contactus|hello|service|services|customer|customers|customerservice|customer[._-]?service|support|help|"
+    r"helpdesk|board|accounting|ap|ar|billing|leasing|mail|maintenance|operations|ops|general|team|inquiries|"
+    r"enquiries|vendor|vendors|office[._-]?manager)([._-]?\d+)?$", re.I)
+PLACEHOLDER_DOMAIN = re.compile(r"@(?:[\w-]+\.)*(?:godaddy|example|domain|yourdomain|email|wixpress|sentry|squarespace|"
+                                r"website)\.(?:com|net|org|io)$", re.I)
+ROLE_WORD = re.compile(r"(account|payable|receivable|billing|invoice|bistro|restaurant|join|inquir|enquir|service|"
+                       r"resident|customer|support|admin|office|manage|mgmt|condo|hoa|assoc|team|sales|market|leasing|"
+                       r"front|desk|contact|hello|mail|reply|filler|test|web|staff|board|maint|ops|hr|jobs|career|info|"
+                       r"help|miami|florida|broward|realty|rent)", re.I)
+# Never a channel at all: template / billing / restaurant / no-reply boxes scraped from a site.
+JUNK_LOCAL = re.compile(r"(account|payable|receivable|billing|invoice|bistro|restaurant|filler|test|no-?reply|"
+                        r"donotreply|jobs|career|webmaster|privacy|abuse|postmaster|press|media)", re.I)
+
+
+def is_generic_mailbox(email: str | None) -> bool:
+    local = (email or "").strip().split("@")[0]
+    return bool(local) and bool(GENERIC_MAILBOX.match(local))
+
+
+def is_placeholder_email(email: str | None) -> bool:
+    return bool(PLACEHOLDER_DOMAIN.search((email or "").strip()))
+
+
+def personal_email(email: str | None, name: str | None = None) -> bool:
+    """The address belongs to one person, and to this person when a name is given (CRM personalEmail)."""
+    import unicodedata
+
+    e = (email or "").strip().lower()
+    if not e or is_placeholder_email(e) or is_generic_mailbox(e):
+        return False
+    local = e.split("@")[0]
+    if not re.fullmatch(r"[a-z]+(?:[._-][a-z]+)?\d{0,2}", local) or len(local) < 3 or ROLE_WORD.search(local) \
+            or local.endswith("pm"):
+        return False
+    plain = unicodedata.normalize("NFD", (name or "").lower()).encode("ascii", "ignore").decode()
+    tokens = [t for t in re.split(r"[^a-z]+", plain) if len(t) >= 3]
+    return not tokens or any(t in local for t in tokens)
+
+
+def email_for_row(email: str | None, contact_name: str | None) -> str | None:
+    """Which email may travel with this row: a person's own address next to that person's name; a shared
+    office inbox only when no person is named (never paired with someone); template / billing / restaurant /
+    no-reply boxes never."""
+    e = (email or "").strip().lower()
+    if not e or is_placeholder_email(e) or JUNK_LOCAL.search(e.split("@")[0]):
+        return None
+    if contact_name:
+        return e if personal_email(e, contact_name) else None
+    return e if is_generic_mailbox(e) or personal_email(e) or not ROLE_WORD.search(e.split("@")[0]) else None
+
+
 def payload_row(row: dict[str, Any], lead: Lead, batch_id: str) -> dict[str, Any] | None:
     """Exactly what POST /api/public/leads-enrich takes for one lead (always by id); None when there is
     nothing worth sending."""
@@ -457,6 +536,11 @@ def payload_row(row: dict[str, Any], lead: Lead, batch_id: str) -> dict[str, Any
         out["address"] = addr
     if out.get("contact_name") and not out.get("contact_title"):
         out.pop("contact_name")                        # a bare name without a role misleads the setter
+    if not out.get("contact_name"):
+        out.pop("contact_title", None)
+    email = email_for_row(out.pop("email", None), out.get("contact_name"))
+    if email:
+        out["email"] = email
     useful = set(out) - {"id", "phone", "name"}
     return out if useful else None
 
@@ -475,6 +559,9 @@ def summarize(rows: list[dict[str, Any]], payloads: list[dict[str, Any]], respon
                     "plan_b": sum("Plan B:" in (p.get("sales_strategy") or "") for p in payloads),
                     "management_company": sum("management_company" in p for p in payloads),
                     "address_zip": sum("address" in p for p in payloads),
+                    "estimate": sum(bool(EST.search(p.get("sales_strategy") or "")) for p in payloads),
+                    "decider": sum(bool(p.get("contact_name") and (personal_email(p.get("email"), p["contact_name"])
+                                                                   or p.get("mobile_phone"))) for p in payloads),
                     "email": sum("email" in p for p in payloads),
                     "contact": sum("contact_name" in p for p in payloads)},
         "crm": None if response is None else {
@@ -485,7 +572,11 @@ def summarize(rows: list[dict[str, Any]], payloads: list[dict[str, Any]], respon
             "plan_b": sum(1 for i, fs in fields.items() if "sales_strategy" in fs
                           and "Plan B:" in (by_id.get(i, {}).get("sales_strategy") or "")),
             "management_company": written("management_company"), "address_zip": written("address"),
-            "email": written("email"), "contact": written("contact_name")},
+            "email": written("email"), "contact": written("contact_name"),
+            "estimate": sum(1 for i, fs in fields.items() if "sales_strategy" in fs
+                            and EST.search(by_id.get(i, {}).get("sales_strategy") or "")),
+            "suggested": sum(1 for r in (response or {}).get("results") or [] if r.get("suggested")),
+            "would_suggest": response.get("would_suggest"), "suggested_total": response.get("suggested")},
     }
 
 

@@ -261,6 +261,12 @@ class Lead:
         if self.estimated_deal:
             from .valuation import label as deal_label
             parts.append(deal_label(self.estimated_deal))
+        pe = self.evidence.get("portfolio_estimate") if self.evidence.get("lead_kind") == "management_firm" else None
+        if pe:
+            from .valuation import fmt_usd_k
+            parts.append(f"est. US$ {fmt_usd_k(pe['median_low'])}–{fmt_usd_k(pe['median_high'])}/año por edificio "
+                         f"(mediana de {pe['buildings']} condominios DBPR)")
+            parts.append(f"cartera completa ~US$ {fmt_usd_k(pe['total_low'])}–{fmt_usd_k(pe['total_high'])}/año")
         cl = self.portfolio_cluster
         if cl and cl.get("count") and self.evidence.get("lead_kind") == "management_firm":
             names = ", ".join(x["name"] for x in cl.get("siblings", [])[:2])

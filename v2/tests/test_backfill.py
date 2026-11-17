@@ -168,7 +168,8 @@ def test_building_gets_ficha_firm_zip_and_keeps_the_crm_phone(wired, monkeypatch
     hook, ficha = p["sales_strategy"].split("\nFicha: ")
     assert "Gran Comunidad" in ficha and "est. US$" in ficha and "score" in ficha and "Plan B:" in ficha
     assert "management +13058661300" in ficha or "+13058661300" in ficha    # the office line goes to the Ficha
-    assert p["email"] == "manager@oceansideplaza.org" and p["maps_url"].startswith("https://maps.google.com")
+    assert "email" not in p                       # manager@ is a shared inbox: never paired with Ana Diaz
+    assert p["maps_url"].startswith("https://maps.google.com")
 
 
 def test_management_firm_is_its_own_company_with_portfolio(wired, monkeypatch):  # noqa: F811
@@ -397,3 +398,74 @@ def test_dropping_a_fake_plan_b_contact_restores_the_generic_one():
     l.add_contact("Financial Reporting", "Owner", "website")
     backfill.drop_implausible_contacts(l)
     assert l.contacts == [] and "Plan B: pedir por el Director de Operaciones" in l.brief()
+
+
+# ── second pass: decider emails, cadastre anomalies, portfolio estimate ─────
+
+@pytest.mark.parametrize("email,name,out", [
+    ("jsmith@acme.com", "John Smith", "jsmith@acme.com"),          # the person's own address
+    ("maria.lopez@acme.com", "John Smith", None),                  # someone else's address never pairs with John
+    ("info@acme.com", "John Smith", None),                         # shared inbox never paired with a person
+    ("filler@godaddy.com", None, None), ("accountspayable@acme.com", None, None), ("bistro@hotel.com", None, None),
+    ("noreply@acme.com", None, None),
+    ("info@acme.com", None, "info@acme.com"),                      # an office inbox only when nobody is named
+    ("mlopez@acme.com", None, "mlopez@acme.com"),
+])
+def test_emails_only_travel_with_their_owner(email, name, out):
+    assert backfill.email_for_row(email, name) == out
+
+
+def test_generic_mailbox_mirror_of_the_crm():
+    assert all(backfill.is_generic_mailbox(e) for e in ("info@x.com", "office2@x.com", "front.desk@x.com", "pm@x.com"))
+    assert not backfill.is_generic_mailbox("ana.perez@x.com")
+    assert backfill.personal_email("ana.perez@x.com", "Ana Pérez") and not backfill.personal_email("cmpm@x.com")
+
+
+def test_payload_never_pairs_a_person_with_a_shared_inbox():
+    from lead_engine.models import Lead
+    l = Lead(source="crm", source_id="crm:x", strategy_kind="onsite", company_name="Ocean Tower",
+             contact_name="Ana Pérez", contact_title="Property Manager", email="info@oceantower.com", email_status="mx",
+             address="1 Ocean Dr, Miami Beach, FL 33139")
+    l.evidence["lead_kind"], l.web_text = "building", "site"
+    p = backfill.payload_row(row(name="Ocean Tower"), l, "t")
+    assert p["contact_name"] == "Ana Pérez" and "email" not in p
+    l.email = "aperez@oceantower.com"
+    assert backfill.payload_row(row(name="Ocean Tower"), l, "t")["email"] == "aperez@oceantower.com"
+
+
+def test_single_unit_cadastre_never_describes_a_condo_or_a_community():
+    from lead_engine import appraiser
+    unit = {"kind": "property", "units": 1, "building_sqft": 1610,
+            "land_use": "RESIDENTIAL - TOTAL VALUE : CONDOMINIUM - RESIDENTIAL"}
+    clubhouse = {"kind": "property", "units": 1, "building_sqft": 2002, "land_use": "RESIDENTIAL - SINGLE FAMILY : 1 UNIT"}
+    plaza = {"kind": "property", "units": 1, "building_sqft": 45000, "land_use": "COMMERCIAL - SHOPPING CENTER"}
+    tower = {"kind": "condominium", "units": 297, "building_sqft": 310037, "land_use": "RESIDENTIAL - TOTAL VALUE"}
+    assert appraiser.single_residential_unit(unit) and appraiser.single_residential_unit(clubhouse)
+    assert not appraiser.single_residential_unit(plaza) and not appraiser.single_residential_unit(tower)
+
+
+def test_tower_numbers_never_cross():
+    assert dbpr.numbers_conflict("Mystic Pointe Tower 100", "MYSTIC POINTE TOWER 400 CONDO")
+    assert not dbpr.numbers_conflict("100 Hidden Bay Condominum", "100 HIDDEN BAY CONDO")
+    assert not dbpr.numbers_conflict("Lago Grande Homeowners", "LAGO GRANDE SEVEN-C")
+
+
+def test_firm_ficha_prices_a_trial_building_from_its_dbpr_portfolio(monkeypatch):
+    from lead_engine.models import Lead
+    monkeypatch.setattr(dbpr, "cluster", lambda **kw: {"count": 3, "siblings": [
+        {"name": "A", "units": 120}, {"name": "B", "units": 300}, {"name": "C", "units": 2}]})
+    pe = backfill.portfolio_estimate("Acme Management")
+    assert pe["buildings"] == 2 and pe["median_low"] < pe["total_low"]          # the 2-unit building is ignored
+    l = Lead(source="crm", source_id="crm:x", strategy_kind="portfolio", company_name="Acme Management")
+    l.evidence.update(lead_kind="management_firm", portfolio_estimate=pe)
+    b = l.brief()
+    assert "/año por edificio (mediana de 2 condominios DBPR)" in b and "cartera completa ~US$" in b
+    import re as _re
+    assert _re.search(r"est\.\s*US\$", b)                                        # what the CRM reads as estimate
+
+
+def test_priority_is_papers_callback_hot_answered():
+    rows = [row(id=str(i), position=i, status=s) for i, s in enumerate(
+        ["new", "on_list", "callback", "interested", "papers_sent", "no_contact"])]
+    assert [r["status"] for r in backfill.select(rows, None, None)][:4] == ["papers_sent", "callback", "interested",
+                                                                             "on_list"]

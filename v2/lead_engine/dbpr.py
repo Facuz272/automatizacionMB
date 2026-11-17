@@ -367,6 +367,16 @@ def _pick(rows: list[sqlite3.Row]) -> sqlite3.Row:
         r["primary_status"] != "Approved", not (r["managing_entity_route"] or "").strip(), -(r["units"] or 0)))[0]
 
 
+_NUM = re.compile(r"\b(\d{1,4})(?:-?[a-z])?\b", re.I)
+
+
+def numbers_conflict(a: str | None, b: str | None) -> bool:
+    """Both names carry a tower / phase number and they differ ('Mystic Pointe Tower 100' vs
+    'MYSTIC POINTE TOWER 400 CONDO'): two different projects that may share a street address."""
+    na, nb = set(_NUM.findall(a or "")), set(_NUM.findall(b or ""))
+    return bool(na and nb and not na & nb)
+
+
 def match(address: str | None, name: str | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any] | None:
     try:
         conn = conn or connect()
@@ -378,9 +388,13 @@ def match(address: str | None, name: str | None = None, conn: sqlite3.Connection
     if key:
         rows = conn.execute("SELECT * FROM dbpr_condos WHERE address_key = ?", (key,)).fetchall()
         how = "address" if rows else None
+    if rows and name:
+        rows = [r for r in rows if not numbers_conflict(name, r["condo_name"])]
+        how = how if rows else None
     if not rows and name and (z := zip5(address)):
         cands = conn.execute("SELECT * FROM dbpr_condos WHERE zip = ?", (z,)).fetchall()
-        scored = sorted(((name_similarity(name, c["condo_name"]), c) for c in cands), key=lambda t: -t[0])
+        scored = sorted(((name_similarity(name, c["condo_name"]), c) for c in cands
+                         if not numbers_conflict(name, c["condo_name"])), key=lambda t: -t[0])
         if scored and scored[0][0] >= 0.6:
             rows, how = [scored[0][1]], f"name~{scored[0][0]:.2f}"
     if not rows:

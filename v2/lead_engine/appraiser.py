@@ -88,6 +88,17 @@ def care_of(a: dict) -> str | None:
     return None
 
 
+def single_residential_unit(rec: dict | None) -> bool:
+    """A residential parcel of one unit: a single condo apartment (the county lists each unit as its own
+    folio) or a house / clubhouse lot. Never the building or community a lead is about, so its area,
+    floors and units must not describe the property (100 Hidden Bay → one 1,610 ft² unit; Marbella Park
+    → the 2,002 ft² clubhouse)."""
+    if not rec:
+        return False
+    units = rec.get("units") or 0
+    return units <= 1 and (rec.get("land_use") or "").upper().startswith("RESIDENTIAL")
+
+
 def aggregate(records: list[dict]) -> dict[str, Any] | None:
     """Building-level facts from the folios at one street address (pure)."""
     recs = [r for r in records if (r.get("DOR_DESC") or "") != "REFERENCE FOLIO"

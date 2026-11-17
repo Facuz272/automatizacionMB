@@ -429,7 +429,12 @@ def enrich(lead: Lead, facts: SiteFacts | None, *, use_apollo: bool, use_ai: boo
 
     # Official cadastre + lodging licence, then the business vertical.
     if lead.source != "pa" or not lead.cadastre:  # cadastre seeds carry their exact folio (unless re-seeded
-        lead.cadastre = appraiser.lookup(lead.address) or lead.cadastre   # from needs_phone.csv by enrich-phones)
+        cad = appraiser.lookup(lead.address)                # from needs_phone.csv by enrich-phones)
+        if appraiser.single_residential_unit(cad):
+            lead.evidence["cadastre_rejected"] = {"folio": cad.get("folio"), "land_use": cad.get("land_use"),
+                                                  "building_sqft": cad.get("building_sqft"), "why": "una sola unidad"}
+            cad = None
+        lead.cadastre = cad or lead.cadastre
     if use_dbpr:
         lead.lodging = lodging.match(lead.address, building_units=(lead.public_records.get("dbpr") or {}).get("units")
                                      or lead.cadastre.get("units")) or {}
