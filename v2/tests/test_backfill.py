@@ -180,8 +180,8 @@ def test_management_firm_is_its_own_company_with_portfolio(wired, monkeypatch): 
     _search_returns(monkeypatch, [firm])
     monkeypatch.setattr(pipeline.appraiser, "lookup", lambda a: pytest.fail("an office is not a property to wash"))
     seen = {}
-    monkeypatch.setattr(dbpr, "cluster", lambda **kw: seen.update(kw) or {
-        "by": "company", "key": "KEY:CASTLEMANAGEMENT", "count": 2, "total_units": 299,
+    monkeypatch.setattr(backfill, "firm_portfolio", lambda company: seen.update(company=company) or {
+        "by": "company", "key": company, "count": 1, "total_units": 299,
         "siblings": [{"name": "Oceanside Plaza", "address": "5555 COLLINS AVE", "units": 299, "zip": "33140"}]})
     monkeypatch.setattr(pipeline, "crawl", lambda url, max_pages=5: parse_page(
         "<html><body><p>Laura Vega, Director of Operations</p></body></html>", url))
@@ -452,7 +452,7 @@ def test_tower_numbers_never_cross():
 
 def test_firm_ficha_prices_a_trial_building_from_its_dbpr_portfolio(monkeypatch):
     from lead_engine.models import Lead
-    monkeypatch.setattr(dbpr, "cluster", lambda **kw: {"count": 3, "siblings": [
+    monkeypatch.setattr(backfill, "firm_portfolio", lambda company: {"count": 3, "siblings": [
         {"name": "A", "units": 120}, {"name": "B", "units": 300}, {"name": "C", "units": 2}]})
     pe = backfill.portfolio_estimate("Acme Management")
     assert pe["buildings"] == 2 and pe["median_low"] < pe["total_low"]          # the 2-unit building is ignored
@@ -469,3 +469,47 @@ def test_priority_is_papers_callback_hot_answered():
         ["new", "on_list", "callback", "interested", "papers_sent", "no_contact"])]
     assert [r["status"] for r in backfill.select(rows, None, None)][:4] == ["papers_sent", "callback", "interested",
                                                                              "on_list"]
+
+
+
+def test_firm_portfolio_never_borrows_another_firms_condos(monkeypatch):
+    rows = [("United Community Management", f"P{i}", f"CONDO {i}", f"{i} A ST, MIAMI, FL 33130", "33130", 100)
+            for i in range(44)]
+    rows += [("Unite Property Management", "U1", "PALM VILLAS", "1 B ST, MIAMI, FL 33130", "33130", 60),
+             ("Unite Property Mgmt", "U2", "SUN TOWERS", "2 B ST, MIAMI, FL 33130", "33130", 80)]
+    monkeypatch.setattr(backfill, "_PORTFOLIO_ROWS", {str(dbpr._db_path()): rows})
+    unite = backfill.firm_portfolio("Unite Property Management Inc")
+    assert unite["count"] == 2 and {x["name"] for x in unite["siblings"]} == {"Palm Villas", "Sun Towers"}
+    assert backfill.firm_portfolio("United Property Management") is None
+    assert backfill.firm_portfolio("United Community Mgmt Corp")["count"] == 44
+
+
+def test_an_office_parcel_with_a_firm_name_is_a_firm(monkeypatch):
+    from lead_engine.models import Lead
+    monkeypatch.setattr(backfill, "firm_portfolio", lambda company: None)
+    l = Lead(source="crm", source_id="crm:kw", strategy_kind="onsite", company_name="KW PROPERTY MANAGEMENT & CONSULTING",
+             cadastre={"land_use": "OFFICE BUILDING - MULTISTORY : OFFICE BUILDING", "building_sqft": 106849},
+             estimated_deal={"low": 27000, "high": 53000})
+    l.evidence["lead_kind"] = "building"
+    assert backfill.office_of_a_firm(l)
+    backfill.as_firm(l)
+    b = l.brief()
+    assert b.startswith("Ficha: Administradora de propiedades") and "106.849" not in b and "27k" not in b
+    tower = Lead(source="crm", source_id="crm:p", strategy_kind="onsite", company_name="Privé Condominium Management",
+                 cadastre={"land_use": "RESIDENTIAL - TOTAL VALUE : CONDOMINIUM - RESIDENTIAL"})
+    tower.evidence["lead_kind"] = "building"
+    assert not backfill.office_of_a_firm(tower)
+
+
+def test_a_firm_keeps_only_a_licence_in_its_own_name():
+    from lead_engine.models import Lead
+    l = Lead(source="crm", source_id="crm:u", strategy_kind="portfolio", company_name="United Property Management")
+    l.licenses = {"firm": {"license_id": "CAB2908", "name": "United Community Management", "legal_name":
+                           "UNITED COMMUNITY MANAGEMENT CORP", "matched_by": "fuzzy", "active": True}}
+    backfill.own_licence_only(l)
+    assert "firm" not in l.licenses and l.evidence["licence_dropped"] == "CAB2908"
+    k = Lead(source="crm", source_id="crm:k", strategy_kind="portfolio", company_name="Keystone Property Management")
+    k.licenses = {"firm": {"license_id": "CAB2832", "name": "Keystone Property Mgmt", "legal_name": "KEYSTONE PROPERTY "
+                           "MANAGEMENT INC", "matched_by": "fuzzy", "active": True}}
+    backfill.own_licence_only(k)
+    assert k.licenses["firm"]["license_id"] == "CAB2832"

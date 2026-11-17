@@ -208,7 +208,8 @@ NOT_A_PERSON = re.compile(
     r"maintenance|accounting|leasing|sales|owners?|apply|online|payments?|forms?|faq|careers?|our|your|free|"
     r"rental|analysis|order|estoppel|request|quote|schedule|book|view|learn|more|read|start|sign|pay|submit|"
     r"download|corporate|profiles?|resources?|testimonials?|reviews?|blog|gallery|events?|amenities|"
-    r"financial|financials|reporting|reports?|statements?|documents?|directory|calendar|newsletter)\b")
+    r"financial|financials|reporting|reports?|statements?|documents?|directory|calendar|newsletter|person|"
+    r"people|name|first|last|full)\b")
 
 
 def plausible_person(name: str | None, company: str | None = None) -> bool:
@@ -298,7 +299,43 @@ def _merge_place(lead: Lead, found: Lead) -> None:
     lead.evidence["place_id"] = found.source_id
 
 
-def portfolio_estimate(company: str | None) -> dict[str, Any] | None:
+_PORTFOLIO_ROWS: dict[str, list] = {}
+
+
+def firm_portfolio(company: str | None) -> dict[str, Any] | None:
+    """Condos in the coverage counties whose DBPR managing-entity line names THIS firm (same spelling up to
+    abbreviations: firm_similarity >= 0.8). Stricter than dbpr.cluster, whose CAB-licence grouping can fold
+    different firms together (United Community Management / Unite Property Management)."""
+    from .names import firm_similarity
+
+    if not company:
+        return None
+    key = str(dbpr._db_path())
+    if key not in _PORTFOLIO_ROWS:
+        try:
+            conn = dbpr.connect()
+            counties = dbpr._coverage_counties()
+            _PORTFOLIO_ROWS[key] = conn.execute(
+                f"SELECT r.company, c.project_number, c.condo_name, c.address, c.zip, c.units FROM dbpr_routes r "
+                f"JOIN dbpr_condos c USING (project_number) WHERE r.company IS NOT NULL AND c.primary_status = "
+                f"'Approved' AND UPPER(c.county) IN ({','.join('?' * len(counties))})", counties).fetchall()
+        except Exception:                              # noqa: BLE001 — registry missing: no portfolio
+            _PORTFOLIO_ROWS[key] = []
+    seen: dict[str, Any] = {}
+    for r in _PORTFOLIO_ROWS[key]:
+        if firm_similarity(company, r[0]) >= 0.8:
+            k = dbpr.address_key(r[3]) or r[1]
+            if k not in seen or (r[5] or 0) > (seen[k][5] or 0):
+                seen[k] = r
+    if not seen:
+        return None
+    rows = sorted(seen.values(), key=lambda r: -(r[5] or 0))
+    return {"by": "company", "key": company, "count": len(rows), "total_units": sum(r[5] or 0 for r in rows),
+            "siblings": [{"name": dbpr._short_condo_name(r[2]), "address": r[3], "units": r[5], "zip": r[4],
+                          "project_number": r[1]} for r in rows]}
+
+
+def portfolio_estimate(company: str | None, cl: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Annual exterior-cleaning range of a firm's DBPR portfolio in the coverage counties, from each condo's
     registered units (valuation.estimate per building): the median building (what one trial is worth) and the
     whole portfolio. None without condos with units."""
@@ -306,7 +343,7 @@ def portfolio_estimate(company: str | None) -> dict[str, Any] | None:
 
     from . import valuation
 
-    cl = dbpr.cluster(company=company, max_siblings=1000) if company else None
+    cl = cl if cl is not None else firm_portfolio(company)
     per = [e for e in (valuation.estimate({"units": s["units"], "vertical": "community"})
                        for s in (cl or {}).get("siblings", []) if (s.get("units") or 0) >= 5) if e]
     if not per:
@@ -314,6 +351,70 @@ def portfolio_estimate(company: str | None) -> dict[str, Any] | None:
     lows, highs = [e["low"] for e in per], [e["high"] for e in per]
     return {"buildings": len(per), "median_low": int(median(lows)), "median_high": int(median(highs)),
             "total_low": sum(lows), "total_high": sum(highs), "source": "DBPR units × valuation.py"}
+
+
+def apply_firm_portfolio(lead: Lead) -> None:
+    """DBPR portfolio (strict firm-name match), its count and the USD range per building / portfolio."""
+    full = firm_portfolio(lead.management_company or lead.company_name)
+    lead.portfolio_cluster = {**full, "siblings": full["siblings"][:3]} if full else {}
+    lead.properties_count = full["count"] if full else None
+    pe = portfolio_estimate(None, full) if full else None
+    if pe:
+        lead.evidence["portfolio_estimate"] = pe
+    else:
+        lead.evidence.pop("portfolio_estimate", None)
+
+
+OFFICE_USE = re.compile(r"(?i)^(?:office|commercial|store|industrial)")
+
+
+def office_of_a_firm(lead: Lead) -> bool:
+    """Classified as a building, but the parcel is an office and the name is a management firm's
+    (KW Property Management & Consulting, South Florida Condominium Management)."""
+    land_use = (lead.cadastre or {}).get("land_use") or ""
+    return (lead.evidence.get("lead_kind") == "building" and bool(OFFICE_USE.search(land_use))
+            and bool(STRONG_FIRM.search(lead.company_name or "")) and not HOA_NAME.search(lead.company_name or ""))
+
+
+def as_firm(lead: Lead) -> None:
+    """Re-read a lead as a management firm from what was already gathered (no API call): its office's cadastre,
+    building profile and ticket do not describe a property to wash."""
+    lead.evidence["lead_kind"] = "management_firm"
+    lead.evidence["reclassified"] = "oficina de administradora"
+    lead.strategy_kind = "portfolio"
+    lead.vertical = "community"
+    lead.cadastre, lead.building, lead.lodging, lead.estimated_deal = {}, {}, {}, {}
+    lead.municipal, lead.pain, lead.pain_score = [], [], 0.0
+    lead.management_company = lead.company_name
+    lead.management_type = "third_party"
+    lead.public_records.pop("dbpr", None)
+    refresh_firm(lead)
+
+
+def own_licence_only(lead: Lead) -> None:
+    """A firm lead keeps a CAB licence only when the licence is in its own name: an approximate match can be
+    another firm (United Property Management ≈ CAB2908 United Community Management)."""
+    from .names import firm_similarity
+
+    lic = (lead.licenses or {}).get("firm")
+    if lic and lic.get("matched_by") != "exact" and max(
+            firm_similarity(lead.company_name, lic.get("name")), firm_similarity(lead.company_name, lic.get("legal_name"))) < 0.8:
+        lead.evidence["licence_dropped"] = lic.get("license_id")
+        lead.licenses.pop("firm", None)
+
+
+def refresh_firm(lead: Lead) -> None:
+    """Portfolio, hook and Plan B of a firm lead from the current rules (used after enrichment and by --rebuild)."""
+    from . import scoring
+
+    lead.management_company = lead.company_name
+    own_licence_only(lead)
+    apply_firm_portfolio(lead)
+    drop_implausible_contacts(lead)
+    lead.sales_strategy = firm_hook(lead)
+    if not lead.plan_b():
+        lead.plan_b_fallback = {"text": FIRM_PLAN_B, "source": "tactical"}
+    scoring.apply(lead)
 
 
 def _enrich_firm(lead: Lead, facts, use_ai: bool, check_mx: bool = True) -> None:
@@ -333,15 +434,8 @@ def _enrich_firm(lead: Lead, facts, use_ai: bool, check_mx: bool = True) -> None
             lead.contact_name, lead.contact_title = best["name"], best["title"]
             lead.evidence["contact_from"] = best["source"]
     pipeline.apply_licenses(lead)
-    cl = dbpr.cluster(company=lead.management_company, near_zip=dbpr.zip5(lead.address),
-                      near_city=dbpr.city_of(lead.address))
-    if cl:
-        cl = {**cl, "count": cl["count"] - 1}          # cluster() counts the lead itself as one building
-        lead.portfolio_cluster = cl
-        lead.properties_count = cl["count"]
-        pe = portfolio_estimate(lead.management_company)
-        if pe:
-            lead.evidence["portfolio_estimate"] = pe
+    own_licence_only(lead)
+    apply_firm_portfolio(lead)
     emails: dict[str, str] = dict(facts.emails)
     pipeline.pick_email(lead, emails, check_mx)
     if use_ai and ai_enrich.available():
@@ -406,6 +500,9 @@ def enrich_row(row: dict[str, Any], *, use_ai: bool = True, nearby: bool = True)
         pipeline.enrich(lead, facts, use_apollo=False, use_ai=use_ai, use_search=False, use_geo=True,
                         use_dbpr=True, check_mx=True)
     drop_implausible_contacts(lead)
+    if office_of_a_firm(lead):
+        as_firm(lead)
+        firm = True
     if crm_phone and lead.phone != crm_phone:          # the CRM line stays the primary
         lead.phone = crm_phone
         lead.evidence.pop("phone_replaced", None)
@@ -667,6 +764,12 @@ def rebuild_saved(out: Path) -> dict[str, Any]:
         lead = Lead.from_record(w["lead"])
         lead.web_text = "(identificado en la corrida original)"
         drop_implausible_contacts(lead)
+        if office_of_a_firm(lead):
+            as_firm(lead)
+        elif lead.evidence.get("lead_kind") == "management_firm":
+            refresh_firm(lead)
+        w["kind"] = lead.evidence.get("lead_kind")
+        w["lead"] = lead.internal_record()
         p = payload_row({"id": w["id"], "name": w["name"], "phone": lead.phone}, lead, batch_id)
         w["fields"] = sorted(set(p or {}) - {"id", "phone", "name"})
         w["sent"] = bool(p)
