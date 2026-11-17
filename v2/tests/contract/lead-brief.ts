@@ -115,12 +115,27 @@ function parseSibling(raw: string): BriefSibling {
   return { name, street, units: unitBit ? Number(unitBit.split(" ")[0]) : null, signals: bits.filter((b) => b !== unitBit), raw };
 }
 
+/** Integer from any digit string, ignoring separators: "12.345" → 12345, "1,200" → 1200; null if no digits. */
+export function parseIntLoose(s: string): number | null {
+  const d = s.replace(/\D/g, "");
+  return d ? Number(d) : null;
+}
+
+/** Footprint in m² from a Ficha fact like "~12.345 m² de huella (~132.882 ft²)" (es-AR thousands). */
+export function fichaFootprintM2(facts: readonly string[]): number | null {
+  for (const x of facts) {
+    const m = /~([\d.,]+)\s*m²\s+de huella/.exec(x);
+    if (m) return parseIntLoose(m[1]!);
+  }
+  return null;
+}
+
 function parseConsolidation(text: string): { found: BriefConsolidation; rest: string } | null {
   const m = CONSOLIDATION.exec(text);
   if (!m) return null;
   const siblings = (m[2]!.match(/\[[^\]]*\]/g) ?? []).map(parseSibling).filter((x) => x.name);
   if (!siblings.length) return null;
-  const usd = m[4] ? Number(m[4].replace(/[.,]/g, "")) : null;
+  const usd = m[4] ? parseIntLoose(m[4].replace(/(?<=\d[.,]\d+)[.,]\d{2}$/, "")) : null;
   const rest = (text.slice(0, m.index) + text.slice(m.index + m[0].length)).replace(/\s{2,}/g, " ").trim();
   return { found: { firm: m[1]!.trim(), siblings, moreInPdf: m[3] ? Number(m[3]) : 0, extraEstimateUsd: usd && Number.isFinite(usd) ? usd : null, text: m[0] }, rest };
 }
@@ -164,4 +179,30 @@ export function phoneE164(number: string): string | null {
   if (d.length === 11 && d.startsWith("1")) return `+${d}`;
   if (d.length >= 11 && d.length <= 15) return `+${d}`;
   return null;
+}
+
+/**
+ * Building name as the duplicate check sees it: lowercase, no leading article, only letters and
+ * digits ("The Palm Court." = "palm court"). Mirrors private.norm_building_name (migration 0050).
+ */
+export function normalizeBuildingName(name: string | null | undefined) {
+  return (name ?? "").trim().toLowerCase().replace(/^(the|el|la|los|las)\s+/, "").replace(/[^a-z0-9]/g, "");
+}
+
+type SiblingCandidate = { id: string; company_name: string; sibling_of?: string | null };
+/** The lead already created from `sourceId` for this portfolio building, if it is loaded. */
+export function createdSibling<T extends SiblingCandidate>(leads: readonly T[], sourceId: string, name: string): T | undefined {
+  const key = normalizeBuildingName(name);
+  return key ? leads.find((l) => l.sibling_of === sourceId && normalizeBuildingName(l.company_name) === key) : undefined;
+}
+
+/**
+ * H2: a sibling lead that still mails the same address as the lead it came from (the firm's
+ * office). The queue never sends both within 7 days, so the setter should send only one sequence.
+ */
+export function sharedSiblingEmail(lead: { sibling_of?: string | null; email?: string | null }, leads: readonly { id: string; company_name: string; email?: string | null }[]) {
+  if (!lead.sibling_of) return null;
+  const email = (lead.email ?? "").trim().toLowerCase();
+  const source = leads.find((l) => l.id === lead.sibling_of);
+  return source && email && (source.email ?? "").trim().toLowerCase() === email ? source : null;
 }
