@@ -192,7 +192,7 @@ def test_broward_seed_record_and_where():
 
 def test_pa_seed_merges_miami_dade_and_the_broward_corridor(monkeypatch):
     tenant.use("mb_softwash")
-    md_row = {"FOLIO": "3040", "TRUE_SITE_ADDR": "8888 SW 136 ST", "TRUE_SITE_CITY": "Miami", "TRUE_SITE_ZIP_CODE": "33176",
+    md_row = {"FOLIO": "3040", "TRUE_SITE_ADDR_NO_UNIT": "8888 SW 136 ST", "TRUE_SITE_CITY": "Miami", "TRUE_SITE_ZIP_CODE": "33176",
               "TRUE_OWNER1": "DADELAND STATION LLC", "BUILDING_ACTUAL_AREA": 150000, "DOR_CODE_CUR": "1600",
               "DOR_DESC": "COMMUNITY SHOPPING CENTER", "CONDO_FLAG": "N"}
     urls = []

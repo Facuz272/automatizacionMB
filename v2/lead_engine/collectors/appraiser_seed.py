@@ -47,7 +47,7 @@ def where_clause(vertical: str, cities: list[str], min_sqft: int) -> str:
 
 
 def to_lead(a: dict, vertical: str, strategy: str) -> Lead | None:
-    site = (a.get("TRUE_SITE_ADDR") or "").strip()
+    site = (a.get("TRUE_SITE_ADDR_NO_UNIT") or "").strip()
     zipc = (a.get("TRUE_SITE_ZIP_CODE") or "")[:5]
     if not site or not zipc:
         return None

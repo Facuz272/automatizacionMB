@@ -1,8 +1,11 @@
 """Miami-Dade Property Appraiser (official cadastre) + Florida milestone-inspection window.
 
-Layer (verified live 2026-11-08, public, no key, updated monthly):
+Layer (verified live 2026-11-17, public, no key, updated monthly):
   https://services.arcgis.com/8Pc9XBTAsYuxx9Ny/arcgis/rest/services/PaGISView_gdb/FeatureServer/0
-  fields used: FOLIO, PARENT_FOLIO, CONDO_FLAG, TRUE_SITE_ADDR/UNIT/CITY/ZIP_CODE, TRUE_OWNER1,
+  In November 2026 the county renamed TRUE_SITE_ADDR to TRUE_SITE_ADDR_NO_UNIT (street address without
+  the unit, which stays in TRUE_SITE_UNIT) and dropped PARENT_FOLIO; asking for a missing field makes the
+  whole query fail ("'outFields' parameter is invalid") and the cadastre was off for every lead.
+  fields used: FOLIO, CONDO_FLAG, TRUE_SITE_ADDR_NO_UNIT/UNIT/CITY/ZIP_CODE, TRUE_OWNER1,
   TRUE_MAILING_ADDR1..3/CITY/STATE, DOR_CODE_CUR, DOR_DESC, FLOOR_COUNT, UNIT_COUNT,
   BUILDING_ACTUAL_AREA, LOT_SIZE, YEAR_BUILT, ASSESSED_VAL_CUR
 
@@ -33,7 +36,7 @@ from . import costs
 from .config import settings
 
 URL = "https://services.arcgis.com/8Pc9XBTAsYuxx9Ny/arcgis/rest/services/PaGISView_gdb/FeatureServer/0/query"
-FIELDS = ("FOLIO,PARENT_FOLIO,CONDO_FLAG,TRUE_SITE_ADDR,TRUE_SITE_UNIT,TRUE_SITE_CITY,TRUE_SITE_ZIP_CODE,TRUE_OWNER1,"
+FIELDS = ("FOLIO,CONDO_FLAG,TRUE_SITE_ADDR_NO_UNIT,TRUE_SITE_UNIT,TRUE_SITE_CITY,TRUE_SITE_ZIP_CODE,TRUE_OWNER1,"
           "TRUE_MAILING_ADDR1,TRUE_MAILING_ADDR2,TRUE_MAILING_ADDR3,TRUE_MAILING_CITY,TRUE_MAILING_STATE,"
           "DOR_CODE_CUR,DOR_DESC,FLOOR_COUNT,UNIT_COUNT,BUILDING_ACTUAL_AREA,LOT_SIZE,YEAR_BUILT,ASSESSED_VAL_CUR")
 
@@ -98,7 +101,9 @@ def aggregate(records: list[dict]) -> dict[str, Any] | None:
         dor = Counter((r.get("DOR_CODE_CUR"), r.get("DOR_DESC")) for r in condo).most_common(1)[0][0]
         return {
             "kind": "condominium",
-            "folio": condo[0].get("PARENT_FOLIO") or condo[0].get("FOLIO"),
+            # The building's folio is the "REFERENCE FOLIO" record (PARENT_FOLIO is gone from the layer).
+            "folio": next((r.get("FOLIO") for r in records if (r.get("DOR_DESC") or "") == "REFERENCE FOLIO"), None)
+                     or condo[0].get("FOLIO"),
             "units": len(condo),
             "year_built": Counter(years).most_common(1)[0][0] if years else None,
             "floors": max(floors) if floors else None,
@@ -133,7 +138,7 @@ def aggregate(records: list[dict]) -> dict[str, Any] | None:
 
 
 def _query(pattern: str, zip5: str | None) -> list[dict]:
-    where = f"TRUE_SITE_ADDR LIKE '{pattern}'"
+    where = f"TRUE_SITE_ADDR_NO_UNIT LIKE '{pattern}'"
     if zip5:
         where += f" AND TRUE_SITE_ZIP_CODE LIKE '{zip5}%'"
     r = requests.get(URL, params={"where": where, "outFields": FIELDS, "returnGeometry": "false",
@@ -174,7 +179,7 @@ def lookup(address: str | None) -> dict[str, Any] | None:
         return None
     same = []
     for r in recs:
-        site = (r.get("TRUE_SITE_ADDR") or "").strip()
+        site = (r.get("TRUE_SITE_ADDR_NO_UNIT") or "").strip()
         unit = (r.get("TRUE_SITE_UNIT") or "").strip()
         if unit and site.endswith(" " + unit):
             site = site[: -len(unit) - 1]

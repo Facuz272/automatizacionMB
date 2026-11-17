@@ -14,23 +14,24 @@ from lead_engine.web_extract import parse_page
 
 FIX = Path(__file__).parent / "fixtures"
 
-# ── Property Appraiser (record shapes copied from the live PaGISView layer) ──────────────────
-REF = {"FOLIO": "0232140100001", "CONDO_FLAG": "N", "TRUE_SITE_ADDR": "5555 COLLINS AVE", "TRUE_OWNER1": "REFERENCE ONLY",
+# ── Property Appraiser (record shapes copied from the live PaGISView layer; since 2026-11-17 the street
+#    address comes without the unit in TRUE_SITE_ADDR_NO_UNIT and PARENT_FOLIO no longer exists) ──────────────────
+REF = {"FOLIO": "0232140100001", "CONDO_FLAG": "N", "TRUE_SITE_ADDR_NO_UNIT": "5555 COLLINS AVE", "TRUE_OWNER1": "REFERENCE ONLY",
        "DOR_CODE_CUR": "0000", "DOR_DESC": "REFERENCE FOLIO"}
 
 
 def _unit(unit, area=912, year=1967, value=280000):
-    return {"FOLIO": f"02321401{unit}", "PARENT_FOLIO": "0232140100001", "CONDO_FLAG": "Y",
-            "TRUE_SITE_ADDR": f"5555 COLLINS AVE {unit}", "TRUE_SITE_UNIT": unit, "TRUE_SITE_CITY": "Miami Beach",
+    return {"FOLIO": f"02321401{unit}", "CONDO_FLAG": "Y",
+            "TRUE_SITE_ADDR_NO_UNIT": "5555 COLLINS AVE", "TRUE_SITE_UNIT": unit, "TRUE_SITE_CITY": "Miami Beach",
             "DOR_CODE_CUR": "0407", "DOR_DESC": "RESIDENTIAL - TOTAL VALUE : CONDOMINIUM - RESIDENTIAL",
             "UNIT_COUNT": 1, "BUILDING_ACTUAL_AREA": area, "YEAR_BUILT": year, "ASSESSED_VAL_CUR": value}
 
 
-OFFICE = {"FOLIO": "0141391170010", "CONDO_FLAG": "N", "TRUE_SITE_ADDR": "1450 BRICKELL AVE", "TRUE_SITE_CITY": "Miami",
+OFFICE = {"FOLIO": "0141391170010", "CONDO_FLAG": "N", "TRUE_SITE_ADDR_NO_UNIT": "1450 BRICKELL AVE", "TRUE_SITE_CITY": "Miami",
           "TRUE_OWNER1": "1450 BRICKELL LLC", "TRUE_MAILING_ADDR1": "1450 BRICKELL AVE STE #1450", "TRUE_MAILING_CITY": "MIAMI",
           "DOR_CODE_CUR": "1813", "DOR_DESC": "OFFICE BUILDING - MULTISTORY : OFFICE BUILDING", "FLOOR_COUNT": 34,
           "BUILDING_ACTUAL_AREA": 1162113, "LOT_SIZE": 83601, "YEAR_BUILT": 2010, "ASSESSED_VAL_CUR": 240500000}
-PLAZA = {"FOLIO": "3050160480010", "CONDO_FLAG": "N", "TRUE_SITE_ADDR": "8888 SW 136 ST", "TRUE_OWNER1": "THE FALLS SHOPPING CTR ASSOC LP",
+PLAZA = {"FOLIO": "3050160480010", "CONDO_FLAG": "N", "TRUE_SITE_ADDR_NO_UNIT": "8888 SW 136 ST", "TRUE_OWNER1": "THE FALLS SHOPPING CTR ASSOC LP",
          "TRUE_MAILING_ADDR1": "C/O SIMON PROPERTY GROUP", "TRUE_MAILING_ADDR2": "PO BOX 6120", "TRUE_MAILING_CITY": "INDIANAPOLIS",
          "TRUE_MAILING_STATE": "IN", "TRUE_SITE_ZIP_CODE": "33176-0000", "TRUE_SITE_CITY": "Unincorporated County",
          "DOR_CODE_CUR": "1517", "DOR_DESC": "REGIONAL SHOPPING CENTER : COMMERCIAL - TOTAL VALUE", "FLOOR_COUNT": 2,
@@ -42,6 +43,8 @@ def test_aggregate_condo_from_unit_folios():
     assert agg["kind"] == "condominium" and agg["units"] == 4 and agg["year_built"] == 1967
     assert agg["floors"] == 17 and agg["floors_source"] == "unit_numbers"
     assert agg["building_sqft"] == 912 * 4 and agg["vertical"] == "community"
+    assert agg["folio"] == "0232140100001"                      # the REFERENCE FOLIO, not a unit's
+    assert appraiser.aggregate([_unit("3A"), _unit("4A")])["folio"] == "023214013A"   # no reference record
 
 
 def test_aggregate_commercial_owner_and_care_of():
@@ -69,7 +72,7 @@ def test_lookup_filters_units_and_zip(monkeypatch):
 
     def fake(prefix, zip5):
         seen.update(prefix=prefix, zip=zip5)
-        return [REF, _unit("3A"), _unit("4A"), {**_unit("9B"), "TRUE_SITE_ADDR": "5555 COLLINS CT 9B"}]
+        return [REF, _unit("3A"), _unit("4A"), {**_unit("9B"), "TRUE_SITE_ADDR_NO_UNIT": "5555 COLLINS CT"}]
 
     monkeypatch.setattr(appraiser, "_query", fake)
     appraiser.reset()
