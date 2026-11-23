@@ -108,6 +108,65 @@ def _search(query: str, page_token: str | None, with_reviews: bool, page_size: i
     raise PlacesError("Places no respondió tras 3 intentos")
 
 
+DETAILS_URL = "https://places.googleapis.com/v1/places/{id}"
+DETAILS_FIELDS = ["id", "displayName", "formattedAddress", "nationalPhoneNumber", "internationalPhoneNumber",
+                  "websiteUri", "googleMapsUri", "rating", "userRatingCount", "businessStatus", "types", "location"]
+
+
+def _search_ids(query: str, page_size: int = 5) -> list[str]:
+    """Text Search Essentials (IDs Only): place ids for a query, no charge (field mask `places.id`)."""
+    if not settings.google_places_api_key:
+        raise PlacesError("Falta GOOGLE_PLACES_API_KEY")
+    body = {"textQuery": query, "regionCode": "us", "languageCode": "en", "pageSize": page_size}
+    headers = {"X-Goog-Api-Key": settings.google_places_api_key, "X-Goog-FieldMask": "places.id"}
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(SEARCH_URL, json=body, headers=headers, timeout=settings.http_timeout_s)
+        except requests.RequestException as exc:
+            logger.warning("Places IDs red (intento {}): {}", attempt, exc)
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code == 200:
+            costs.tracker.add("places_text_search_ids")
+            return [p["id"] for p in (r.json().get("places") or []) if p.get("id")]
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(2 ** attempt)
+            continue
+        raise PlacesError(f"Places IDs HTTP {r.status_code}: {r.text[:300]}")
+    raise PlacesError("Places IDs no respondió tras 3 intentos")
+
+
+def _details(place_id: str) -> dict:
+    """Place Details Enterprise for one id (name, address, types, phone, website; no reviews)."""
+    headers = {"X-Goog-Api-Key": settings.google_places_api_key, "X-Goog-FieldMask": ",".join(DETAILS_FIELDS)}
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(DETAILS_URL.format(id=place_id), headers=headers, timeout=settings.http_timeout_s)
+        except requests.RequestException as exc:
+            logger.warning("Places Details red (intento {}): {}", attempt, exc)
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code == 200:
+            costs.tracker.add("places_details_enterprise")
+            return r.json()
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(2 ** attempt)
+            continue
+        raise PlacesError(f"Places Details HTTP {r.status_code}: {r.text[:300]}")
+    raise PlacesError("Places Details no respondió tras 3 intentos")
+
+
+def candidate_places(query: str, page_size: int = 5):
+    """Places for a targeted lookup, in rank order. Mode "search": one Text Search with Enterprise fields.
+    Mode "details": free IDs-only search, then Place Details one id at a time (lazy: the caller stops paying as
+    soon as it accepts one), at most PLACES_DETAILS_MAX details per lookup."""
+    if settings.places_mode == "details":
+        for pid in _search_ids(query, page_size)[:max(1, settings.places_details_max)]:
+            yield _details(pid)
+        return
+    yield from (_search(query, None, with_reviews=settings.places_reviews, page_size=page_size).get("places") or [])
+
+
 def _to_lead(place: dict, strategy: str, allow_lodging: bool = False) -> Lead | None:
     if place.get("businessStatus") not in (None, "OPERATIONAL"):
         return None
@@ -201,29 +260,30 @@ def find_place(name: str, address: str, strategy: str, vertical: str | None = No
     """
     from ..dbpr import address_key, name_similarity, zip5
 
-    try:
-        data = _search(f"{name}, {address}", None, with_reviews=settings.places_reviews, page_size=5)
-    except PlacesError as exc:
-        logger.warning("Places find_place {}: {}", name, exc)
-        return None
     want_key, want_zip = address_key(address), zip5(address)
     by_name: Lead | None = None
     skipped = []
-    for p in data.get("places") or []:
-        reason = sub_listing_reason(p, name)
-        if reason:
-            skipped.append(f"{(p.get('displayName') or {}).get('text')} ({reason})")
-            continue
-        lead = _to_lead(p, strategy, allow_lodging=vertical in ("commercial", "clinic"))
-        if not lead:
-            continue
-        if want_key and address_key(lead.address) == want_key:
-            lead.evidence["places_match"] = "address"
-            if skipped:
-                lead.evidence["places_skipped"] = skipped
-            return lead
-        if by_name is None and zip5(lead.address) == want_zip and name_similarity(name, lead.company_name) >= 0.5:
-            by_name = lead
+    try:
+        for p in candidate_places(f"{name}, {address}", page_size=5):   # lazy in "details" mode
+            reason = sub_listing_reason(p, name)
+            if reason:
+                skipped.append(f"{(p.get('displayName') or {}).get('text')} ({reason})")
+                continue
+            lead = _to_lead(p, strategy, allow_lodging=vertical in ("commercial", "clinic"))
+            if not lead:
+                continue
+            if want_key and address_key(lead.address) == want_key:
+                lead.evidence["places_match"] = "address"
+                if skipped:
+                    lead.evidence["places_skipped"] = skipped
+                return lead
+            if by_name is None and zip5(lead.address) == want_zip and name_similarity(name, lead.company_name) >= 0.5:
+                by_name = lead
+                if settings.places_mode == "details":
+                    break                     # a clear name match: no second paid Details call
+    except PlacesError as exc:
+        logger.warning("Places find_place {}: {}", name, exc)
+        return None
     if by_name is not None:
         by_name.evidence["places_match"] = "name"
         if skipped:

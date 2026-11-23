@@ -16,6 +16,8 @@ DEFAULT_PRICES = {
     "places_text_search": 0.035,           # Places API (New) Text Search, Enterprise fields (phone/website)
     "places_text_search_reviews": 0.040,   # + reviews (Enterprise + Atmosphere)
     "places_nearby_reviews": 0.040,        # Nearby Search with reviews (Enterprise + Atmosphere), zone hook
+    "places_text_search_ids": 0.0,         # Text Search Essentials (IDs Only): no charge, no monthly cap
+    "places_details_enterprise": 0.020,    # Place Details Enterprise (name/address/types/phone/website, no reviews)
     "claude_input_token": 2.0 / 1_000_000,   # Claude Sonnet 5.5
     "claude_output_token": 10.0 / 1_000_000,
     "serpapi": 0.015,
@@ -29,10 +31,31 @@ DEFAULT_PRICES = {
 }
 
 
+# Google Maps Platform free usage per SKU and billing month (pricing since March 2025): what a key can call
+# each month before anything is billed. Used for the "net" cost; budgets always use list prices.
+FREE_MONTHLY = {
+    "places_text_search": 1000,            # Text Search Enterprise
+    "places_text_search_reviews": 1000,    # Text Search Enterprise + Atmosphere
+    "places_nearby_reviews": 1000,         # Nearby Search Enterprise + Atmosphere
+    "places_details_enterprise": 1000,     # Place Details Enterprise
+}
+
+
+class BudgetExceeded(RuntimeError):
+    pass
+
+
 class CostTracker:
     def __init__(self) -> None:
         self.counts: Counter[str] = Counter()
         self._lock = Lock()
+        self.budget_usd: float | None = None      # list-price ceiling for the current run (None = no ceiling)
+
+    def total(self) -> float:
+        return round(sum(v * self.price(k) for k, v in self.counts.items()), 4)
+
+    def over_budget(self) -> bool:
+        return self.budget_usd is not None and self.total() >= self.budget_usd
 
     def reset(self) -> None:
         with self._lock:
@@ -55,3 +78,13 @@ class CostTracker:
 
 
 tracker = CostTracker()
+
+
+def net_of_free_tier(counts: dict[str, int], used_before: dict[str, int] | None = None) -> float:
+    """USD after the monthly free usage: `used_before` = calls already made this billing month per key."""
+    used_before = used_before or {}
+    total = 0.0
+    for key, n in counts.items():
+        free_left = max(0, FREE_MONTHLY.get(key, 0) - used_before.get(key, 0))
+        total += max(0, n - free_left) * tracker.price(key)
+    return round(total, 4)

@@ -1,0 +1,9 @@
+[Unit]
+Description=Lead Engine · padrón DBPR los domingos 01:30 hora de Miami
+
+[Timer]
+OnCalendar=Sun *-*-* 01:30:00 America/New_York
+Persistent=true
+
+[Install]
+WantedBy=timers.target

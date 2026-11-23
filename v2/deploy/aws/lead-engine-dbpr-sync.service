@@ -1,0 +1,13 @@
+[Unit]
+Description=Lead Engine · refresco semanal del padrón DBPR (condominios, CAM/CAB, alojamiento)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=leadengine
+WorkingDirectory=/opt/lead-engine/v2
+EnvironmentFile=/opt/lead-engine/v2/.env
+ExecStart=/opt/lead-engine/venv/bin/python -m lead_engine dbpr-sync
+StandardOutput=append:/var/log/lead-engine/dbpr-sync.log
+StandardError=append:/var/log/lead-engine/dbpr-sync.log

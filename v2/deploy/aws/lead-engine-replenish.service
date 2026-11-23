@@ -1,0 +1,17 @@
+[Unit]
+Description=Lead Engine · auto-replenish del Pool del CRM
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=leadengine
+WorkingDirectory=/opt/lead-engine/v2
+EnvironmentFile=/opt/lead-engine/v2/.env
+# REPLENISH_COMMIT=true en .env para escribir en el CRM; sin eso la corrida es un dry run.
+ExecStart=/opt/lead-engine/v2/deploy/aws/run_replenish.sh
+TimeoutStartSec=4h
+Nice=5
+# El disco persistente guarda data/state.db (memoria, cola de zonas, uso mensual) y data/dbpr.db.
+StandardOutput=append:/var/log/lead-engine/replenish.log
+StandardError=append:/var/log/lead-engine/replenish.log

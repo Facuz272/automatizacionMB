@@ -313,6 +313,32 @@ siguiente los salta, así `--seed dbpr --limit 20` trae los 20 siguientes del ra
 `--ignore-seen` los vuelve a incluir; `--retry-needs-phone` reintenta solo los que quedaron sin
 teléfono. El `quality_report.json` cuenta `skipped_seen_in_earlier_runs`.
 
+### Piloto automático de bajo costo (`auto-replenish`, AWS Lightsail)
+
+```bash
+python -m lead_engine auto-replenish --plan      # demanda y plan: solo lee el Pool (sin APIs pagas)
+python -m lead_engine auto-replenish             # dry run completo (el CRM no escribe nada)
+python -m lead_engine auto-replenish --commit    # carga el Pool
+```
+
+- **Demanda:** del health del CRM (`pool_target` = 2 días de cuota × setters activas). Si el Pool baja del
+  piso (`REPLENISH_FLOOR_DAYS`, 2) completa hasta el objetivo (`REPLENISH_TARGET_DAYS`, 3), con tope
+  `REPLENISH_MAX_LEADS` (400).
+- **Cola de zonas** (`state.db` → `territories`): condominios onsite y de cartera por ciudad del tenant,
+  administradoras CAB por condado, comerciales por ciudad; reparte el déficit con `REPLENISH_MIX` y rota a la
+  zona trabajada hace más tiempo; una zona que no da nada nuevo queda agotada y Slack avisa cuando quedan pocas.
+- **Administradoras CAB** (`--seed cab`): las 634 firmas con licencia CAB activa en Dade y Broward del padrón
+  DBPR, primero las de mayor cartera; una búsqueda por firma da su oficina, teléfono y web.
+- **Places a costo mínimo** (`PLACES_MODE=details`): búsqueda IDs Only (sin cargo) y Place Details Enterprise
+  solo hasta encontrar la propiedad (`PLACES_DETAILS_MAX`, 2), sin reseñas ni Nearby.
+- **Topes:** `REPLENISH_MAX_COST_USD` (10) a precio de lista corta la corrida; `api_usage` guarda las llamadas
+  del mes y el reporte muestra el costo después del cupo gratis mensual de Google. Cada corrida queda en
+  `replenish_runs` y en Slack (`#operacion`).
+- **Instalación:** `deploy/aws/setup.sh` en una instancia Ubuntu 24.04 (Lightsail de 1 GB sin Chromium, o de
+  2 GB con `WITH_BROWSER=true`): usuario `leadengine`, entorno virtual, padrón DBPR, `.env` desde
+  `deploy/aws/env.aws.example` (queda en dry run hasta `REPLENISH_COMMIT=true`) y los timers de systemd
+  `lead-engine-replenish` (03:00 hora de Miami) y `lead-engine-dbpr-sync` (domingos).
+
 ### Feedback del CRM (`feedback`, paso 0 de `daily`)
 
 Al arrancar, `daily` lee `GET /api/public/lead-outcomes?since=…` (header `x-webhook-secret`) y lo guarda

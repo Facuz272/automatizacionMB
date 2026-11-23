@@ -142,19 +142,17 @@ def is_firm(name: str | None, place_types: list[str] | None = None) -> bool:
 def _place_leads(query: str, strategy: str, name: str) -> list[Lead]:
     from .collectors import google_places as gp
 
+    out = []
     try:
-        data = gp._search(query, None, with_reviews=settings.places_reviews, page_size=5)
+        for p in gp.candidate_places(query, page_size=5):        # "details" mode: IDs free, Details per id
+            reason = gp.sub_listing_reason(p, name)
+            if reason:
+                continue
+            lead = gp._to_lead(p, strategy)
+            if lead:
+                out.append(lead)
     except gp.PlacesError as exc:
         logger.warning("Places {}: {}", query, exc)
-        return []
-    out = []
-    for p in data.get("places") or []:
-        reason = gp.sub_listing_reason(p, name)
-        if reason:
-            continue
-        lead = gp._to_lead(p, strategy)
-        if lead:
-            out.append(lead)
     return out
 
 
@@ -300,15 +298,19 @@ def _merge_place(lead: Lead, found: Lead) -> None:
 
 
 _PORTFOLIO_ROWS: dict[str, list] = {}
+_PORTFOLIO_TOKENS: dict[str, dict[str, set]] = {}
 
 
 def firm_portfolio(company: str | None) -> dict[str, Any] | None:
     """Condos in the coverage counties whose DBPR managing-entity line names THIS firm (same spelling up to
     abbreviations: firm_similarity >= 0.8). Stricter than dbpr.cluster, whose CAB-licence grouping can fold
     different firms together (United Community Management / Unite Property Management)."""
-    from .names import firm_similarity
+    from .names import firm_key
 
     if not company:
+        return None
+    want = set(firm_key(company).split())
+    if not want:
         return None
     key = str(dbpr._db_path())
     if key not in _PORTFOLIO_ROWS:
@@ -321,9 +323,13 @@ def firm_portfolio(company: str | None) -> dict[str, Any] | None:
                 f"'Approved' AND UPPER(c.county) IN ({','.join('?' * len(counties))})", counties).fetchall()
         except Exception:                              # noqa: BLE001 — registry missing: no portfolio
             _PORTFOLIO_ROWS[key] = []
+        # Word sets of every spelling computed once (same tokens names.firm_similarity compares).
+        _PORTFOLIO_TOKENS[key] = {c: set(firm_key(c).split()) for c in {r[0] for r in _PORTFOLIO_ROWS[key]}}
+    tokens = _PORTFOLIO_TOKENS.get(key) or {}
     seen: dict[str, Any] = {}
     for r in _PORTFOLIO_ROWS[key]:
-        if firm_similarity(company, r[0]) >= 0.8:
+        t = tokens.get(r[0]) or set(firm_key(r[0]).split())
+        if t and len(want & t) / len(want | t) >= 0.8:
             k = dbpr.address_key(r[3]) or r[1]
             if k not in seen or (r[5] or 0) > (seen[k][5] or 0):
                 seen[k] = r

@@ -478,6 +478,7 @@ def test_firm_portfolio_never_borrows_another_firms_condos(monkeypatch):
     rows += [("Unite Property Management", "U1", "PALM VILLAS", "1 B ST, MIAMI, FL 33130", "33130", 60),
              ("Unite Property Mgmt", "U2", "SUN TOWERS", "2 B ST, MIAMI, FL 33130", "33130", 80)]
     monkeypatch.setattr(backfill, "_PORTFOLIO_ROWS", {str(dbpr._db_path()): rows})
+    monkeypatch.setattr(backfill, "_PORTFOLIO_TOKENS", {})
     unite = backfill.firm_portfolio("Unite Property Management Inc")
     assert unite["count"] == 2 and {x["name"] for x in unite["siblings"]} == {"Palm Villas", "Sun Towers"}
     assert backfill.firm_portfolio("United Property Management") is None

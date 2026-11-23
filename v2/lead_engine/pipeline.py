@@ -62,6 +62,9 @@ def _candidates(strategy: str, sources: list[str], max_candidates: int, seed: st
         elif src == "pa":
             from .collectors import appraiser_seed
             yield from appraiser_seed.collect(strategy, max_candidates, vertical=settings.seed_vertical)
+        elif src == "cab":
+            from .collectors import cab_seed
+            yield from cab_seed.collect(strategy, max_candidates)
         elif src == "needs_phone":
             from .collectors import needs_phone
             yield from needs_phone.collect(seed, strategy, max_candidates)
@@ -673,9 +676,16 @@ def _run(strategy, limit, sources, seed, use_ai, use_apollo, precheck, send, com
         attempts += 1
         if attempts > max_candidates:
             break
+        if costs.tracker.over_budget():
+            logger.warning("Tope de costo de la corrida alcanzado (US$ {}): no se examinan más candidatos",
+                           costs.tracker.budget_usd)
+            break
         bad = ledger.bad_phones_for(lead)        # CRM feedback: numbers proven wrong / dead for this building
         if lead.source in ("dbpr", "pa"):
             resolve_seed(lead, use_search)
+        elif lead.source == "cab":
+            from .collectors import cab_seed
+            cab_seed.resolve(lead)
         if bad and drop_bad_phones(lead, bad) and not lead.phone and lead.source in ("dbpr", "pa"):
             from . import phone_resolver
             if phone_resolver.resolve(lead, steps=("lodging",)):     # Places had it; the lodging line is next
@@ -754,8 +764,12 @@ def _run(strategy, limit, sources, seed, use_ai, use_apollo, precheck, send, com
             if facts is None and lead.website_url:
                 facts = crawl(lead.website_url)
                 _fill_from_site(lead, facts)
-            enrich(lead, facts, use_apollo=use_apollo, use_ai=use_ai, use_search=use_search,
-                   use_geo=use_geo, use_dbpr=use_dbpr, check_mx=check_mx)
+            if lead.source == "cab":            # a management firm: its office is not a property to wash
+                from .backfill import _enrich_firm
+                _enrich_firm(lead, facts or SiteFacts(), use_ai, check_mx=check_mx)
+            else:
+                enrich(lead, facts, use_apollo=use_apollo, use_ai=use_ai, use_search=use_search,
+                       use_geo=use_geo, use_dbpr=use_dbpr, check_mx=check_mx)
             portfolio_consolidation.apply(lead)
             accepted.append(lead)             # recorded in the memory only when the CRM confirms it (finalize)
             logger.success("[{:>3}] {} · {} · {} · contacto={} · admin={} · email={}({})", lead.lead_score,

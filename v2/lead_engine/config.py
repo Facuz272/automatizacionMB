@@ -52,6 +52,11 @@ class Settings:
     # ── deep enrichment ──
     # Places reviews (Enterprise + Atmosphere SKU) feed the pain detector for every strategy.
     places_reviews: bool = field(default_factory=lambda: _bool("PLACES_REVIEWS", True))
+    # "search": Text Search with Enterprise fields (one paid call returns up to 5 candidates).
+    # "details": Text Search IDs Only (no charge) + Place Details Enterprise one candidate at a time, stopping at
+    # the first match (no reviews; cheaper SKU, and only for candidates actually examined).
+    places_mode: str = field(default_factory=lambda: os.getenv("PLACES_MODE", "search").strip().lower())
+    places_details_max: int = field(default_factory=lambda: int(os.getenv("PLACES_DETAILS_MAX", "2")))
     geo_enabled: bool = field(default_factory=lambda: _bool("GEO_ENABLED", True))
     overpass_url: str = field(default_factory=lambda: os.getenv("OVERPASS_URL", "https://overpass-api.de/api/interpreter"))
     render_js: str = field(default_factory=lambda: os.getenv("RENDER_JS", "auto").strip().lower())  # off|auto|always

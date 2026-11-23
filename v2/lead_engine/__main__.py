@@ -13,6 +13,7 @@
   python -m lead_engine daily --target-pool 40 [--commit]  # rutina diaria completa
   python -m lead_engine feedback [--metrics]               # resultados del CRM → teléfonos malos, conversión
   python -m lead_engine backfill-crm --active --limit 50 [--commit]  # enriquecer leads ya cargados
+  python -m lead_engine auto-replenish [--plan|--commit]   # piloto automático del Pool (cron 03:00 ET)
   python -m lead_engine sunbiz-sync                         # directivos de asociaciones (data/sunbiz/)
 """
 
@@ -48,9 +49,9 @@ def _main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run", help="recolectar, validar, enriquecer y (opcional) enviar al CRM")
     r.add_argument("--strategy", choices=["onsite", "pain", "portfolio"], default="onsite")
     r.add_argument("--limit", type=int, default=20, help="leads enriquecidos a producir")
-    r.add_argument("--source", action="append", choices=["places", "osm", "csv", "dbpr", "npi", "pa"],
+    r.add_argument("--source", action="append", choices=["places", "osm", "csv", "dbpr", "npi", "pa", "cab"],
                    help="repetible; por defecto places si hay GOOGLE_PLACES_API_KEY, si no dbpr")
-    r.add_argument("--seed", help="dbpr (condominios) | npi (clínicas) | pa (catastro: --vertical) | archivo.csv")
+    r.add_argument("--seed", help="dbpr (condominios) | cab (administradoras CAB) | npi (clínicas) | pa (catastro: --vertical) | archivo.csv")
     r.add_argument("--vertical", choices=["plaza", "commercial", "clinic"], help="--seed pa: segmento a sembrar")
     r.add_argument("--min-units", type=int, help="semilla DBPR: mínimo de unidades (default MIN_UNITS=50)")
     r.add_argument("--max-candidates", type=int, default=None, help="tope de candidatos crudos (default 6×limit)")
@@ -142,6 +143,12 @@ def _main(argv: list[str] | None = None) -> int:
     bf.add_argument("--from-batch", help="out/enrich-…: enviar (--commit) el payload ya revisado de esa corrida")
     bf.add_argument("--rebuild", action="store_true",
                     help="con --from-batch: rearmar el payload con las reglas actuales (sin APIs) y repetir el dry run")
+    ar = sub.add_parser("auto-replenish", help="mantener el Pool del CRM abastecido (cron diario): demanda, zonas, topes")
+    ar.add_argument("--commit", action="store_true", help="escribir en el CRM (sin esto: dry run)")
+    ar.add_argument("--plan", action="store_true", help="solo mostrar la demanda y el plan (sin APIs pagas)")
+    ar.add_argument("--no-ai", action="store_true")
+    ar.add_argument("--no-slack", action="store_true")
+    ar.add_argument("--max-cost", type=float, help="tope de costo a precio de lista (default REPLENISH_MAX_COST_USD=10)")
     rt = sub.add_parser("route", help="ruta de inspecciones optimizada por zonas")
     rt.add_argument("input", help="leads.jsonl del lote o export del CRM (.csv/.json) con address e inspection_at")
     rt.add_argument("--date", help="día (YYYY-MM-DD, default hoy en Miami)")
@@ -155,7 +162,8 @@ def _main(argv: list[str] | None = None) -> int:
 
     args = ap.parse_args(argv)
     from . import tenant
-    prof = tenant.use(args.tenant or (None if os.getenv("TENANT") or args.cmd != "daily" else "mb_softwash"))
+    prof = tenant.use(args.tenant or (None if os.getenv("TENANT") or args.cmd not in ("daily", "auto-replenish")
+                                      else "mb_softwash"))
     if prof:
         logger.info("Perfil de empresa: {}", prof.get("company", {}).get("name") or args.tenant)
     if args.cmd == "preflight":
@@ -271,6 +279,12 @@ def _main(argv: list[str] | None = None) -> int:
             return 1
         print(json.dumps({k: v for k, v in rep.items()}, ensure_ascii=False, indent=2))
         return 0
+    if args.cmd == "auto-replenish":
+        from . import auto_replenish
+        rep = auto_replenish.run(commit=args.commit, plan_only=args.plan, use_ai=not args.no_ai,
+                                 slack=not args.no_slack, max_cost=args.max_cost)
+        print(json.dumps(rep, ensure_ascii=False, indent=2, default=str))
+        return 0
     if args.cmd == "route":
         return _route(args)
     if args.cmd == "cam-load":
@@ -283,7 +297,7 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
     sources = args.source
     seed_file = args.seed
-    if args.seed and args.seed.lower() in ("dbpr", "npi", "pa"):
+    if args.seed and args.seed.lower() in ("dbpr", "npi", "pa", "cab"):
         sources, seed_file = (sources or []) + [args.seed.lower()], None
     if args.min_units is not None or args.render or args.vertical:
         import dataclasses

@@ -1,0 +1,12 @@
+[Unit]
+Description=Lead Engine · auto-replenish diario 03:00 hora de Miami (antes del reparto de las 06:00)
+
+[Timer]
+# La zona horaria va en la expresión: systemd respeta el cambio de horario de verano solo.
+OnCalendar=*-*-* 03:00:00 America/New_York
+# Si la instancia estaba apagada a las 03:00, corre apenas arranca.
+Persistent=true
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target
