@@ -248,9 +248,20 @@ def _from_state(state: Any, facts: SiteFacts) -> None:
             facts.emails.setdefault(e, "embedded_json")
 
 
+def _text(v) -> str:
+    """A JSON-LD value as text: numbers ("postalCode": 33139), lists and nested objects included."""
+    if v is None or isinstance(v, bool):
+        return ""
+    if isinstance(v, (list, tuple)):
+        return " ".join(t for t in (_text(x) for x in v) if t)
+    if isinstance(v, dict):
+        return _text(v.get("name") or v.get("@value"))
+    return str(v).strip()
+
+
 def _postal(addr: dict) -> str:
-    parts = [addr.get("streetAddress"), addr.get("addressLocality")]
-    tail = " ".join(x for x in (addr.get("addressRegion"), addr.get("postalCode")) if x)
+    parts = [_text(addr.get("streetAddress")), _text(addr.get("addressLocality"))]
+    tail = " ".join(x for x in (_text(addr.get("addressRegion")), _text(addr.get("postalCode"))) if x)
     return clean_address(", ".join(x for x in (*parts, tail) if x))
 
 
@@ -389,11 +400,19 @@ def fetch_and_parse(session: requests.Session, url: str) -> tuple[str | None, Si
     html = _get(session, url)
     if html is None:
         return None, None
-    facts = parse_page(html, url)
+    try:
+        facts = parse_page(html, url)
+    except Exception as exc:                       # noqa: BLE001 — one odd page never stops the crawl
+        logger.warning("página {} no se pudo leer ({}: {}); se omite", url, exc.__class__.__name__, exc)
+        return None, None
     if render.enabled() and looks_like_spa(html, facts):
         rendered = render.render(url)
         if rendered:
-            rfacts = parse_page(rendered, url)
+            try:
+                rfacts = parse_page(rendered, url)
+            except Exception as exc:               # noqa: BLE001
+                logger.warning("página renderizada {} no se pudo leer ({}); se usa la estática", url, exc)
+                return html, facts
             rfacts.rendered.append(url)
             rfacts.merge(facts)
             return rendered, rfacts

@@ -767,16 +767,21 @@ def _run(strategy, limit, sources, seed, use_ai, use_apollo, precheck, send, com
     accepted: list[Lead] = []
     try:
         for lead, facts in gated[:limit]:
-            if facts is None and lead.website_url:
-                facts = crawl(lead.website_url)
-                _fill_from_site(lead, facts)
-            if lead.source == "cab":            # a management firm: its office is not a property to wash
-                from .backfill import _enrich_firm
-                _enrich_firm(lead, facts or SiteFacts(), use_ai, check_mx=check_mx)
-            else:
-                enrich(lead, facts, use_apollo=use_apollo, use_ai=use_ai, use_search=use_search,
-                       use_geo=use_geo, use_dbpr=use_dbpr, check_mx=check_mx)
-            portfolio_consolidation.apply(lead)
+            try:
+                if facts is None and lead.website_url:
+                    facts = crawl(lead.website_url)
+                    _fill_from_site(lead, facts)
+                if lead.source == "cab":        # a management firm: its office is not a property to wash
+                    from .backfill import _enrich_firm
+                    _enrich_firm(lead, facts or SiteFacts(), use_ai, check_mx=check_mx)
+                else:
+                    enrich(lead, facts, use_apollo=use_apollo, use_ai=use_ai, use_search=use_search,
+                           use_geo=use_geo, use_dbpr=use_dbpr, check_mx=check_mx)
+                portfolio_consolidation.apply(lead)
+            except Exception as exc:            # noqa: BLE001 — one lead never loses the rest of the batch
+                logger.exception("Enriquecimiento de {} falló: {}", lead.company_name, exc)
+                reject(lead, f"error de enriquecimiento: {exc.__class__.__name__}")
+                continue
             accepted.append(lead)             # recorded in the memory only when the CRM confirms it (finalize)
             logger.success("[{:>3}] {} · {} · {} · contacto={} · admin={} · email={}({})", lead.lead_score,
                            lead.company_name, lead.phone, lead.segment, lead.contact_name or "—",

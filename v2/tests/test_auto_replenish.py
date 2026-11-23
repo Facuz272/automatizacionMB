@@ -396,3 +396,31 @@ def test_the_gate_rejects_crm_names_before_paying(crm_snapshot, monkeypatch, tmp
 def test_same_firm_is_strict(a, b, same):
     from lead_engine import crm_names
     assert crm_names.same_firm(a, b) is same
+
+
+# ── a bad page or a bad lead never loses the batch (live run, 2026-11-22) ───
+
+def test_numeric_postal_code_in_json_ld_is_read():
+    html = ('<html><head><script type="application/ld+json">{"@type": "Organization", "address": {"@type": '
+            '"PostalAddress", "streetAddress": "1 Ocean Dr", "addressLocality": "Miami Beach", "addressRegion": "FL", '
+            '"postalCode": 33139}}</script></head><body></body></html>')
+    facts = parse_page(html, "https://x.org")
+    assert facts.addresses == ["1 Ocean Dr, Miami Beach, FL 33139"]
+
+
+def test_one_failing_lead_does_not_lose_the_others(monkeypatch, tmp_path):
+    leads = [pipeline.Lead(source="dbpr", source_id=f"dbpr:{i}", strategy_kind="onsite", company_name=f"Tower {i}",
+                           address=f"{i} Ocean Dr, Miami Beach, FL 33139", phone=f"+130542787{70 + i}")
+             for i in range(3)]
+    monkeypatch.setattr(pipeline, "_candidates", lambda *a, **k: iter(leads))
+    monkeypatch.setattr(pipeline, "resolve_seed", lambda lead, use_search: None)
+
+    def enrich(lead, facts, **kw):
+        if lead.company_name == "Tower 1":
+            raise TypeError("sequence item 1: expected str instance, int found")
+    monkeypatch.setattr(pipeline, "enrich", enrich)
+    out = pipeline.run(strategy="onsite", limit=3, sources=["dbpr"], use_ai=False, use_apollo=False, precheck=False,
+                       send=False, use_search=False, use_geo=False, check_mx=False, out_dir=tmp_path)
+    names = [json.loads(l)["company_name"] for l in (out / "leads.jsonl").read_text().splitlines() if l.strip()]
+    rej = [json.loads(l) for l in (out / "rejected.jsonl").read_text().splitlines() if l.strip()]
+    assert sorted(names) == ["Tower 0", "Tower 2"] and rej[0]["reason"].startswith("error de enriquecimiento")
