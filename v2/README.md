@@ -331,6 +331,9 @@ python -m lead_engine auto-replenish --commit    # carga el Pool
   DBPR, primero las de mayor cartera; una búsqueda por firma da su oficina, teléfono y web.
 - **Places a costo mínimo** (`PLACES_MODE=details`): búsqueda IDs Only (sin cargo) y Place Details Enterprise
   solo hasta encontrar la propiedad (`PLACES_DETAILS_MAX`, 2), sin reseñas ni Nearby.
+- **Orden por rendimiento:** onsite → CAB → cartera (mix 45/40/15); `PLACES_DETAILS_MAX_CONDO_PORTFOLIO=1`
+  limita la cartera (muchos edificios sin Google) a una llamada de Details. Las alertas de inventario cuentan
+  candidatos realmente pendientes por fuente (no zonas: CAB tiene solo dos por diseño).
 - **Topes:** `REPLENISH_MAX_COST_USD` (10) a precio de lista corta la corrida; `api_usage` guarda las llamadas
   del mes y el reporte muestra el costo después del cupo gratis mensual de Google. Cada corrida queda en
   `replenish_runs` y en Slack (`#operacion`).
@@ -338,6 +341,37 @@ python -m lead_engine auto-replenish --commit    # carga el Pool
   2 GB con `WITH_BROWSER=true`): usuario `leadengine`, entorno virtual, padrón DBPR, `.env` desde
   `deploy/aws/env.aws.example` (queda en dry run hasta `REPLENISH_COMMIT=true`) y los timers de systemd
   `lead-engine-replenish` (03:00 hora de Miami) y `lead-engine-dbpr-sync` (domingos).
+
+### Teléfonos muertos (☎️) → `new_phone`
+
+```bash
+python -m lead_engine backfill-crm --dead-phones --limit 50 --max-cost 1            # dry run
+python -m lead_engine backfill-crm --dead-phones --limit 50 --max-cost 1 --commit   # escribe new_phone
+```
+
+Lee los leads abiertos con `phone_dead: true` (`leads-unenriched?include_attempted=true`), busca otro número
+primero en fuentes gratis (sitio web, licencia Lodging del DBPR, línea publicada de la administradora) y solo si
+no hay ninguno hace una búsqueda en Places dentro del tope. Nunca ofrece el número muerto, uno que el motor ya
+sabe malo para ese edificio ni uno que otro lead del CRM ya tiene (prechequeo en dry run). El CRM valida y
+responde por fila (`phone_duplicate`, `phone_invalid`…); el número muerto queda en `bad_phones`.
+`auto-replenish` lo corre primero en cada pasada (`DEAD_PHONES_MAX_COST_USD`, `REPLENISH_DEAD_PHONES`).
+
+### Recarga gratis hasta el reinicio mensual de Google (1/12)
+
+Place Details Enterprise quedó en ~910/1.000 en noviembre; Text Search Enterprise (sin reseñas) tiene sus
+1.000 gratis intactas. Para una recarga de ~150–200 leads antes del 1/12, usar ese cupo:
+
+```bash
+export PLACES_MODE=search PLACES_REVIEWS=false COMPETITOR_NEARBY=false ANTHROPIC_MODEL=claude-haiku-5-5 \
+       PRICE_CLAUDE_INPUT_TOKEN=0.0000001 PRICE_CLAUDE_OUTPUT_TOKEN=0.0000005 \
+       REPLENISH_FREE_TIER_ONLY=true REPLENISH_MAX_LEADS=200 REPLENISH_MAX_COST_USD=30
+python -m lead_engine --tenant mb_softwash auto-replenish --plan      # sin costo: Pool, plan, cupo gratis, inventario
+python -m lead_engine --tenant mb_softwash auto-replenish --commit    # la carga
+```
+
+`--plan` muestra `free_tier` (SKU en uso, llamadas usadas / libres del mes según `state.db`) y el tope
+efectivo: con `REPLENISH_FREE_TIER_ONLY=true` nunca más que lo que cubre el cupo gratis (US$ 30 ≈ 857 llamadas
+de US$ 0,035). Desde el 1/12 vuelve el perfil `PLACES_MODE=details` del `.env` de AWS.
 
 ### Feedback del CRM (`feedback`, paso 0 de `daily`)
 

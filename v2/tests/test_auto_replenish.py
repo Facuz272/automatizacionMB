@@ -211,7 +211,7 @@ def test_demand_caps_and_needs_the_crm():
 
 
 def test_split_is_exact_and_mix_comes_from_env(monkeypatch):
-    assert ar.split(408, ar.DEFAULT_MIX) == {"condo_onsite": 163, "condo_portfolio": 102, "cab_firm": 143}
+    assert ar.split(408, ar.DEFAULT_MIX) == {"condo_onsite": 184, "cab_firm": 163, "condo_portfolio": 61}
     monkeypatch.setenv("REPLENISH_MIX", '{"cab_firm": 1, "nope": 3}')
     assert ar.mix() == {"cab_firm": 1.0}
     monkeypatch.setenv("REPLENISH_MIX", "garbage")
@@ -231,7 +231,8 @@ def test_areas_rotate_and_exhausted_ones_are_skipped():
     assert ar.next_areas(led, "condo_onsite")[-1] == "Miami Beach"            # worked: goes to the back
     ar.record_area(led, "cab_firm", "Miami-Dade", accepted=0, exhausted=True)
     assert ar.next_areas(led, "cab_firm") == ["Broward"]
-    assert any("cab_firm" in a for a in ar.inventory_alerts(led, ["cab_firm"]))
+    # one of CAB's two areas worked out is no alert while firms remain
+    assert ar.inventory_alerts(led, {"cab_firm": 60}, daily=150, inventory={"cab_firm": 500}) == []
 
 
 def test_monthly_usage_accumulates():
@@ -260,7 +261,8 @@ def test_plan_only_spends_nothing(crm, monkeypatch):
     monkeypatch.setattr(ar, "run_slice", lambda *a, **k: pytest.fail("no slice in --plan"))
     s = ar.run(plan_only=True)
     assert s["demand"]["deficit"] == 400                                    # 408 capped by REPLENISH_MAX_LEADS
-    assert s["plan"] == {"condo_onsite": 160, "condo_portfolio": 100, "cab_firm": 140}
+    assert s["plan"] == {"condo_onsite": 180, "cab_firm": 160, "condo_portfolio": 60}
+    assert list(s["plan"]) == ["condo_onsite", "cab_firm", "condo_portfolio"]             # run order
     assert s["areas"]["cab_firm"] == ["Miami-Dade", "Broward"] and crm.slack == []
 
 
@@ -305,7 +307,7 @@ def test_a_failing_crm_queue_blocks_new_spend(crm, monkeypatch):
 def test_cli_plan(crm, capsys):
     from lead_engine.__main__ import main
     assert main(["auto-replenish", "--plan", "--no-slack"]) == 0
-    assert '"condo_onsite": 160' in capsys.readouterr().out
+    assert '"condo_onsite": 180' in capsys.readouterr().out
 
 
 # ── deploy files ────────────────────────────────────────────────────────────
@@ -328,6 +330,8 @@ def test_aws_env_template_is_dry_run_and_low_cost():
     assert env["ANTHROPIC_MODEL"] == "claude-haiku-5-5"
     assert all(not env[k] for k in ("GOOGLE_PLACES_API_KEY", "ANTHROPIC_API_KEY", "CRM_WEBHOOK_SECRET"))
     assert json.loads(env["REPLENISH_MIX"]) == ar.DEFAULT_MIX
+    assert env["PLACES_DETAILS_MAX_CONDO_PORTFOLIO"] == "1" and env["REPLENISH_FREE_TIER_ONLY"] == "true"
+    assert env["REPLENISH_DEAD_PHONES"] == "true" and float(env["DEAD_PHONES_MAX_COST_USD"]) <= 1
 
 
 # ── run-time guards added after the live smoke test ─────────────────────────
@@ -424,3 +428,78 @@ def test_one_failing_lead_does_not_lose_the_others(monkeypatch, tmp_path):
     names = [json.loads(l)["company_name"] for l in (out / "leads.jsonl").read_text().splitlines() if l.strip()]
     rej = [json.loads(l) for l in (out / "rejected.jsonl").read_text().splitlines() if l.strip()]
     assert sorted(names) == ["Tower 0", "Tower 2"] and rej[0]["reason"].startswith("error de enriquecimiento")
+
+
+# ── cost-aware mix, per-source Details, free-tier guard, real inventory alerts, dead phones step ────────────
+
+def test_plan_runs_cheapest_sources_first_whatever_the_env_order(monkeypatch):
+    monkeypatch.setenv("REPLENISH_MIX", '{"condo_portfolio": 0.5, "cab_firm": 0.2, "condo_onsite": 0.3}')
+    plan = ar.ordered(ar.split(100, ar.mix()))
+    assert list(plan) == ["condo_onsite", "cab_firm", "condo_portfolio"]
+
+
+def test_portfolio_can_use_a_single_details_call(monkeypatch):
+    monkeypatch.setenv("PLACES_DETAILS_MAX_CONDO_PORTFOLIO", "1")
+    object.__setattr__(settings, "places_details_max", 2)
+    seen = {}
+    monkeypatch.setattr(pipeline, "run", lambda **kw: seen.update(max=settings.places_details_max) or pytest.fail("stop"))
+    with ar._area("condo_portfolio", "Miami"):
+        assert settings.places_details_max == 1
+    with ar._area("condo_onsite", "Miami Beach"):
+        assert settings.places_details_max == 2
+    assert settings.places_details_max == 2 and ar.details_max("cab_firm") is None
+
+
+def test_free_tier_guard_turns_calls_left_into_the_budget(monkeypatch):
+    object.__setattr__(settings, "places_mode", "details")
+    led = Ledger()
+    ar.add_usage(led, {"places_details_enterprise": 910})
+    f = ar.free_tier_budget(led, claude_allowance=0.5)
+    assert f["sku"] == "places_details_enterprise" and f["free_left"] == 90 and f["budget_usd"] == pytest.approx(2.3)
+    object.__setattr__(settings, "places_mode", "search")
+    object.__setattr__(settings, "places_reviews", False)
+    f = ar.free_tier_budget(led, claude_allowance=0.5)
+    assert f["sku"] == "places_text_search" and f["free_left"] == 1000 and f["budget_usd"] == pytest.approx(35.5)
+
+
+def test_free_tier_only_caps_the_run(crm, monkeypatch):
+    object.__setattr__(settings, "places_mode", "details")
+    ar.add_usage(Ledger(), {"places_details_enterprise": 990})
+    monkeypatch.setenv("REPLENISH_FREE_TIER_ONLY", "true")
+    monkeypatch.setenv("REPLENISH_MAX_COST_USD", "18")
+    s = ar.run(plan_only=True)
+    assert s["budget_usd"] == pytest.approx(10 * 0.020 + 0.5) and s["free_tier"]["free_left"] == 10
+
+
+def test_two_cab_areas_are_no_alert_but_a_short_inventory_is(monkeypatch):
+    from lead_engine import tenant
+    tenant.use("mb_softwash")
+    led = Ledger()
+    ar.sync_territories(led)
+    plan = {"cab_firm": 60, "condo_onsite": 70}
+    assert ar.inventory_alerts(led, plan, daily=150, inventory={"cab_firm": 500, "condo_onsite": 900}) == []
+    alerts = ar.inventory_alerts(led, plan, daily=150, inventory={"cab_firm": 120, "condo_onsite": 900})
+    assert alerts == ["cab_firm: quedan 120 candidatos sin trabajar (< 5 días de su cupo, ~300)"]
+    ar.record_area(led, "cab_firm", "Miami-Dade", 0, exhausted=True)
+    ar.record_area(led, "cab_firm", "Broward", 0, exhausted=True)
+    assert "todas las zonas agotadas" in ar.inventory_alerts(led, plan, daily=150, inventory={"condo_onsite": 900})[0]
+
+
+def test_dead_phones_run_first_with_their_own_ceiling(crm, monkeypatch):
+    from lead_engine import dead_phones
+    calls = []
+    monkeypatch.setattr(dead_phones, "run", lambda **kw: calls.append(kw) or {
+        "dead_leads": 4, "with_candidate": 3, "crm": {"written": 3, "refused": {"phone_duplicate": 1}},
+        "costs": {"by_api": {"places_details_enterprise": {"count": 10, "usd": 0.2}}, "total_usd": 0.2}})
+    monkeypatch.setattr(ar, "run_slice", lambda kind, area, n, **kw: {
+        "kind": kind, "area": area, "quota": n, "batch": "b", "accepted": n, "with_email": 0, "inserted": n,
+        "would_insert": n, "crm_error": None, "counts": {}, "cost_usd": 0.0})
+    monkeypatch.setenv("DEAD_PHONES_MAX_COST_USD", "1")
+    s = ar.run(commit=True)
+    assert calls[0]["commit"] is True and calls[0]["max_cost"] == 1.0
+    assert s["dead_phones"]["crm"]["written"] == 3 and s["cost_list_usd"] == pytest.approx(0.2)
+    assert "☎️ Teléfonos muertos: 4 · número nuevo para 3" in crm.slack[-1]
+    monkeypatch.setenv("REPLENISH_DEAD_PHONES", "false")
+    calls.clear()
+    ar.run(commit=True)
+    assert calls == []

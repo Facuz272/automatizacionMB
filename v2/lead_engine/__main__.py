@@ -141,6 +141,10 @@ def _main(argv: list[str] | None = None) -> int:
     bf.add_argument("--no-nearby", action="store_true", help="sin Places Nearby (sin gancho de zona)")
     bf.add_argument("--include-attempted", action="store_true", help="incluir los intentados en los últimos 30 días")
     bf.add_argument("--from-batch", help="out/enrich-…: enviar (--commit) el payload ya revisado de esa corrida")
+    bf.add_argument("--dead-phones", action="store_true",
+                    help="leads ☎️: buscar otro número y enviarlo como new_phone (sitio, Lodging, administradora, Places)")
+    bf.add_argument("--max-cost", type=float, default=2.0, help="--dead-phones: tope a precio de lista (US$)")
+    bf.add_argument("--no-places", action="store_true", help="--dead-phones: solo fuentes gratuitas")
     bf.add_argument("--rebuild", action="store_true",
                     help="con --from-batch: rearmar el payload con las reglas actuales (sin APIs) y repetir el dry run")
     ar = sub.add_parser("auto-replenish", help="mantener el Pool del CRM abastecido (cron diario): demanda, zonas, topes")
@@ -263,6 +267,12 @@ def _main(argv: list[str] | None = None) -> int:
         statuses = [x.strip() for x in args.status.split(",") if x.strip()] if args.status else (
             list(backfill.ACTIVE) if args.active else None)
         try:
+            if args.dead_phones:
+                from . import dead_phones
+                rep = dead_phones.run(limit=args.limit, commit=args.commit, max_cost=args.max_cost,
+                                      use_places=not args.no_places)
+                print(json.dumps(rep, ensure_ascii=False, indent=2, default=str))
+                return 0
             if args.from_batch and args.rebuild:
                 print(json.dumps(backfill.rebuild_saved(args.from_batch), ensure_ascii=False, indent=2))
                 return 0
