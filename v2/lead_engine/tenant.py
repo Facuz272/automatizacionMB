@@ -21,6 +21,9 @@ from typing import Any
 
 from .config import BASE_DIR, settings
 
+# Profile keys that an explicit environment variable overrides (the run's own choice wins over the profile).
+ENV_WINS = {"competitor_nearby": "COMPETITOR_NEARBY"}
+
 TENANTS_DIR = Path(os.getenv("TENANTS_DIR", str(BASE_DIR / "tenants")))
 COMPANY_MAP = {"name": "company_name", "phone": "company_phone", "email": "company_email",
                "website": "company_website", "booking_url": "company_booking_url",
@@ -62,6 +65,8 @@ def apply(data: dict[str, Any], target=None) -> None:
         if k in data.get("company", {}):
             object.__setattr__(target, field_name, data["company"][k] or ([] if k == "documents_available" else None))
     for k in SETTINGS_KEYS & set(data):
+        if k in ENV_WINS and os.getenv(ENV_WINS[k]) not in (None, ""):
+            continue                         # set explicitly for this run (e.g. the low-cost profile)
         object.__setattr__(target, k, data[k])
     if data.get("pdf_lang") and data["pdf_lang"] not in ("en", "es"):
         raise TenantError("pdf_lang debe ser 'en' o 'es'")

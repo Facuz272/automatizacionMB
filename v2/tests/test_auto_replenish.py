@@ -328,3 +328,71 @@ def test_aws_env_template_is_dry_run_and_low_cost():
     assert env["ANTHROPIC_MODEL"] == "claude-haiku-5-5"
     assert all(not env[k] for k in ("GOOGLE_PLACES_API_KEY", "ANTHROPIC_API_KEY", "CRM_WEBHOOK_SECRET"))
     assert json.loads(env["REPLENISH_MIX"]) == ar.DEFAULT_MIX
+
+
+# ── run-time guards added after the live smoke test ─────────────────────────
+
+def test_explicit_env_beats_the_tenant_for_nearby(monkeypatch):
+    from lead_engine import tenant
+    monkeypatch.setenv("COMPETITOR_NEARBY", "false")
+    object.__setattr__(settings, "competitor_nearby", False)
+    tenant.use("mb_softwash")                                         # the profile says true
+    assert settings.competitor_nearby is False
+    monkeypatch.delenv("COMPETITOR_NEARBY")
+    tenant.use("mb_softwash")
+    assert settings.competitor_nearby is True
+
+
+@pytest.fixture
+def crm_snapshot(tmp_path, monkeypatch):
+    p = tmp_path / "crm_names.json"
+    p.write_text(json.dumps({"leads": [["Miami Management Inc", "1145 Sawgrass Corporate Pkwy, Sunrise, FL 33323"],
+                                       ["FirstService Residential Miami", None],
+                                       ["Mystic Pointe Tower 200", None],
+                                       ["Pillar Management Group LLC", "1000 Brickell Ave, Miami, FL 33131"],
+                                       ["Flamenco Towers Condominium", "3701 N Country Club Dr, Aventura, FL 33180"]]}))
+    monkeypatch.setenv("CRM_NAMES_FILE", str(p))
+    return p
+
+
+@pytest.mark.parametrize("name,source,address,hit", [
+    ("Miami Management INC", "cab", "Miami, FL 33130", "Miami Management Inc"),          # another office line
+    ("Firstservice Residential", "cab", "Plantation, FL 33324", "FirstService Residential Miami"),
+    ("Miami Association Management", "cab", "Miami, FL 33130", None),
+    ("Mystic Pointe Tower 400", "dbpr", "19195 Mystic Pointe Dr, Aventura, FL 33180", None),  # another tower
+    ("FLAMENCO TOWER CONDO", "dbpr", "3701 N Country Club Dr, Miami, FL 33180", "Flamenco Towers Condominium"),
+    ("1000 Brickell Condo", "dbpr", "1000 Brickell Ave, Miami, FL 33131", None),         # a firm's office there
+])
+def test_crm_names_catch_leads_under_another_phone(crm_snapshot, name, source, address, hit):
+    from lead_engine import crm_names
+    from lead_engine.models import Lead
+    l = Lead(source=source, source_id=f"{source}:x", strategy_kind="onsite", company_name=name, address=address)
+    assert crm_names.known(l) == hit
+
+
+def test_the_gate_rejects_crm_names_before_paying(crm_snapshot, monkeypatch, tmp_path):
+    from lead_engine.models import Lead
+    firm = Lead(source="cab", source_id="cab:CAB9", strategy_kind="portfolio", company_name="Miami Management INC",
+                address="Miami, FL 33130")
+    firm.evidence["lead_kind"] = "management_firm"
+    monkeypatch.setattr(pipeline, "_candidates", lambda *a, **k: iter([firm]))
+    monkeypatch.setattr(cab_seed, "resolve", lambda lead: pytest.fail("no paid lookup for a lead already in the CRM"))
+    out = pipeline.run(strategy="portfolio", limit=1, sources=["cab"], use_ai=False, use_apollo=False, precheck=False,
+                       send=False, use_search=False, use_geo=False, check_mx=False, out_dir=tmp_path)
+    rej = [json.loads(l) for l in (out / "rejected.jsonl").read_text().splitlines() if l.strip()]
+    assert rej[0]["reason"] == "ya existe en el CRM"
+
+
+@pytest.mark.parametrize("a,b,same", [
+    ("GRS Management, INC.", "GRS Community Management", False),
+    ("Miami Management INC", "Homes Management of Miami Inc.", False),
+    ("Miami Quality Management", "Management Miami, LLC", False),
+    ("Trust Management Services Group Corp", "The Management Trust", False),
+    ("Firstservice Residential", "FirstService Residential Miami", True),
+    ("Kw Property Management & Consulting", "KW PROPERTY MANAGEMENT & CONSULTING", True),
+    ("Phoenix Management Services INC", "Phoenix Management Services, Inc", True),
+    ("Keystone Property Mgmt INC", "Keystone Property Management", True),
+])
+def test_same_firm_is_strict(a, b, same):
+    from lead_engine import crm_names
+    assert crm_names.same_firm(a, b) is same

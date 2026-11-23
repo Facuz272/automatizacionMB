@@ -673,6 +673,12 @@ def _run(strategy, limit, sources, seed, use_ai, use_apollo, precheck, send, com
             continue
         if skip_keys and (lead.source_id in skip_keys or (dbpr.address_key(lead.address) or "") in skip_keys):
             continue                          # already produced earlier in this daily mix
+        from . import crm_names
+        same = crm_names.known(lead)
+        if same:                              # in the CRM under another phone: rejected before any paid lookup
+            lead.evidence["crm_same_name"] = same
+            reject(lead, "ya existe en el CRM")
+            continue
         attempts += 1
         if attempts > max_candidates:
             break
